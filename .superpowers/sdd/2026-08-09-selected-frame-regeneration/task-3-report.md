@@ -43,3 +43,14 @@
 ## 우려
 
 없음. 생성 실패나 취소 뒤 작업 폴더의 참조 PNG가 남는 동작은 기존 생성 산출물 보존 정책과 같으며 저장 프로젝트 상태에는 영향을 주지 않는다.
+
+## 수정 라운드 1: `frameId` 런타임 타입 검증
+
+- 발견: `String(input.frameId)` 강제 변환 때문에 실제 프레임 UUID 하나를 담은 배열도 유효한 선택 요청으로 수락됐다.
+- covering test: `배열 frameId는 문자열 선택으로 변환하지 않고 거부한다`
+- RED: `npx.cmd tsx --test tests/server.test.ts`
+  - 결과: 6개 중 1개 실패. 배열 `frameId` 요청이 HTTP 202를 반환했다(예상 400).
+- 수정: `frameId`가 `undefined`도 문자열도 아니면 `프레임 ID는 문자열이어야 합니다.` 오류로 즉시 거부하고, 강제 문자열 변환을 제거했다.
+- GREEN: `npx.cmd tsx --test tests/server.test.ts`
+  - 결과: 6/6 통과.
+- 전체 검증: `npm.cmd test` 87/87 통과, `npm.cmd run build` 성공.

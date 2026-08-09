@@ -331,7 +331,8 @@ export function createPixelForgeServer({ projectsRoot, codex, staticRoot }: Serv
         const input = await body(request) as { projectId?: unknown; frameId?: unknown; request?: SpriteSheetRequest };
         const projectId = safeProjectId(String(input.projectId ?? ""));
         const generationRequest = { ...input.request } as SpriteSheetRequest;
-        const frameId = input.frameId === undefined ? undefined : String(input.frameId);
+        if (input.frameId !== undefined && typeof input.frameId !== "string") throw new Error("프레임 ID는 문자열이어야 합니다.");
+        const frameId = input.frameId;
         const jobId = randomUUID();
         if (!lockProject(projectId, jobId)) return send(response, 409, { error: "이미 생성 중인 프로젝트입니다." });
         try {

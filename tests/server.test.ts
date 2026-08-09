@@ -253,6 +253,32 @@ test("빈 frameId는 전체 시트 생성으로 폴백하지 않는다", async (
   }
 });
 
+test("배열 frameId는 문자열 선택으로 변환하지 않고 거부한다", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pixelforge-array-frame-"));
+  const project = threeFrameProject();
+  await createProject(join(root, project.id), project);
+  const codex = new FakeCodex();
+  const { server, base, token } = await startGenerationServer(root, codex);
+
+  try {
+    const response = await fetch(`${base}/api/generations`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-pixelforge-token": token },
+      body: JSON.stringify({
+        projectId: project.id,
+        frameId: [project.document.frames[1].id],
+        request: { prompt: "잘못된 타입", frameCount: 3, columns: 3, cellWidth: 2, cellHeight: 1, durationMs: 100 },
+      }),
+    });
+    assert.equal(response.status, 400);
+    assert.match(((await response.json()) as { error: string }).error, /프레임 ID.*문자열/);
+    assert.equal(codex.lastPrompt, "");
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("로컬 API는 세션 토큰으로 프로젝트 생성과 Codex 결과 가져오기를 보호한다", async () => {
   const root = await mkdtemp(join(tmpdir(), "pixelforge-server-"));
   const staticRoot = join(root, "static");
