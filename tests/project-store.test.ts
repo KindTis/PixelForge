@@ -4,6 +4,10 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { createDocument, createProject as makeProject } from "../src/core/document.ts";
+import { addFrame, addLayer } from "../src/core/timeline.ts";
+import { celKey } from "../src/core/types.ts";
+import { importRegeneratedFrame } from "../src/server/generation.ts";
+import { encodePng } from "../src/server/png.ts";
 import { createProject, loadProject, resolveInside, saveProject } from "../src/server/project-store.ts";
 
 test("프로젝트 외부 경로를 거부한다", () => {
@@ -49,6 +53,42 @@ test("다시 저장한 프로젝트를 최신 상태로 읽는다", async () => 
     project.name = "검사";
     await saveProject(root, project);
     assert.equal((await loadProject(root)).name, "검사");
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("선택 프레임 재생성 결과를 저장 왕복해 전체 프로젝트를 보존한다", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pixelforge-regenerated-roundtrip-"));
+  try {
+    let document = createDocument({ width: 2, height: 2 });
+    document = addFrame(addFrame(document));
+    document = addLayer(document, "효과");
+    for (const [index, cel] of Object.values(document.cels).entries()) document.images[cel.imageId].data.fill(index + 1);
+    document.tags.push({ id: crypto.randomUUID(), name: "공격", fromFrameId: document.frames[0].id, toFrameId: document.frames[2].id, direction: "pingPong" });
+    const project = makeProject("기사", document);
+    project.generationHistory.push({ id: crypto.randomUUID(), prompt: "기존 생성", createdAt: "2026-08-09T00:00:00.000Z", outputPath: "old.png" });
+    const selectedFrame = project.document.frames[1];
+    const before = structuredClone(project);
+    const regenerated = importRegeneratedFrame(project, encodePng(2, 2, new Uint8ClampedArray([
+      255, 255, 255, 255, 255, 255, 255, 255, 0, 0, 0, 0, 0, 0, 0, 0,
+    ])), { prompt: "검 공격", frameId: selectedFrame.id }, "generated/frame.png");
+
+    await saveProject(root, regenerated);
+    const loaded = await loadProject(root);
+    assert.deepEqual(loaded, regenerated);
+    assert.deepEqual(loaded.document.frames, regenerated.document.frames);
+    assert.deepEqual(loaded.document.layers, regenerated.document.layers);
+    assert.deepEqual(loaded.document.tags, regenerated.document.tags);
+    assert.deepEqual(loaded.document.palette, regenerated.document.palette);
+    assert.deepEqual(loaded.generationHistory, before.generationHistory);
+    for (const frame of before.document.frames.filter(({ id }) => id !== selectedFrame.id)) {
+      for (const layer of before.document.layers) {
+        const beforeCel = before.document.cels[celKey(frame.id, layer.id)];
+        const loadedCel = loaded.document.cels[celKey(frame.id, layer.id)];
+        assert.deepEqual(Array.from(loaded.document.images[loadedCel.imageId].data), Array.from(before.document.images[beforeCel.imageId].data));
+      }
+    }
   } finally {
     await rm(root, { recursive: true, force: true });
   }
