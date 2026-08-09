@@ -60,6 +60,7 @@ test("선택 재생성 완료는 시작한 프레임과 일치하는 결과만 �
 
   assert.equal(completedFrameIndex(project), 0);
   assert.equal(completedFrameIndex(project, frameId, frameId), 0);
+  assert.throws(() => completedFrameIndex(undefined, frameId, frameId), /완료된 생성 결과가 없습니다/);
   assert.throws(() => completedFrameIndex(project, frameId), /선택 프레임 ID/);
   assert.throws(() => completedFrameIndex(project, frameId, "다른 프레임"), /일치하지/);
   assert.throws(() => completedFrameIndex(project, "없는 프레임", "없는 프레임"), /찾을 수 없습니다/);

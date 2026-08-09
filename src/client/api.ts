@@ -70,7 +70,8 @@ export function generationStatusTitle(job: Pick<GenerationJob, "status" | "frame
   return titles[job.status][job.frameId === undefined ? 0 : 1];
 }
 
-export function completedFrameIndex(project: SpriteProject, requestedFrameId?: string, responseFrameId?: string): number {
+export function completedFrameIndex(project: SpriteProject | undefined, requestedFrameId?: string, responseFrameId?: string): number {
+  if (!project) throw new Error("완료된 생성 결과가 없습니다.");
   if (requestedFrameId === undefined) return 0;
   if (responseFrameId === undefined) throw new Error("선택 프레임 ID가 완료 응답에 없습니다.");
   if (responseFrameId !== requestedFrameId) throw new Error("완료 응답 프레임 ID가 요청과 일치하지 않습니다.");

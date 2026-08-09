@@ -152,14 +152,18 @@ export function App() {
     for (;;) {
       const next = await api<GenerationJob>(`/api/generations/${id}`);
       if (latestProject.current?.id !== projectId) return;
-      if (next.project) next.project = decodeProject(next.project);
-      if (next.status === "completed" && next.project) {
-        const selectedFrameIndex = completedFrameIndex(next.project, requestedFrameId, next.frameId);
-        setJob(next);
-        setProject(next.project);
-        setDirty(false);
-        setFrameIndex(selectedFrameIndex);
-        setNotice(requestedFrameId === undefined ? "생성 결과를 프레임으로 가져와 저장했습니다." : "선택 프레임을 재생성해 저장했습니다.");
+      if (next.status === "completed") {
+        if (!next.project) {
+          completedFrameIndex(undefined, requestedFrameId, next.frameId);
+        } else {
+          const completedProject = decodeProject(next.project);
+          const selectedFrameIndex = completedFrameIndex(completedProject, requestedFrameId, next.frameId);
+          setJob({ ...next, project: completedProject });
+          setProject(completedProject);
+          setDirty(false);
+          setFrameIndex(selectedFrameIndex);
+          setNotice(requestedFrameId === undefined ? "생성 결과를 프레임으로 가져와 저장했습니다." : "선택 프레임을 재생성해 저장했습니다.");
+        }
         return;
       }
       setJob(next);
