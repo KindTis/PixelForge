@@ -183,6 +183,24 @@ function alignFrame(data: Uint8ClampedArray, width: number, height: number): Uin
   return aligned;
 }
 
+function offsetFrame(data: Uint8ClampedArray, width: number, height: number, x: number, y: number): Uint8ClampedArray {
+  if (x === 0 && y === 0) return data;
+  const offset = new Uint8ClampedArray(data.length);
+  for (let sourceY = 0; sourceY < height; sourceY += 1) {
+    for (let sourceX = 0; sourceX < width; sourceX += 1) {
+      const source = (sourceY * width + sourceX) * 4;
+      const targetX = sourceX - x;
+      const targetY = sourceY - y;
+      if (targetX < 0 || targetX >= width || targetY < 0 || targetY >= height) {
+        if (data[source + 3] > 0) throw new Error("셀 오프셋 보정으로 픽셀이 캔버스 경계를 벗어납니다.");
+        continue;
+      }
+      offset.set(data.subarray(source, source + 4), (targetY * width + targetX) * 4);
+    }
+  }
+  return offset;
+}
+
 export function importSpriteSheet(
   project: SpriteProject,
   png: Uint8Array,
@@ -270,9 +288,13 @@ export function importRegeneratedFrame(
   const output = cels.find(({ layer, cel }) => layer.visible && layer.blendMode === "normal" && layer.opacity === 1 && cel.opacity === 1) ?? cels[0];
   if (!output) throw new Error("선택한 프레임에 셀이 없습니다.");
 
+  const palette = project.document.palette.map((entry) => entry.color);
+  if (project.document.colorMode === "indexed" && !palette.some((color) => color[3] === 0)) {
+    throw new Error("인덱스 문서에는 투명 팔레트 색상이 필요합니다.");
+  }
+  const aligned = offsetFrame(alignFrame(generated.data, generated.width, generated.height), generated.width, generated.height, output.cel.x, output.cel.y);
+
   const next = structuredClone(project);
-  const aligned = alignFrame(generated.data, generated.width, generated.height);
-  const palette = next.document.palette.map((entry) => entry.color);
   const result = next.document.colorMode === "indexed"
     ? indexedToRgba(quantizeToPalette({ width: generated.width, height: generated.height, data: aligned }, palette), generated.width, generated.height, palette)
     : { width: generated.width, height: generated.height, data: aligned };

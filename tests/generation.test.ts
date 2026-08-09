@@ -332,3 +332,83 @@ test("잘못된 재생성 PNG는 입력 프로젝트를 변경하지 않는다",
   );
   assert.equal(JSON.stringify(project), before);
 });
+
+test("투명 팔레트가 있는 인덱스 문서는 재생성 픽셀을 기존 팔레트로 양자화한다", () => {
+  const document = createDocument({ width: 4, height: 4 });
+  document.colorMode = "indexed";
+  document.palette.push({ id: crypto.randomUUID(), name: "투명", color: [0, 0, 0, 0] });
+  const project = createProject("기사", document);
+  const palette = structuredClone(project.document.palette);
+  const png = encodePng(4, 4, new Uint8ClampedArray([
+    250, 250, 250, 255, 250, 250, 250, 255, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  ]));
+
+  const after = importRegeneratedFrame(project, png, { prompt: "검 공격", frameId: document.frames[0].id }, "generated/frame.png");
+
+  assert.deepEqual(after.document.palette, palette);
+  assert.deepEqual(Array.from(compositeFrame(after.document, document.frames[0].id).data), [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 255, 255, 255, 255, 255, 255, 255, 255,
+  ]);
+});
+
+test("투명 팔레트가 없는 인덱스 문서 재생성은 입력을 변경하지 않고 거부한다", () => {
+  const document = createDocument({ width: 4, height: 4 });
+  document.colorMode = "indexed";
+  document.images[Object.keys(document.images)[0]].data.fill(255);
+  const project = createProject("기사", document);
+  const before = JSON.stringify(project);
+
+  assert.throws(
+    () => importRegeneratedFrame(project, encodePng(4, 4, new Uint8ClampedArray(64)), { prompt: "검 공격", frameId: document.frames[0].id }, "generated/frame.png"),
+    /투명.*팔레트/,
+  );
+  assert.equal(JSON.stringify(project), before);
+});
+
+test("셀 오프셋이 있어도 재생성 합성 결과의 기준점은 유지한다", () => {
+  const document = createDocument({ width: 4, height: 4 });
+  const cel = document.cels[celKey(document.frames[0].id, document.layers[0].id)];
+  cel.x = 1;
+  const project = createProject("기사", document);
+  const png = encodePng(4, 4, new Uint8ClampedArray([
+    255, 255, 255, 255, 255, 255, 255, 255, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  ]));
+
+  const after = importRegeneratedFrame(project, png, { prompt: "검 공격", frameId: document.frames[0].id }, "generated/frame.png");
+
+  assert.equal(after.document.cels[celKey(document.frames[0].id, document.layers[0].id)].x, 1);
+  assert.deepEqual(Array.from(compositeFrame(after.document, document.frames[0].id).data), [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 255, 255, 255, 255, 255, 255, 255, 255,
+  ]);
+});
+
+test("셀 오프셋 역이동이 경계를 넘으면 재생성은 입력을 변경하지 않고 거부한다", () => {
+  const document = createDocument({ width: 4, height: 4 });
+  document.cels[celKey(document.frames[0].id, document.layers[0].id)].x = -1;
+  const project = createProject("기사", document);
+  const before = JSON.stringify(project);
+  const png = encodePng(4, 4, new Uint8ClampedArray([
+    255, 255, 255, 255, 255, 255, 255, 255, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  ]));
+
+  assert.throws(
+    () => importRegeneratedFrame(project, png, { prompt: "검 공격", frameId: document.frames[0].id }, "generated/frame.png"),
+    /경계/,
+  );
+  assert.equal(JSON.stringify(project), before);
+});
