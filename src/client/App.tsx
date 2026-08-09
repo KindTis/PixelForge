@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import type { SpriteProject } from "../core/types.ts";
-import { api, completedFrameIndex, decodeProject, encodeProject, failedGenerationJob, generationPayload, generationStatusTitle, type GenerationJob, type Session } from "./api.ts";
+import { api, completedFrameIndex, decodeProject, encodeProject, failedGenerationJob, generationPayload, generationStatusTitle, pollingErrorGenerationJob, type GenerationJob, type Session } from "./api.ts";
 import { EditorWorkspace } from "./editor/EditorWorkspace.tsx";
 import { ExportDialog, type ExportResult, type ExportTarget } from "./ExportDialog.tsx";
 
@@ -150,7 +150,15 @@ export function App() {
 
   const poll = async (id: string, projectId: string, requestedFrameId?: string) => {
     for (;;) {
-      const next = await api<GenerationJob>(`/api/generations/${id}`);
+      let next: GenerationJob;
+      try {
+        next = await api<GenerationJob>(`/api/generations/${id}`);
+      } catch (reason) {
+        const message = reason instanceof Error ? reason.message : String(reason);
+        setJob((current) => pollingErrorGenerationJob(current, id, message));
+        await new Promise((resolve) => window.setTimeout(resolve, 500));
+        continue;
+      }
       if (latestProject.current?.id !== projectId) return;
       if (next.status === "completed") {
         if (!next.project) {

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createDocument, createProject } from "../src/core/document.ts";
-import { completedFrameIndex, decodeProject, encodeProject, failedGenerationJob, generationPayload, generationStatusTitle, type GenerationJob, type WireProject } from "../src/client/api.ts";
+import { completedFrameIndex, decodeProject, encodeProject, failedGenerationJob, generationPayload, generationStatusTitle, pollingErrorGenerationJob, type GenerationJob, type WireProject } from "../src/client/api.ts";
 
 test("프로젝트 픽셀을 JSON 배열로 보내고 Uint8ClampedArray로 복원한다", () => {
   const project = createProject("저장", createDocument({ width: 1, height: 1 }));
@@ -64,6 +64,27 @@ test("선택 재생성 완료는 시작한 프레임과 일치하는 결과만 �
   assert.throws(() => completedFrameIndex(project, frameId), /선택 프레임 ID/);
   assert.throws(() => completedFrameIndex(project, frameId, "다른 프레임"), /일치하지/);
   assert.throws(() => completedFrameIndex(project, "없는 프레임", "없는 프레임"), /찾을 수 없습니다/);
+});
+
+test("폴링 전송 오류는 같은 비종결 작업의 상태를 유지하고 오류만 반영한다", () => {
+  const running: GenerationJob = { id: "job", frameId: "frame", status: "running", messages: [] };
+  const awaiting: GenerationJob = {
+    ...running,
+    status: "awaitingApproval",
+    approval: { requestId: 1, method: "write" },
+  };
+  const completed: GenerationJob = { ...running, status: "completed" };
+
+  assert.deepEqual(pollingErrorGenerationJob(running, "job", "연결이 끊어졌습니다."), {
+    ...running,
+    error: "연결이 끊어졌습니다.",
+  });
+  assert.deepEqual(pollingErrorGenerationJob(awaiting, "job", "응답을 읽을 수 없습니다."), {
+    ...awaiting,
+    error: "응답을 읽을 수 없습니다.",
+  });
+  assert.equal(pollingErrorGenerationJob(running, "new-job", "연결이 끊어졌습니다."), running);
+  assert.equal(pollingErrorGenerationJob(completed, "job", "연결이 끊어졌습니다."), completed);
 });
 
 test("폴링 실패는 같은 생성 작업만 실패 상태로 바꾼다", () => {

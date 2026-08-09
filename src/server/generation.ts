@@ -92,7 +92,9 @@ export function buildFrameRegenerationPrompt(
     const rightSpan = frames.findIndex((frame) => frame.id === right.toFrameId) - frames.findIndex((frame) => frame.id === right.fromFrameId);
     return leftSpan - rightSpan;
   })[0];
-  const progress = frames.length === 1 ? 0 : (frameIndex / (frames.length - 1)) * 100;
+  const rangeStart = tag ? frames.findIndex((frame) => frame.id === tag.fromFrameId) : 0;
+  const rangeEnd = tag ? frames.findIndex((frame) => frame.id === tag.toFrameId) : frames.length - 1;
+  const progress = rangeStart === rangeEnd ? 100 : ((frameIndex - rangeStart) / (rangeEnd - rangeStart)) * 100;
   const anchorX = Math.floor(project.document.width / 2);
   const anchorY = project.document.height - Math.max(1, Math.round(project.document.height / 8));
 
@@ -103,7 +105,8 @@ export function buildFrameRegenerationPrompt(
     `애니메이션 태그: ${tag?.name ?? "전체 구간"}`,
     `재생 방향: ${tag?.direction ?? "forward"}`,
     `진행률: ${progress.toFixed(1)}%`,
-    "준비·타격·후속·복귀 흐름과 앞뒤 프레임의 캐릭터 일관성을 유지하세요.",
+    "원 프롬프트, 타임라인 위치와 역할별 참조를 함께 해석해 현재 동작 단계를 준비·타격·후속·복귀 중 하나로 먼저 판단하세요.",
+    "첫 프레임 참조는 캐릭터 외형·팔레트·크기·카메라의 기준으로, 이전·다음 참조는 앞뒤 동작 연결의 기준으로 사용하고, 선택적 참조가 없는 경계에서는 존재하는 참조만 사용하세요.",
     `첫 프레임 참조: ${references.first}`,
     references.previous?.trim() ? `이전 프레임 참조: ${references.previous}` : "",
     references.next?.trim() ? `다음 프레임 참조: ${references.next}` : "",

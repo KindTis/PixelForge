@@ -120,6 +120,53 @@ test("선택 프레임 프롬프트는 태그 진행률과 역할별 참조를 �
   assert.match(prompt, /지면 기준점/);
 });
 
+test("선택 프레임 진행률은 부분 태그 구간 안에서 계산한다", () => {
+  const document = createDocument({ width: 8, height: 8 });
+  document.frames.push(
+    { id: crypto.randomUUID(), durationMs: 100 },
+    { id: crypto.randomUUID(), durationMs: 100 },
+    { id: crypto.randomUUID(), durationMs: 100 },
+    { id: crypto.randomUUID(), durationMs: 100 },
+  );
+  document.tags.push({
+    id: crypto.randomUUID(),
+    name: "attack",
+    fromFrameId: document.frames[1].id,
+    toFrameId: document.frames[3].id,
+    direction: "forward",
+  });
+  const project = createProject("기사", document);
+  const promptFor = (frameId: string) => buildFrameRegenerationPrompt(
+    project,
+    { prompt: "검 공격", frameId },
+    { first: "first.png" },
+    "frame.png",
+  );
+
+  assert.match(promptFor(document.frames[1].id), /진행률: 0\.0%/);
+  assert.match(promptFor(document.frames[3].id), /진행률: 100\.0%/);
+  document.tags[0].fromFrameId = document.frames[2].id;
+  document.tags[0].toFrameId = document.frames[2].id;
+  assert.match(promptFor(document.frames[2].id), /진행률: 100\.0%/);
+});
+
+test("선택 프레임 프롬프트는 동작 단계를 먼저 판단하고 참조별 역할을 구분한다", () => {
+  const project = createProject("기사", createDocument({ width: 8, height: 8 }));
+  const prompt = buildFrameRegenerationPrompt(project, {
+    prompt: "검 공격",
+    frameId: project.document.frames[0].id,
+  }, {
+    first: "first.png",
+    previous: "previous.png",
+    next: "next.png",
+  }, "frame.png");
+
+  assert.match(prompt, /원 프롬프트.*타임라인 위치.*역할별 참조.*함께 해석.*준비·타격·후속·복귀.*먼저 판단/);
+  assert.match(prompt, /첫 프레임 참조.*캐릭터 외형·팔레트·크기·카메라.*기준/);
+  assert.match(prompt, /이전·다음 참조.*앞뒤 동작 연결.*기준/);
+  assert.match(prompt, /선택적 참조가 없는 경계.*존재하는 참조만 사용/);
+});
+
 test("선택 프레임 프롬프트는 전달된 참조 역할만 포함한다", () => {
   const project = createProject("기사", createDocument({ width: 8, height: 8 }));
   const prompt = buildFrameRegenerationPrompt(project, {

@@ -80,6 +80,11 @@ export function completedFrameIndex(project: SpriteProject | undefined, requeste
   return index;
 }
 
+export function pollingErrorGenerationJob(job: GenerationJob | undefined, id: string, error: string): GenerationJob | undefined {
+  if (job?.id !== id || job.status === "completed" || job.status === "failed" || job.status === "cancelled") return job;
+  return { ...job, error };
+}
+
 export function failedGenerationJob(job: GenerationJob | undefined, id: string, error: string): GenerationJob | undefined {
   return job?.id === id ? { ...job, status: "failed", error } : job;
 }
