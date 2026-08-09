@@ -77,10 +77,10 @@ test("선택 프레임 재생성 결과를 저장 왕복해 전체 프로젝트�
     await saveProject(root, regenerated);
     const loaded = await loadProject(root);
     assert.deepEqual(loaded, regenerated);
-    assert.deepEqual(loaded.document.frames, regenerated.document.frames);
-    assert.deepEqual(loaded.document.layers, regenerated.document.layers);
-    assert.deepEqual(loaded.document.tags, regenerated.document.tags);
-    assert.deepEqual(loaded.document.palette, regenerated.document.palette);
+    assert.deepEqual(loaded.document.frames, before.document.frames);
+    assert.deepEqual(loaded.document.layers, before.document.layers);
+    assert.deepEqual(loaded.document.tags, before.document.tags);
+    assert.deepEqual(loaded.document.palette, before.document.palette);
     assert.deepEqual(loaded.generationHistory, before.generationHistory);
     for (const frame of before.document.frames.filter(({ id }) => id !== selectedFrame.id)) {
       for (const layer of before.document.layers) {
@@ -89,6 +89,12 @@ test("선택 프레임 재생성 결과를 저장 왕복해 전체 프로젝트�
         assert.deepEqual(Array.from(loaded.document.images[loadedCel.imageId].data), Array.from(before.document.images[beforeCel.imageId].data));
       }
     }
+    const selectedLayers = loaded.document.layers.map((layer) => loaded.document.images[loaded.document.cels[celKey(selectedFrame.id, layer.id)].imageId].data);
+    assert.deepEqual(Array.from(selectedLayers[0]), [
+      0, 0, 0, 0, 0, 0, 0, 0,
+      255, 255, 255, 255, 255, 255, 255, 255,
+    ]);
+    assert.deepEqual(Array.from(selectedLayers[1]), new Array(16).fill(0));
   } finally {
     await rm(root, { recursive: true, force: true });
   }
