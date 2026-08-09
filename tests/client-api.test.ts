@@ -96,7 +96,8 @@ test("폴링 실패는 같은 생성 작업만 실패 상태로 바꾼다", () =
 
 test("HTTP 응답 오류는 폴링 재시도에서 제외하고 전송·JSON 오류는 재시도한다", async () => {
   const originalFetch = globalThis.fetch;
-  globalThis.fetch = async () => new Response(JSON.stringify({ error: "생성 작업을 찾을 수 없습니다." }), {
+  let body = JSON.stringify({ error: "생성 작업을 찾을 수 없습니다." });
+  globalThis.fetch = async () => new Response(body, {
     status: 404,
     headers: { "content-type": "application/json" },
   });
@@ -105,6 +106,9 @@ test("HTTP 응답 오류는 폴링 재시도에서 제외하고 전송·JSON 오
     const httpError = await api("/api/generations/missing").then(() => undefined, (reason: unknown) => reason);
     assert.equal(httpError instanceof Error, true);
     assert.equal(isRetryablePollingError(httpError), false);
+    body = "<html>not found</html>";
+    const nonJsonHttpError = await api("/api/generations/missing").then(() => undefined, (reason: unknown) => reason);
+    assert.equal(isRetryablePollingError(nonJsonHttpError), false);
     assert.equal(isRetryablePollingError(new TypeError("fetch failed")), true);
     assert.equal(isRetryablePollingError(new SyntaxError("Unexpected token")), true);
   } finally {

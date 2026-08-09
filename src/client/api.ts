@@ -102,7 +102,9 @@ export async function api<T>(path: string, token?: string, init?: RequestInit): 
       ...init?.headers,
     },
   });
-  const result = await response.json() as T & { error?: string };
-  if (!response.ok) throw new Error(result.error ?? `요청 실패 (${response.status})`, { cause: response });
-  return result;
+  if (!response.ok) {
+    const result = await response.json().catch(() => ({})) as { error?: string };
+    throw new Error(result.error ?? `요청 실패 (${response.status})`, { cause: response });
+  }
+  return await response.json() as T;
 }
