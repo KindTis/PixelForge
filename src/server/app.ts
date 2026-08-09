@@ -3,11 +3,20 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
 import { extname, join, resolve } from "node:path";
 import { createDocument, createProject as makeProject, validateDocument } from "../core/document.ts";
+import { compositeFrame } from "../core/render.ts";
 import type { PixelBuffer, SpriteProject } from "../core/types.ts";
 import type { AccountState, CodexBridge, CodexEvent } from "./codex-bridge.ts";
-import { buildSpriteSheetPrompt, importSpriteSheet, type SpriteSheetRequest } from "./generation.ts";
+import {
+  buildFrameRegenerationPrompt,
+  buildSpriteSheetPrompt,
+  importRegeneratedFrame,
+  importSpriteSheet,
+  type FrameReferencePaths,
+  type FrameRegenerationRequest,
+  type SpriteSheetRequest,
+} from "./generation.ts";
 import { createProject, loadProject, resolveInside, saveProject } from "./project-store.ts";
-import { decodePng } from "./png.ts";
+import { decodePng, encodePng } from "./png.ts";
 import { exportProject, type ExportOptions, type ExportTarget } from "./exporters/index.ts";
 
 type CodexClient = Pick<CodexBridge, "getAccount" | "login" | "startGeneration" | "interrupt" | "respond"> & {
@@ -17,7 +26,8 @@ type CodexClient = Pick<CodexBridge, "getAccount" | "login" | "startGeneration" 
 type Job = {
   id: string;
   projectId: string;
-  request: SpriteSheetRequest;
+  request: SpriteSheetRequest | FrameRegenerationRequest;
+  frameId?: string;
   outputPath: string;
   relativeOutputPath: string;
   runId?: string;
@@ -161,7 +171,10 @@ export function createPixelForgeServer({ projectsRoot, codex, staticRoot }: Serv
     try {
       const root = resolveInside(projectsRoot, safeProjectId(job.projectId));
       const project = await loadProject(root);
-      job.project = importSpriteSheet(project, await readFile(job.outputPath), job.request, job.relativeOutputPath);
+      const png = await readFile(job.outputPath);
+      job.project = job.frameId !== undefined
+        ? importRegeneratedFrame(project, png, job.request as FrameRegenerationRequest, job.relativeOutputPath)
+        : importSpriteSheet(project, png, job.request as SpriteSheetRequest, job.relativeOutputPath);
       await saveProject(root, job.project);
       job.status = "completed";
     } catch (error) {
@@ -315,24 +328,53 @@ export function createPixelForgeServer({ projectsRoot, codex, staticRoot }: Serv
       }
 
       if (request.method === "POST" && url.pathname === "/api/generations") {
-        const input = await body(request) as { projectId?: unknown; request?: SpriteSheetRequest };
+        const input = await body(request) as { projectId?: unknown; frameId?: unknown; request?: SpriteSheetRequest };
         const projectId = safeProjectId(String(input.projectId ?? ""));
         const generationRequest = { ...input.request } as SpriteSheetRequest;
+        const frameId = input.frameId === undefined ? undefined : String(input.frameId);
         const jobId = randomUUID();
         if (!lockProject(projectId, jobId)) return send(response, 409, { error: "이미 생성 중인 프로젝트입니다." });
         try {
           const root = resolveInside(projectsRoot, projectId);
-          await loadProject(root);
+          const project = await loadProject(root);
           if (generationRequest.referencePath) {
             const reference = resolveInside(root, generationRequest.referencePath);
             if (!(await stat(reference)).isFile()) throw new Error("참조 이미지를 찾을 수 없습니다.");
             generationRequest.referencePath = reference;
           }
-          const relativeOutputPath = `generated/${jobId}/sheet.png`;
+          const relativeOutputPath = `generated/${jobId}/${frameId !== undefined ? "frame.png" : "sheet.png"}`;
           const outputPath = resolveInside(root, relativeOutputPath);
           await mkdir(resolve(outputPath, ".."), { recursive: true });
-          const prompt = buildSpriteSheetPrompt(generationRequest, outputPath);
-          const job: Job = { id: jobId, projectId, request: generationRequest, outputPath, relativeOutputPath, status: "running", messages: [] };
+          let prompt: string;
+          let jobRequest: SpriteSheetRequest | FrameRegenerationRequest = generationRequest;
+          if (frameId !== undefined) {
+            const frameIndex = project.document.frames.findIndex((frame) => frame.id === frameId);
+            if (frameIndex < 0) throw new Error("선택한 프레임을 찾을 수 없습니다.");
+            const referencePaths: FrameReferencePaths = {
+              first: resolveInside(root, `generated/${jobId}/first.png`),
+              previous: frameIndex > 0 ? resolveInside(root, `generated/${jobId}/previous.png`) : undefined,
+              next: frameIndex < project.document.frames.length - 1 ? resolveInside(root, `generated/${jobId}/next.png`) : undefined,
+            };
+            const referenceFrames = [
+              { path: referencePaths.first, frameId: project.document.frames[0].id },
+              ...(referencePaths.previous ? [{ path: referencePaths.previous, frameId: project.document.frames[frameIndex - 1].id }] : []),
+              ...(referencePaths.next ? [{ path: referencePaths.next, frameId: project.document.frames[frameIndex + 1].id }] : []),
+            ];
+            for (const reference of referenceFrames) {
+              const image = compositeFrame(project.document, reference.frameId);
+              await writeFile(reference.path, encodePng(image.width, image.height, image.data));
+            }
+            jobRequest = {
+              prompt: generationRequest.prompt,
+              frameId,
+              parentId: generationRequest.parentId,
+              referencePath: generationRequest.referencePath,
+            };
+            prompt = buildFrameRegenerationPrompt(project, jobRequest, referencePaths, outputPath);
+          } else {
+            prompt = buildSpriteSheetPrompt(generationRequest, outputPath);
+          }
+          const job: Job = { id: jobId, projectId, request: jobRequest, frameId, outputPath, relativeOutputPath, status: "running", messages: [] };
           jobs.set(jobId, job);
           const run = await codex.startGeneration({ cwd: root, prompt });
           job.runId = run.id;
@@ -347,7 +389,7 @@ export function createPixelForgeServer({ projectsRoot, codex, staticRoot }: Serv
             earlyCompletions.delete(run.id);
             void finish(run.id, early);
           }
-          return send(response, 202, { id: jobId, status: job.status });
+          return send(response, 202, { id: jobId, status: job.status, frameId });
         } catch (error) {
           jobs.delete(jobId);
           unlockProject(projectId, jobId);
