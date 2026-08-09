@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import type { SpriteProject } from "../core/types.ts";
-import { api, decodeProject, encodeProject, generationPayload, type GenerationJob, type Session } from "./api.ts";
+import { api, completedFrameIndex, decodeProject, encodeProject, failedGenerationJob, generationPayload, generationStatusTitle, type GenerationJob, type Session } from "./api.ts";
 import { EditorWorkspace } from "./editor/EditorWorkspace.tsx";
 import { ExportDialog, type ExportResult, type ExportTarget } from "./ExportDialog.tsx";
 
@@ -148,20 +148,21 @@ export function App() {
     return () => window.clearTimeout(timer);
   }, [dirty, project, session]);
 
-  const poll = async (id: string, projectId: string) => {
+  const poll = async (id: string, projectId: string, requestedFrameId?: string) => {
     for (;;) {
       const next = await api<GenerationJob>(`/api/generations/${id}`);
       if (latestProject.current?.id !== projectId) return;
       if (next.project) next.project = decodeProject(next.project);
-      setJob(next);
       if (next.status === "completed" && next.project) {
+        const selectedFrameIndex = completedFrameIndex(next.project, requestedFrameId, next.frameId);
+        setJob(next);
         setProject(next.project);
         setDirty(false);
-        const selectedFrameIndex = next.frameId === undefined ? 0 : next.project.document.frames.findIndex((frame) => frame.id === next.frameId);
-        setFrameIndex(selectedFrameIndex < 0 ? 0 : selectedFrameIndex);
-        setNotice(next.frameId === undefined ? "생성 결과를 프레임으로 가져와 저장했습니다." : "선택 프레임을 재생성해 저장했습니다.");
+        setFrameIndex(selectedFrameIndex);
+        setNotice(requestedFrameId === undefined ? "생성 결과를 프레임으로 가져와 저장했습니다." : "선택 프레임을 재생성해 저장했습니다.");
         return;
       }
+      setJob(next);
       if (next.status === "failed" || next.status === "cancelled") return;
       await new Promise((resolve) => window.setTimeout(resolve, 500));
     }
@@ -179,7 +180,11 @@ export function App() {
         body: JSON.stringify(generationPayload(project, prompt, frameCount, Math.min(columns, frameCount), reference?.path, frameId)),
       });
       setJob(started);
-      void poll(started.id, project.id).catch((reason) => setError(reason instanceof Error ? reason.message : String(reason)));
+      void poll(started.id, project.id, frameId).catch((reason) => {
+        const message = reason instanceof Error ? reason.message : String(reason);
+        setError(message);
+        setJob((current) => failedGenerationJob(current, started.id, message));
+      });
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
@@ -301,7 +306,7 @@ export function App() {
               </button>
             </form>
             {job && <div className={`job-status ${job.status}`} aria-live="polite">
-              <b>{job.status === "running" ? job.frameId === undefined ? "Codex가 제작 중입니다" : "선택 프레임을 재생성 중입니다" : job.status === "awaitingApproval" ? "Codex 승인 필요" : job.status === "cancelling" ? "생성을 취소하는 중입니다" : job.status === "finalizing" ? "결과를 가져오는 중입니다" : job.status === "completed" ? job.frameId === undefined ? "가져오기 완료" : "선택 프레임 가져오기 완료" : job.status === "cancelled" ? "생성 취소됨" : "생성 실패"}</b>
+              <b>{generationStatusTitle(job)}</b>
               <p>{job.error || job.messages?.at(-1) || "캐릭터 일관성과 프레임 격자를 확인하고 있습니다."}</p>
               {job.status === "running" && <button type="button" onClick={() => void cancel()}>생성 취소</button>}
               {job.status === "awaitingApproval" && <div><button type="button" onClick={() => void approve(true)}>허용</button><button type="button" onClick={() => void approve(false)}>거부</button></div>}

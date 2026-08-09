@@ -57,6 +57,32 @@ export function generationPayload(project: SpriteProject, prompt: string, frameC
   };
 }
 
+export function generationStatusTitle(job: Pick<GenerationJob, "status" | "frameId">): string {
+  const titles: Record<GenerationJob["status"], [string, string]> = {
+    running: ["Codex가 제작 중입니다", "선택 프레임을 재생성 중입니다"],
+    awaitingApproval: ["Codex 승인 필요", "선택 프레임 재생성 승인 필요"],
+    cancelling: ["생성을 취소하는 중입니다", "선택 프레임 재생성을 취소하는 중입니다"],
+    finalizing: ["결과를 가져오는 중입니다", "선택 프레임 결과를 가져오는 중입니다"],
+    completed: ["가져오기 완료", "선택 프레임 가져오기 완료"],
+    failed: ["생성 실패", "선택 프레임 재생성 실패"],
+    cancelled: ["생성 취소됨", "선택 프레임 재생성 취소됨"],
+  };
+  return titles[job.status][job.frameId === undefined ? 0 : 1];
+}
+
+export function completedFrameIndex(project: SpriteProject, requestedFrameId?: string, responseFrameId?: string): number {
+  if (requestedFrameId === undefined) return 0;
+  if (responseFrameId === undefined) throw new Error("선택 프레임 ID가 완료 응답에 없습니다.");
+  if (responseFrameId !== requestedFrameId) throw new Error("완료 응답 프레임 ID가 요청과 일치하지 않습니다.");
+  const index = project.document.frames.findIndex((frame) => frame.id === requestedFrameId);
+  if (index < 0) throw new Error("선택 프레임을 결과 프로젝트에서 찾을 수 없습니다.");
+  return index;
+}
+
+export function failedGenerationJob(job: GenerationJob | undefined, id: string, error: string): GenerationJob | undefined {
+  return job?.id === id ? { ...job, status: "failed", error } : job;
+}
+
 export async function api<T>(path: string, token?: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, {
     ...init,
