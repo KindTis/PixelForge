@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import type { SpriteProject } from "../core/types.ts";
-import { api, decodeProject, encodeProject, type GenerationJob, type Session } from "./api.ts";
+import { api, decodeProject, encodeProject, generationPayload, type GenerationJob, type Session } from "./api.ts";
 import { EditorWorkspace } from "./editor/EditorWorkspace.tsx";
 import { ExportDialog, type ExportResult, type ExportTarget } from "./ExportDialog.tsx";
 
@@ -157,8 +157,9 @@ export function App() {
       if (next.status === "completed" && next.project) {
         setProject(next.project);
         setDirty(false);
-        setFrameIndex(0);
-        setNotice("생성 결과를 프레임으로 가져와 저장했습니다.");
+        const selectedFrameIndex = next.frameId === undefined ? 0 : next.project.document.frames.findIndex((frame) => frame.id === next.frameId);
+        setFrameIndex(selectedFrameIndex < 0 ? 0 : selectedFrameIndex);
+        setNotice(next.frameId === undefined ? "생성 결과를 프레임으로 가져와 저장했습니다." : "선택 프레임을 재생성해 저장했습니다.");
         return;
       }
       if (next.status === "failed" || next.status === "cancelled") return;
@@ -166,8 +167,7 @@ export function App() {
     }
   };
 
-  const generate = async (event: FormEvent) => {
-    event.preventDefault();
+  const generate = async (frameId?: string) => {
     if (!session || !project) return;
     setError("");
     setNotice("");
@@ -176,19 +176,7 @@ export function App() {
       if (!(await save())) return;
       const started = await api<GenerationJob>("/api/generations", session.token, {
         method: "POST",
-        body: JSON.stringify({
-          projectId: project.id,
-          request: {
-            prompt,
-            frameCount,
-            columns: Math.min(columns, frameCount),
-            cellWidth: project.document.width,
-            cellHeight: project.document.height,
-            durationMs: 100,
-            parentId: project.generationHistory.at(-1)?.id,
-            referencePath: reference?.path,
-          },
-        }),
+        body: JSON.stringify(generationPayload(project, prompt, frameCount, Math.min(columns, frameCount), reference?.path, frameId)),
       });
       setJob(started);
       void poll(started.id, project.id).catch((reason) => setError(reason instanceof Error ? reason.message : String(reason)));
@@ -293,24 +281,27 @@ export function App() {
       }} /> : <EditorWorkspace project={project} frameIndex={frameIndex} readOnly={generationBusy} onFrameIndex={setFrameIndex} onChange={(next) => { setProject(next); setDirty(true); }} onSave={() => void save()} saveState={dirty ? "저장 대기" : "저장됨"} onError={setError} generationPanel={
           <section className="generation-panel">
             <div className="panel-title"><span>CODEX FORGE</span><b>{account?.type === "chatgpt" ? "연결됨" : "로그인 필요"}</b></div>
-            <form onSubmit={generate}>
-              <label>프롬프트<textarea rows={6} value={prompt} onChange={(event) => setPrompt(event.target.value)} /></label>
+            <form onSubmit={(event) => { event.preventDefault(); void generate(); }}>
+              <label>프롬프트<textarea rows={6} disabled={generationBusy} value={prompt} onChange={(event) => setPrompt(event.target.value)} /></label>
               <div className="form-grid">
-                <label>프레임<input type="number" min="1" max="256" value={frameCount} onChange={(event) => setFrameCount(Number(event.target.value))} /></label>
-                <label>열<input type="number" min="1" max={frameCount} value={columns} onChange={(event) => setColumns(Number(event.target.value))} /></label>
+                <label>프레임<input type="number" min="1" max="256" disabled={generationBusy} value={frameCount} onChange={(event) => setFrameCount(Number(event.target.value))} /></label>
+                <label>열<input type="number" min="1" max={frameCount} disabled={generationBusy} value={columns} onChange={(event) => setColumns(Number(event.target.value))} /></label>
               </div>
               <p className="hint">{project.document.width} × {project.document.height}px · 투명 배경 · PNG</p>
               <div className="asset-inputs">
                 <label>참조 PNG<input type="file" accept="image/png" disabled={generationBusy} onChange={(event) => void uploadReference(event.target.files?.[0])} /></label>
                 <label>시트 가져오기<input type="file" accept="image/png" disabled={generationBusy} onChange={(event) => void importSheet(event.target.files?.[0])} /></label>
               </div>
-              {reference && <p className="reference-file"><span>{reference.name}</span><button type="button" onClick={() => setReference(undefined)}>제거</button></p>}
+              {reference && <p className="reference-file"><span>{reference.name}</span><button type="button" disabled={generationBusy} onClick={() => setReference(undefined)}>제거</button></p>}
               <button className="forge-button" type="submit" disabled={!account || generationBusy}>
                 <span>{project.generationHistory.length ? "프롬프트로 다시 생성" : "스프라이트 생성"}</span><b>⌘ ↗</b>
               </button>
+              <button className="forge-button" type="button" disabled={!account || generationBusy || !project.document.frames[frameIndex]} onClick={() => void generate(project.document.frames[frameIndex]?.id)}>
+                <span>선택 프레임 재생성</span><b>⌘ ↗</b>
+              </button>
             </form>
             {job && <div className={`job-status ${job.status}`} aria-live="polite">
-              <b>{job.status === "running" ? "Codex가 제작 중입니다" : job.status === "awaitingApproval" ? "Codex 승인 필요" : job.status === "cancelling" ? "생성을 취소하는 중입니다" : job.status === "finalizing" ? "결과를 가져오는 중입니다" : job.status === "completed" ? "가져오기 완료" : job.status === "cancelled" ? "생성 취소됨" : "생성 실패"}</b>
+              <b>{job.status === "running" ? job.frameId === undefined ? "Codex가 제작 중입니다" : "선택 프레임을 재생성 중입니다" : job.status === "awaitingApproval" ? "Codex 승인 필요" : job.status === "cancelling" ? "생성을 취소하는 중입니다" : job.status === "finalizing" ? "결과를 가져오는 중입니다" : job.status === "completed" ? job.frameId === undefined ? "가져오기 완료" : "선택 프레임 가져오기 완료" : job.status === "cancelled" ? "생성 취소됨" : "생성 실패"}</b>
               <p>{job.error || job.messages?.at(-1) || "캐릭터 일관성과 프레임 격자를 확인하고 있습니다."}</p>
               {job.status === "running" && <button type="button" onClick={() => void cancel()}>생성 취소</button>}
               {job.status === "awaitingApproval" && <div><button type="button" onClick={() => void approve(true)}>허용</button><button type="button" onClick={() => void approve(false)}>거부</button></div>}

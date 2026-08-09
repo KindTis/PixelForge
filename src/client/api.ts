@@ -16,6 +16,7 @@ export type Session = { token: string; account: AccountResponse };
 
 export type GenerationJob = {
   id: string;
+  frameId?: string;
   status: "running" | "awaitingApproval" | "cancelling" | "finalizing" | "completed" | "failed" | "cancelled";
   messages: string[];
   error?: string;
@@ -37,6 +38,23 @@ export function encodeProject(value: SpriteProject): WireProject {
     data: Array.from(image.data),
   }]));
   return { ...value, document: { ...value.document, images } };
+}
+
+export function generationPayload(project: SpriteProject, prompt: string, frameCount: number, columns: number, referencePath?: string, frameId?: string) {
+  return {
+    projectId: project.id,
+    ...(frameId === undefined ? {} : { frameId }),
+    request: {
+      prompt,
+      frameCount,
+      columns,
+      cellWidth: project.document.width,
+      cellHeight: project.document.height,
+      durationMs: 100,
+      parentId: project.generationHistory.at(-1)?.id,
+      referencePath,
+    },
+  };
 }
 
 export async function api<T>(path: string, token?: string, init?: RequestInit): Promise<T> {
