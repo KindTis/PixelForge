@@ -1,5 +1,7 @@
 import type { Cel, Frame, Layer, PixelBuffer, SpriteProject } from "../core/types.ts";
 import { celKey } from "../core/types.ts";
+import { validateDocument } from "../core/document.ts";
+import { indexedToRgba, quantizeToPalette } from "../core/palette.ts";
 import { decodePng } from "./png.ts";
 
 export type SpriteSheetRequest = {
@@ -244,4 +246,50 @@ export function importSpriteSheet(
     }],
     exportSettings: { ...project.exportSettings, columns: request.columns },
   };
+}
+
+export function importRegeneratedFrame(
+  project: SpriteProject,
+  png: Uint8Array,
+  request: FrameRegenerationRequest,
+  outputPath: string,
+): SpriteProject {
+  if (!request.prompt.trim()) throw new Error("생성 프롬프트가 필요합니다.");
+  if (!outputPath.trim()) throw new Error("출력 파일 경로가 필요합니다.");
+  validateDocument(project.document);
+  const frame = project.document.frames.find((candidate) => candidate.id === request.frameId);
+  if (!frame) throw new Error("선택한 프레임을 찾을 수 없습니다.");
+  const generated = decodePng(png);
+  if (generated.width !== project.document.width || generated.height !== project.document.height) {
+    throw new Error("생성된 프레임 크기가 캔버스와 다릅니다.");
+  }
+
+  const cels = project.document.layers
+    .map((layer) => ({ layer, cel: project.document.cels[celKey(frame.id, layer.id)] }))
+    .filter((candidate): candidate is { layer: Layer; cel: Cel } => Boolean(candidate.cel));
+  const output = cels.find(({ layer, cel }) => layer.visible && layer.blendMode === "normal" && layer.opacity === 1 && cel.opacity === 1) ?? cels[0];
+  if (!output) throw new Error("선택한 프레임에 셀이 없습니다.");
+
+  const next = structuredClone(project);
+  const aligned = alignFrame(generated.data, generated.width, generated.height);
+  const palette = next.document.palette.map((entry) => entry.color);
+  const result = next.document.colorMode === "indexed"
+    ? indexedToRgba(quantizeToPalette({ width: generated.width, height: generated.height, data: aligned }, palette), generated.width, generated.height, palette)
+    : { width: generated.width, height: generated.height, data: aligned };
+  const replacedImageIds = new Set(cels.map(({ cel }) => cel.imageId));
+
+  for (const { layer, cel } of cels) {
+    const imageId = crypto.randomUUID();
+    next.document.cels[celKey(frame.id, layer.id)].imageId = imageId;
+    next.document.images[imageId] = {
+      width: generated.width,
+      height: generated.height,
+      data: cel.id === output.cel.id ? result.data : new Uint8ClampedArray(result.data.length),
+    };
+  }
+  for (const imageId of replacedImageIds) {
+    if (!Object.values(next.document.cels).some((cel) => cel.imageId === imageId)) delete next.document.images[imageId];
+  }
+  validateDocument(next.document);
+  return next;
 }

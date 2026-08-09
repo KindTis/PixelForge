@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createDocument, createProject } from "../src/core/document.ts";
-import { buildFrameRegenerationPrompt, buildSpriteSheetPrompt, importSpriteSheet, type SpriteSheetRequest } from "../src/server/generation.ts";
+import { compositeFrame } from "../src/core/render.ts";
+import { addFrame, addLayer } from "../src/core/timeline.ts";
+import { celKey } from "../src/core/types.ts";
+import { buildFrameRegenerationPrompt, buildSpriteSheetPrompt, importRegeneratedFrame, importSpriteSheet, type SpriteSheetRequest } from "../src/server/generation.ts";
 import { encodePng } from "../src/server/png.ts";
 
 const request: SpriteSheetRequest = {
@@ -38,6 +41,34 @@ function nonTransparentPixels(data: Uint8ClampedArray, width: number): string[] 
     }
   }
   return result;
+}
+
+function frameBytes(project: ReturnType<typeof createProject>, frameIndex: number): number[][] {
+  const frame = project.document.frames[frameIndex];
+  return project.document.layers.map((layer) => {
+    const cel = project.document.cels[celKey(frame.id, layer.id)];
+    return Array.from(project.document.images[cel.imageId].data);
+  });
+}
+
+function projectWithThreeFramesAndTwoLayers() {
+  let document = createDocument({ width: 4, height: 4 });
+  document = addFrame(document);
+  document = addFrame(document);
+  document = addLayer(document, "효과");
+  for (const [index, cel] of Object.values(document.cels).entries()) {
+    document.images[cel.imageId].data.fill(index + 1);
+  }
+  document.tags.push({
+    id: crypto.randomUUID(),
+    name: "공격",
+    fromFrameId: document.frames[0].id,
+    toFrameId: document.frames[2].id,
+    direction: "forward",
+  });
+  const project = createProject("기사", document);
+  project.generationHistory.push({ id: crypto.randomUUID(), prompt: "기존 생성", createdAt: "2026-08-09T00:00:00.000Z", outputPath: "old.png" });
+  return project;
 }
 
 test("생성 프롬프트는 투명 배경, 정확한 격자와 출력 파일을 강제한다", () => {
@@ -230,4 +261,74 @@ test("시트 크기가 격자와 다르면 가져오기를 거부한다", () => 
     () => importSpriteSheet(project, encodePng(1, 1, new Uint8ClampedArray(4)), request, "sheet.png"),
     /시트 크기/,
   );
+});
+
+test("재생성은 선택 프레임 픽셀만 교체하고 나머지 프로젝트 상태를 보존한다", () => {
+  const project = projectWithThreeFramesAndTwoLayers();
+  const before = structuredClone(project);
+  const selectedFrame = project.document.frames[1];
+  const selectedCels = project.document.layers.map((layer) => project.document.cels[celKey(selectedFrame.id, layer.id)]);
+  const png = encodePng(4, 4, new Uint8ClampedArray([
+    255, 255, 255, 255, 255, 255, 255, 255, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  ]));
+
+  const after = importRegeneratedFrame(project, png, { prompt: "검 공격", frameId: selectedFrame.id }, "generated/frame.png");
+
+  assert.deepEqual(after.document.frames, before.document.frames);
+  assert.deepEqual(after.document.layers, before.document.layers);
+  assert.deepEqual(after.document.tags, before.document.tags);
+  assert.deepEqual(after.generationHistory, before.generationHistory);
+  assert.deepEqual(frameBytes(after, 0), frameBytes(before, 0));
+  assert.deepEqual(frameBytes(after, 2), frameBytes(before, 2));
+  assert.deepEqual(
+    project.document.layers.map((layer) => {
+      const cel = after.document.cels[celKey(selectedFrame.id, layer.id)];
+      return { id: cel.id, x: cel.x, y: cel.y, opacity: cel.opacity };
+    }),
+    selectedCels.map(({ id, x, y, opacity }) => ({ id, x, y, opacity })),
+  );
+  assert.ok(project.document.layers.every((layer, index) => after.document.cels[celKey(selectedFrame.id, layer.id)].imageId !== selectedCels[index].imageId));
+  assert.deepEqual(Array.from(after.document.images[after.document.cels[celKey(selectedFrame.id, project.document.layers[1].id)].imageId].data), new Array(64).fill(0));
+  assert.deepEqual(Array.from(compositeFrame(after.document, selectedFrame.id).data), [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 255, 255, 255, 255, 255, 255, 255, 255,
+  ]);
+});
+
+test("재생성은 연결된 다음 프레임 셀을 새 이미지 ID로 분리한다", () => {
+  let document = createDocument({ width: 4, height: 4 });
+  document = addFrame(document);
+  document = addFrame(document);
+  const layer = document.layers[0];
+  const selected = document.frames[1];
+  const next = document.frames[2];
+  const selectedCel = document.cels[celKey(selected.id, layer.id)];
+  const nextCel = document.cels[celKey(next.id, layer.id)];
+  nextCel.imageId = selectedCel.imageId;
+  document.images[selectedCel.imageId].data.set([9, 8, 7, 255]);
+  const project = createProject("기사", document);
+  const nextBefore = Array.from(project.document.images[nextCel.imageId].data);
+
+  const after = importRegeneratedFrame(project, encodePng(4, 4, new Uint8ClampedArray(64)), { prompt: "대기", frameId: selected.id }, "generated/frame.png");
+
+  const afterSelected = after.document.cels[celKey(selected.id, layer.id)];
+  const afterNext = after.document.cels[celKey(next.id, layer.id)];
+  assert.notEqual(afterSelected.imageId, afterNext.imageId);
+  assert.deepEqual(Array.from(after.document.images[afterNext.imageId].data), nextBefore);
+});
+
+test("잘못된 재생성 PNG는 입력 프로젝트를 변경하지 않는다", () => {
+  const project = projectWithThreeFramesAndTwoLayers();
+  const before = JSON.stringify(project);
+
+  assert.throws(
+    () => importRegeneratedFrame(project, encodePng(3, 4, new Uint8ClampedArray(48)), { prompt: "검 공격", frameId: project.document.frames[1].id }, "generated/frame.png"),
+    /크기/,
+  );
+  assert.equal(JSON.stringify(project), before);
 });
