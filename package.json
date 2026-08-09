@@ -1,0 +1,27 @@
+{
+  "name": "pixelforge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20.19"
+  },
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "build": "tsc --noEmit && vite build",
+    "test": "tsx --test tests/*.test.ts",
+    "start": "tsx src/server/index.ts"
+  },
+  "dependencies": {
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8"
+  },
+  "devDependencies": {
+    "@types/node": "^26.2.0",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.4",
+    "tsx": "^4.23.11",
+    "typescript": "^7.0.2",
+    "vite": "^8.2.1"
+  }
+}

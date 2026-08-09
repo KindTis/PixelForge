@@ -1,0 +1,189 @@
+import type { Cel, Frame, Layer, PixelBuffer, SpriteProject } from "../core/types.ts";
+import { celKey } from "../core/types.ts";
+import { decodePng } from "./png.ts";
+
+export type SpriteSheetRequest = {
+  prompt: string;
+  frameCount: number;
+  columns: number;
+  cellWidth: number;
+  cellHeight: number;
+  durationMs: number;
+  parentId?: string;
+  referencePath?: string;
+};
+
+function validate(request: SpriteSheetRequest): void {
+  if (!request.prompt.trim()) throw new Error("생성 프롬프트가 필요합니다.");
+  if (!Number.isInteger(request.frameCount) || request.frameCount < 1 || request.frameCount > 256) {
+    throw new Error("프레임 수는 1~256 사이의 정수여야 합니다.");
+  }
+  if (!Number.isInteger(request.columns) || request.columns < 1 || request.columns > request.frameCount) {
+    throw new Error("열 수는 프레임 수 이하의 양의 정수여야 합니다.");
+  }
+  if (!Number.isInteger(request.cellWidth) || !Number.isInteger(request.cellHeight)
+    || request.cellWidth < 1 || request.cellHeight < 1
+    || request.cellWidth > 4096 || request.cellHeight > 4096) {
+    throw new Error("프레임 크기는 1~4096 사이의 정수여야 합니다.");
+  }
+  if (!Number.isFinite(request.durationMs) || request.durationMs < 1) {
+    throw new Error("프레임 시간은 1ms 이상이어야 합니다.");
+  }
+  const rows = Math.ceil(request.frameCount / request.columns);
+  if (request.columns * request.cellWidth > 8192 || rows * request.cellHeight > 8192) {
+    throw new Error("전체 시트 크기는 8192픽셀을 넘을 수 없습니다.");
+  }
+}
+
+export function buildSpriteSheetPrompt(request: SpriteSheetRequest, outputPath: string): string {
+  validate(request);
+  if (!outputPath.trim()) throw new Error("출력 파일 경로가 필요합니다.");
+  const rows = Math.ceil(request.frameCount / request.columns);
+  const anchorX = Math.floor(request.cellWidth / 2);
+  const anchorY = request.cellHeight - Math.max(1, Math.round(request.cellHeight / 8));
+  return [
+    request.prompt.trim(),
+    request.referencePath ? `캐릭터 외형과 팔레트는 다음 참조 이미지를 따르세요: ${request.referencePath}` : "",
+    `캐릭터 스프라이트 시트를 ${request.frameCount}프레임, ${request.columns}열 × ${rows}행으로 제작하세요.`,
+    `각 프레임 크기: ${request.cellWidth} × ${request.cellHeight} 픽셀. 전체 이미지 크기: ${request.columns * request.cellWidth} × ${rows * request.cellHeight} 픽셀.`,
+    "모든 프레임에서 캐릭터 비율, 카메라, 조명, 팔레트를 일관되게 유지하고 셀 경계가 겹치지 않게 하세요.",
+    `모든 프레임의 지면 기준점과 하체 중심을 각 셀의 x=${anchorX}, y=${anchorY} 픽셀에 고정하고, 카메라 이동이나 루트 이동 없는 제자리 모션으로 만드세요.`,
+    "투명 배경의 픽셀 아트 PNG 한 장만 만들고, 빈 셀은 완전히 투명하게 두세요.",
+    `결과를 반드시 다음 경로에 저장하세요: ${outputPath}`,
+  ].filter(Boolean).join("\n");
+}
+
+function alignFrame(data: Uint8ClampedArray, width: number, height: number): Uint8ClampedArray {
+  const rowCounts = new Uint32Array(height);
+  let minX = width;
+  let minY = height;
+  let maxX = -1;
+  let maxY = -1;
+  let contentMinX = width;
+  let contentMinY = height;
+  let contentMaxX = -1;
+  let contentMaxY = -1;
+
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const alpha = data[(y * width + x) * 4 + 3];
+      if (alpha === 0) continue;
+      contentMinX = Math.min(contentMinX, x);
+      contentMinY = Math.min(contentMinY, y);
+      contentMaxX = Math.max(contentMaxX, x);
+      contentMaxY = Math.max(contentMaxY, y);
+      if (alpha <= 16) continue;
+      rowCounts[y] += 1;
+      minX = Math.min(minX, x);
+      minY = Math.min(minY, y);
+      maxX = Math.max(maxX, x);
+      maxY = Math.max(maxY, y);
+    }
+  }
+  if (maxY < 0) return data;
+
+  const minimumGroundPixels = Math.max(2, Math.ceil(width * 0.02));
+  let groundY = maxY;
+  while (groundY > minY && rowCounts[groundY] < minimumGroundPixels) groundY -= 1;
+  const lowerTop = Math.max(minY, groundY - Math.max(1, Math.round(height * 0.35)));
+  const lowerColumns = new Uint32Array(width);
+  let lowerPixelCount = 0;
+  for (let y = lowerTop; y <= groundY; y += 1) {
+    for (let x = minX; x <= maxX; x += 1) {
+      if (data[(y * width + x) * 4 + 3] <= 16) continue;
+      lowerColumns[x] += 1;
+      lowerPixelCount += 1;
+    }
+  }
+  const middlePixel = Math.floor((lowerPixelCount - 1) / 2);
+  let anchorX = minX;
+  let pixelsSeen = 0;
+  for (; anchorX <= maxX; anchorX += 1) {
+    pixelsSeen += lowerColumns[anchorX];
+    if (pixelsSeen > middlePixel) break;
+  }
+  const targetX = Math.floor(width / 2);
+  const targetY = height - Math.max(1, Math.round(height / 8));
+  const offsetX = Math.max(-contentMinX, Math.min(width - 1 - contentMaxX, targetX - anchorX));
+  const offsetY = Math.max(-contentMinY, Math.min(height - 1 - contentMaxY, targetY - groundY));
+  if (offsetX === 0 && offsetY === 0) return data;
+
+  const aligned = new Uint8ClampedArray(data.length);
+  for (let y = 0; y < height; y += 1) {
+    const targetYPosition = y + offsetY;
+    if (targetYPosition < 0 || targetYPosition >= height) continue;
+    for (let x = 0; x < width; x += 1) {
+      const targetXPosition = x + offsetX;
+      if (targetXPosition < 0 || targetXPosition >= width) continue;
+      const source = (y * width + x) * 4;
+      const target = (targetYPosition * width + targetXPosition) * 4;
+      aligned.set(data.subarray(source, source + 4), target);
+    }
+  }
+  return aligned;
+}
+
+export function importSpriteSheet(
+  project: SpriteProject,
+  png: Uint8Array,
+  request: SpriteSheetRequest,
+  outputPath: string,
+): SpriteProject {
+  validate(request);
+  const sheet = decodePng(png);
+  const rows = Math.ceil(request.frameCount / request.columns);
+  if (sheet.width !== request.columns * request.cellWidth || sheet.height !== rows * request.cellHeight) {
+    throw new Error("생성된 시트 크기가 요청한 격자와 다릅니다.");
+  }
+
+  const layer: Layer = {
+    id: crypto.randomUUID(),
+    name: "생성 결과",
+    visible: true,
+    locked: false,
+    opacity: 1,
+    blendMode: "normal",
+  };
+  const frames: Frame[] = [];
+  const cels: Record<string, Cel> = {};
+  const images: Record<string, PixelBuffer> = {};
+
+  for (let index = 0; index < request.frameCount; index += 1) {
+    const frame: Frame = { id: crypto.randomUUID(), durationMs: request.durationMs };
+    const imageId = crypto.randomUUID();
+    const data = new Uint8ClampedArray(request.cellWidth * request.cellHeight * 4);
+    const originX = (index % request.columns) * request.cellWidth;
+    const originY = Math.floor(index / request.columns) * request.cellHeight;
+    for (let y = 0; y < request.cellHeight; y += 1) {
+      const source = ((originY + y) * sheet.width + originX) * 4;
+      const target = y * request.cellWidth * 4;
+      data.set(sheet.data.subarray(source, source + request.cellWidth * 4), target);
+    }
+    frames.push(frame);
+    images[imageId] = { width: request.cellWidth, height: request.cellHeight, data: alignFrame(data, request.cellWidth, request.cellHeight) };
+    cels[celKey(frame.id, layer.id)] = { id: crypto.randomUUID(), imageId, x: 0, y: 0, opacity: 1 };
+  }
+
+  return {
+    ...project,
+    document: {
+      width: request.cellWidth,
+      height: request.cellHeight,
+      colorMode: "rgba",
+      frames,
+      layers: [layer],
+      cels,
+      images,
+      palette: project.document.palette,
+      tags: [],
+    },
+    generationHistory: [...project.generationHistory, {
+      id: crypto.randomUUID(),
+      prompt: request.prompt.trim(),
+      createdAt: new Date().toISOString(),
+      outputPath,
+      parentId: request.parentId,
+    }],
+    exportSettings: { ...project.exportSettings, columns: request.columns },
+  };
+}

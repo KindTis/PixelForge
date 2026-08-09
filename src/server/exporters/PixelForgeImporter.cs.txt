@@ -1,0 +1,102 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using UnityEditor;
+using UnityEditor.U2D.Sprites;
+using UnityEngine;
+
+public sealed class PixelForgeImporter : AssetPostprocessor
+{
+    [Serializable] private sealed class Bundle { public int pixelsPerUnit; public Pivot pivot; public Frame[] frames; public Animation[] animations; }
+    [Serializable] private sealed class Pivot { public float x; public float y; }
+    [Serializable] private sealed class RectData { public int x; public int y; public int w; public int h; }
+    [Serializable] private sealed class Frame { public string filename; public RectData frame; public RectData spriteSourceSize; public RectData sourceSize; public int duration; }
+    [Serializable] private sealed class Animation { public string name; public string[] frames; public string direction; }
+
+    [MenuItem("PixelForge/Import Selected Bundle")]
+    private static void ImportSelectedBundle()
+    {
+        var folder = EditorUtility.OpenFolderPanel("PixelForge 묶음 선택", Application.dataPath, "");
+        if (string.IsNullOrEmpty(folder)) return;
+        var assetFolder = FileUtil.GetProjectRelativePath(folder).Replace('\\', '/');
+        if (!assetFolder.StartsWith("Assets/", StringComparison.Ordinal) && assetFolder != "Assets")
+            throw new InvalidOperationException("묶음을 Unity 프로젝트의 Assets 폴더 안에 복사하세요.");
+
+        var data = JsonUtility.FromJson<Bundle>(File.ReadAllText(Path.Combine(folder, "pixelforge-unity.json")));
+        var texturePath = assetFolder + "/spritesheet.png";
+        AssetDatabase.ImportAsset(texturePath, ImportAssetOptions.ForceSynchronousImport);
+        var importer = (TextureImporter)AssetImporter.GetAtPath(texturePath);
+        importer.textureType = TextureImporterType.Sprite;
+        importer.spriteImportMode = SpriteImportMode.Multiple;
+        importer.filterMode = FilterMode.Point;
+        importer.textureCompression = TextureImporterCompression.Uncompressed;
+        importer.alphaIsTransparency = true;
+        importer.mipmapEnabled = false;
+        importer.spritePixelsPerUnit = data.pixelsPerUnit;
+        importer.SaveAndReimport();
+
+        var texture = AssetDatabase.LoadAssetAtPath<Texture2D>(texturePath);
+        var factory = new SpriteDataProviderFactories();
+        factory.Init();
+        ISpriteEditorDataProvider dataProvider = factory.GetSpriteEditorDataProviderFromObject(texture);
+        if (dataProvider == null) throw new InvalidOperationException("Unity Sprite Editor data provider를 찾을 수 없습니다.");
+        dataProvider.InitSpriteEditorDataProvider();
+        var spriteRects = data.frames.Select(frame => new SpriteRect {
+            name = frame.filename,
+            spriteID = GUID.Generate(),
+            rect = new Rect(frame.frame.x, texture.height - frame.frame.y - frame.frame.h, frame.frame.w, frame.frame.h),
+            alignment = SpriteAlignment.Custom,
+            pivot = AdjustedPivot(frame, data.pivot)
+        }).ToArray();
+        dataProvider.SetSpriteRects(spriteRects);
+        dataProvider.GetDataProvider<ISpriteNameFileIdDataProvider>().SetNameFileIdPairs(
+            spriteRects.Select(rect => new SpriteNameFileIdPair(rect.name, rect.spriteID)));
+        dataProvider.Apply();
+        var dataImporter = dataProvider.targetObject as AssetImporter;
+        if (dataImporter == null) throw new InvalidOperationException("Unity TextureImporter를 찾을 수 없습니다.");
+        dataImporter.SaveAndReimport();
+
+        var sprites = AssetDatabase.LoadAllAssetsAtPath(texturePath).OfType<Sprite>().ToDictionary(sprite => sprite.name);
+        var durations = data.frames.ToDictionary(frame => frame.filename, frame => frame.duration / 1000f);
+        var animationFolder = assetFolder + "/PixelForgeAnimations";
+        if (!AssetDatabase.IsValidFolder(animationFolder)) AssetDatabase.CreateFolder(assetFolder, "PixelForgeAnimations");
+        foreach (var animation in data.animations) CreateClip(animationFolder, animation, sprites, durations);
+        AssetDatabase.SaveAssets();
+        Selection.activeObject = texture;
+    }
+
+    private static Vector2 AdjustedPivot(Frame frame, Pivot pivot)
+    {
+        var sourceBottom = frame.sourceSize.h - frame.spriteSourceSize.y - frame.spriteSourceSize.h;
+        return new Vector2(
+            (pivot.x * frame.sourceSize.w - frame.spriteSourceSize.x) / frame.spriteSourceSize.w,
+            (pivot.y * frame.sourceSize.h - sourceBottom) / frame.spriteSourceSize.h);
+    }
+
+    private static void CreateClip(string folder, Animation animation, Dictionary<string, Sprite> sprites, Dictionary<string, float> durations)
+    {
+        var sequence = Expand(animation).ToArray();
+        var keys = new List<ObjectReferenceKeyframe>();
+        var time = 0f;
+        foreach (var name in sequence) {
+            keys.Add(new ObjectReferenceKeyframe { time = time, value = sprites[name] });
+            time += durations[name];
+        }
+        keys.Add(new ObjectReferenceKeyframe { time = time, value = sprites[sequence[0]] });
+        var clip = new AnimationClip { frameRate = 60, wrapMode = WrapMode.Loop };
+        AnimationUtility.SetObjectReferenceCurve(clip, EditorCurveBinding.PPtrCurve("", typeof(SpriteRenderer), "m_Sprite"), keys.ToArray());
+        var filename = string.Join("_", animation.name.Split(Path.GetInvalidFileNameChars(), StringSplitOptions.RemoveEmptyEntries)).Replace('/', '_');
+        var path = folder + "/" + (string.IsNullOrEmpty(filename) ? "animation" : filename) + ".anim";
+        if (AssetDatabase.LoadAssetAtPath<AnimationClip>(path) != null) AssetDatabase.DeleteAsset(path);
+        AssetDatabase.CreateAsset(clip, path);
+    }
+
+    private static IEnumerable<string> Expand(Animation animation)
+    {
+        if (animation.direction == "reverse") return animation.frames.Reverse();
+        if (animation.direction == "pingPong" && animation.frames.Length > 2)
+            return animation.frames.Concat(animation.frames.Skip(1).Take(animation.frames.Length - 2).Reverse());
+        return animation.frames;
+    }
+}
