@@ -41,3 +41,25 @@ SyntaxError: The requested module '../src/server/generation.ts' does not provide
 - 프로젝트 문서나 선택하지 않은 프레임을 변경하지 않으며, 생성 이력·상태 머신도 추가하지 않았다.
 - `parentId`는 후속 생성 흐름에서 사용할 계약 필드이므로 이 프롬프트 빌더에서는 소비하지 않는다.
 - 현재 태그 선택은 태그 수가 적은 편집기 문서를 전제로 한 선형 탐색이며, 대규모 태그 성능이 필요해질 때만 인덱싱을 검토한다.
+
+## 수정 라운드 1
+
+### 변경 내용
+
+- 2프레임 프로젝트에서 첫 프레임은 `first`·`next`만, 마지막 프레임은 `first`·`previous`만 포함하고 반대 역할은 제외하는 테스트를 추가했다.
+- `previous`·`next`가 공백이면 참조 역할을 프롬프트에 포함하지 않도록 `trim()` 검사로 수정했다.
+
+### TDD 검증
+
+RED 명령:
+
+```text
+npx.cmd tsx --test tests/generation.test.ts
+```
+
+핵심 실패: `공백인 선택 참조 경로는 프롬프트에 포함하지 않는다` 테스트가 실패했고, 출력에 `이전 프레임 참조:  ` 및 `다음 프레임 참조:`가 포함됐다.
+
+GREEN 명령 및 결과:
+
+- `npx.cmd tsx --test tests/generation.test.ts` → 10 tests, 10 pass, 0 fail
+- `npm.cmd test` → 74 tests, 74 pass, 0 fail

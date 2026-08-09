@@ -101,6 +101,39 @@ test("선택 프레임 프롬프트는 전달된 참조 역할만 포함한다",
   assert.doesNotMatch(prompt, /다음 프레임 참조/);
 });
 
+test("첫 프레임과 마지막 프레임은 가능한 역할별 참조만 포함한다", () => {
+  const document = createDocument({ width: 8, height: 8 });
+  document.frames.push({ id: crypto.randomUUID(), durationMs: 100 });
+  const project = createProject("기사", document);
+
+  const firstPrompt = buildFrameRegenerationPrompt(project, {
+    prompt: "시작",
+    frameId: project.document.frames[0].id,
+  }, { first: "first.png", next: "next.png" }, "first-frame.png");
+  assert.match(firstPrompt, /첫 프레임 참조.*first\.png/);
+  assert.match(firstPrompt, /다음 프레임 참조.*next\.png/);
+  assert.doesNotMatch(firstPrompt, /이전 프레임 참조/);
+
+  const lastPrompt = buildFrameRegenerationPrompt(project, {
+    prompt: "끝",
+    frameId: project.document.frames[1].id,
+  }, { first: "first.png", previous: "previous.png" }, "last-frame.png");
+  assert.match(lastPrompt, /첫 프레임 참조.*first\.png/);
+  assert.match(lastPrompt, /이전 프레임 참조.*previous\.png/);
+  assert.doesNotMatch(lastPrompt, /다음 프레임 참조/);
+});
+
+test("공백인 선택 참조 경로는 프롬프트에 포함하지 않는다", () => {
+  const project = createProject("기사", createDocument({ width: 8, height: 8 }));
+  const prompt = buildFrameRegenerationPrompt(project, {
+    prompt: "대기",
+    frameId: project.document.frames[0].id,
+  }, { first: "first.png", previous: " ", next: "\t" }, "frame.png");
+
+  assert.doesNotMatch(prompt, /이전 프레임 참조/);
+  assert.doesNotMatch(prompt, /다음 프레임 참조/);
+});
+
 test("잘못된 생성 요청을 거부한다", () => {
   assert.throws(
     () => buildSpriteSheetPrompt({ ...request, frameCount: 0 }, "sheet.png"),
