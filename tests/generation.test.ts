@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createDocument, createProject } from "../src/core/document.ts";
-import { buildSpriteSheetPrompt, importSpriteSheet, type SpriteSheetRequest } from "../src/server/generation.ts";
+import { buildFrameRegenerationPrompt, buildSpriteSheetPrompt, importSpriteSheet, type SpriteSheetRequest } from "../src/server/generation.ts";
 import { encodePng } from "../src/server/png.ts";
 
 const request: SpriteSheetRequest = {
@@ -51,6 +51,54 @@ test("생성 프롬프트는 투명 배경, 정확한 격자와 출력 파일을
   assert.match(prompt, /제자리 모션/);
   assert.match(prompt, /references\/hero\.png/);
   assert.match(prompt, /C:\/project\/generated\/sheet\.png/);
+});
+
+test("선택 프레임 프롬프트는 태그 진행률과 역할별 참조를 포함한다", () => {
+  const document = createDocument({ width: 32, height: 32 });
+  document.frames.push(
+    { id: crypto.randomUUID(), durationMs: 100 },
+    { id: crypto.randomUUID(), durationMs: 100 },
+    { id: crypto.randomUUID(), durationMs: 100 },
+  );
+  document.tags.push({
+    id: crypto.randomUUID(),
+    name: "attack",
+    fromFrameId: document.frames[0].id,
+    toFrameId: document.frames[3].id,
+    direction: "reverse",
+  });
+  const project = createProject("기사", document);
+  const prompt = buildFrameRegenerationPrompt(project, {
+    prompt: "검 공격",
+    frameId: project.document.frames[2].id,
+  }, {
+    first: "C:/project/generated/job/first.png",
+    previous: "C:/project/generated/job/previous.png",
+    next: "C:/project/generated/job/next.png",
+  }, "C:/project/generated/job/frame.png");
+
+  assert.match(prompt, /선택 프레임: 3\/4/);
+  assert.match(prompt, /애니메이션 태그: attack/);
+  assert.match(prompt, /재생 방향: reverse/);
+  assert.match(prompt, /진행률: 66\.7%/);
+  assert.match(prompt, /준비·타격·후속·복귀/);
+  assert.match(prompt, /첫 프레임 참조.*first\.png/);
+  assert.match(prompt, /이전 프레임 참조.*previous\.png/);
+  assert.match(prompt, /다음 프레임 참조.*next\.png/);
+  assert.match(prompt, /투명 배경/);
+  assert.match(prompt, /지면 기준점/);
+});
+
+test("선택 프레임 프롬프트는 전달된 참조 역할만 포함한다", () => {
+  const project = createProject("기사", createDocument({ width: 8, height: 8 }));
+  const prompt = buildFrameRegenerationPrompt(project, {
+    prompt: "대기",
+    frameId: project.document.frames[0].id,
+  }, { first: "first.png" }, "frame.png");
+
+  assert.match(prompt, /첫 프레임 참조.*first\.png/);
+  assert.doesNotMatch(prompt, /이전 프레임 참조/);
+  assert.doesNotMatch(prompt, /다음 프레임 참조/);
 });
 
 test("잘못된 생성 요청을 거부한다", () => {

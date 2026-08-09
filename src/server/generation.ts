@@ -13,6 +13,19 @@ export type SpriteSheetRequest = {
   referencePath?: string;
 };
 
+export type FrameRegenerationRequest = {
+  prompt: string;
+  frameId: string;
+  parentId?: string;
+  referencePath?: string;
+};
+
+export type FrameReferencePaths = {
+  first: string;
+  previous?: string;
+  next?: string;
+};
+
 function validate(request: SpriteSheetRequest): void {
   if (!request.prompt.trim()) throw new Error("생성 프롬프트가 필요합니다.");
   if (!Number.isInteger(request.frameCount) || request.frameCount < 1 || request.frameCount > 256) {
@@ -49,6 +62,51 @@ export function buildSpriteSheetPrompt(request: SpriteSheetRequest, outputPath: 
     "모든 프레임에서 캐릭터 비율, 카메라, 조명, 팔레트를 일관되게 유지하고 셀 경계가 겹치지 않게 하세요.",
     `모든 프레임의 지면 기준점과 하체 중심을 각 셀의 x=${anchorX}, y=${anchorY} 픽셀에 고정하고, 카메라 이동이나 루트 이동 없는 제자리 모션으로 만드세요.`,
     "투명 배경의 픽셀 아트 PNG 한 장만 만들고, 빈 셀은 완전히 투명하게 두세요.",
+    `결과를 반드시 다음 경로에 저장하세요: ${outputPath}`,
+  ].filter(Boolean).join("\n");
+}
+
+export function buildFrameRegenerationPrompt(
+  project: SpriteProject,
+  request: FrameRegenerationRequest,
+  references: FrameReferencePaths,
+  outputPath: string,
+): string {
+  if (!request.prompt.trim()) throw new Error("생성 프롬프트가 필요합니다.");
+  if (!outputPath.trim()) throw new Error("출력 파일 경로가 필요합니다.");
+  if (!references.first.trim()) throw new Error("첫 프레임 참조 경로가 필요합니다.");
+
+  const { frames, tags } = project.document;
+  const frameIndex = frames.findIndex((frame) => frame.id === request.frameId);
+  if (frameIndex < 0) throw new Error("선택한 프레임을 찾을 수 없습니다.");
+
+  const containingTags = tags.filter((tag) => {
+    const from = frames.findIndex((frame) => frame.id === tag.fromFrameId);
+    const to = frames.findIndex((frame) => frame.id === tag.toFrameId);
+    return from >= 0 && to >= from && frameIndex >= from && frameIndex <= to;
+  });
+  const tag = containingTags.sort((left, right) => {
+    const leftSpan = frames.findIndex((frame) => frame.id === left.toFrameId) - frames.findIndex((frame) => frame.id === left.fromFrameId);
+    const rightSpan = frames.findIndex((frame) => frame.id === right.toFrameId) - frames.findIndex((frame) => frame.id === right.fromFrameId);
+    return leftSpan - rightSpan;
+  })[0];
+  const progress = frames.length === 1 ? 0 : (frameIndex / (frames.length - 1)) * 100;
+  const anchorX = Math.floor(project.document.width / 2);
+  const anchorY = project.document.height - Math.max(1, Math.round(project.document.height / 8));
+
+  return [
+    request.prompt.trim(),
+    request.referencePath ? `캐릭터 외형과 팔레트는 다음 참조 이미지를 따르세요: ${request.referencePath}` : "",
+    `선택 프레임: ${frameIndex + 1}/${frames.length}`,
+    `애니메이션 태그: ${tag?.name ?? "전체 구간"}`,
+    `재생 방향: ${tag?.direction ?? "forward"}`,
+    `진행률: ${progress.toFixed(1)}%`,
+    "준비·타격·후속·복귀 흐름과 앞뒤 프레임의 캐릭터 일관성을 유지하세요.",
+    `첫 프레임 참조: ${references.first}`,
+    references.previous ? `이전 프레임 참조: ${references.previous}` : "",
+    references.next ? `다음 프레임 참조: ${references.next}` : "",
+    `정확한 캔버스 크기: ${project.document.width} × ${project.document.height} 픽셀. 투명 배경의 픽셀 아트 한 프레임만 만드세요.`,
+    `지면 기준점과 하체 중심을 각 프레임의 x=${anchorX}, y=${anchorY} 픽셀에 고정하세요.`,
     `결과를 반드시 다음 경로에 저장하세요: ${outputPath}`,
   ].filter(Boolean).join("\n");
 }
