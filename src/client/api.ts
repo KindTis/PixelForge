@@ -85,6 +85,10 @@ export function pollingErrorGenerationJob(job: GenerationJob | undefined, id: st
   return { ...job, error };
 }
 
+export function isRetryablePollingError(error: unknown): boolean {
+  return !(error instanceof Error && error.cause instanceof Response);
+}
+
 export function failedGenerationJob(job: GenerationJob | undefined, id: string, error: string): GenerationJob | undefined {
   return job?.id === id ? { ...job, status: "failed", error } : job;
 }
@@ -99,6 +103,6 @@ export async function api<T>(path: string, token?: string, init?: RequestInit): 
     },
   });
   const result = await response.json() as T & { error?: string };
-  if (!response.ok) throw new Error(result.error ?? `요청 실패 (${response.status})`);
+  if (!response.ok) throw new Error(result.error ?? `요청 실패 (${response.status})`, { cause: response });
   return result;
 }

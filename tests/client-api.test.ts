@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createDocument, createProject } from "../src/core/document.ts";
-import { completedFrameIndex, decodeProject, encodeProject, failedGenerationJob, generationPayload, generationStatusTitle, pollingErrorGenerationJob, type GenerationJob, type WireProject } from "../src/client/api.ts";
+import { api, completedFrameIndex, decodeProject, encodeProject, failedGenerationJob, generationPayload, generationStatusTitle, isRetryablePollingError, pollingErrorGenerationJob, type GenerationJob, type WireProject } from "../src/client/api.ts";
 
 test("프로젝트 픽셀을 JSON 배열로 보내고 Uint8ClampedArray로 복원한다", () => {
   const project = createProject("저장", createDocument({ width: 1, height: 1 }));
@@ -92,4 +92,22 @@ test("폴링 실패는 같은 생성 작업만 실패 상태로 바꾼다", () =
 
   assert.deepEqual(failedGenerationJob(job, "job", "연결이 끊어졌습니다."), { ...job, status: "failed", error: "연결이 끊어졌습니다." });
   assert.equal(failedGenerationJob(job, "new-job", "연결이 끊어졌습니다."), job);
+});
+
+test("HTTP 응답 오류는 폴링 재시도에서 제외하고 전송·JSON 오류는 재시도한다", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(JSON.stringify({ error: "생성 작업을 찾을 수 없습니다." }), {
+    status: 404,
+    headers: { "content-type": "application/json" },
+  });
+
+  try {
+    const httpError = await api("/api/generations/missing").then(() => undefined, (reason: unknown) => reason);
+    assert.equal(httpError instanceof Error, true);
+    assert.equal(isRetryablePollingError(httpError), false);
+    assert.equal(isRetryablePollingError(new TypeError("fetch failed")), true);
+    assert.equal(isRetryablePollingError(new SyntaxError("Unexpected token")), true);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
