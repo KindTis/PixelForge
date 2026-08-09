@@ -298,6 +298,11 @@ export function importRegeneratedFrame(
   const result = next.document.colorMode === "indexed"
     ? indexedToRgba(quantizeToPalette({ width: generated.width, height: generated.height, data: aligned }, palette), generated.width, generated.height, palette)
     : { width: generated.width, height: generated.height, data: aligned };
+  const blank = new Uint8ClampedArray(result.data.length);
+  if (next.document.colorMode === "indexed") {
+    const transparent = palette.find((color) => color[3] === 0)!;
+    for (let offset = 0; offset < blank.length; offset += 4) blank.set(transparent, offset);
+  }
   const replacedImageIds = new Set(cels.map(({ cel }) => cel.imageId));
 
   for (const { layer, cel } of cels) {
@@ -306,7 +311,7 @@ export function importRegeneratedFrame(
     next.document.images[imageId] = {
       width: generated.width,
       height: generated.height,
-      data: cel.id === output.cel.id ? result.data : new Uint8ClampedArray(result.data.length),
+      data: cel.id === output.cel.id ? result.data : new Uint8ClampedArray(blank),
     };
   }
   for (const imageId of replacedImageIds) {

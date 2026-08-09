@@ -412,3 +412,36 @@ test("셀 오프셋 역이동이 경계를 넘으면 재생성은 입력을 변�
   );
   assert.equal(JSON.stringify(project), before);
 });
+
+test("임의 RGB 투명 팔레트의 다중 레이어 인덱스 문서는 투명 배경을 유지하며 재생성한다", () => {
+  let document = createDocument({ width: 4, height: 4 });
+  document = addLayer(document, "효과");
+  document.colorMode = "indexed";
+  const transparent = [10, 20, 30, 0] as const;
+  document.palette.push({ id: crypto.randomUUID(), name: "투명", color: transparent });
+  for (const image of Object.values(document.images)) {
+    for (let offset = 0; offset < image.data.length; offset += 4) image.data.set(transparent, offset);
+  }
+  const project = createProject("기사", document);
+  const palette = structuredClone(project.document.palette);
+  const frame = document.frames[0];
+  const png = encodePng(4, 4, new Uint8ClampedArray([
+    250, 250, 250, 255, 250, 250, 250, 255, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+  ]));
+
+  const after = importRegeneratedFrame(project, png, { prompt: "검 공격", frameId: frame.id }, "generated/frame.png");
+
+  const blankLayer = after.document.layers[1];
+  const blankCel = after.document.cels[celKey(frame.id, blankLayer.id)];
+  assert.deepEqual(after.document.palette, palette);
+  assert.deepEqual(Array.from(after.document.images[blankCel.imageId].data), Array.from({ length: 16 }, () => transparent).flat());
+  assert.deepEqual(Array.from(compositeFrame(after.document, frame.id).data), [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 255, 255, 255, 255, 255, 255, 255, 255,
+  ]);
+});
