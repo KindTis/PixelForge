@@ -2,6 +2,8 @@
 .playwright-cli/
 .codex/
 docs/
+/graphify-out/
+/AGENTS.md
 node_modules/
 dist/
 projects/
