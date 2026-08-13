@@ -1,3 +1,4 @@
+import type { EditorTool } from "../../core/ai-edit.ts";
 import type { EditCommand, PixelChange } from "../../core/commands.ts";
 import {
   ellipse,
@@ -15,7 +16,7 @@ import {
 import { lassoMask, magicWandMask, rectangleMask } from "../../core/selection.ts";
 import type { PixelBuffer, RGBA } from "../../core/types.ts";
 
-export type EditorTool = "pencil" | "eraser" | "line" | "curve" | "rectangle" | "ellipse" | "polygon" | "fill" | "gradient" | "spray" | "eyedropper" | "select" | "lasso" | "wand";
+export type { EditorTool } from "../../core/ai-edit.ts";
 
 export type ToolSettings = {
   tool: EditorTool;
