@@ -72,7 +72,9 @@ textarea { resize: vertical; color: var(--paper); font-size: 12px; line-height: 
 .reference-file span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .reference-file button { border: 0; background: transparent; color: var(--muted); font-size: 9px; }
 .forge-button, .primary { width: 100%; display: flex; justify-content: space-between; border: 0; background: var(--forge); color: #18130d; padding: 12px; font-weight: 800; font-size: 11px; box-shadow: 4px 4px 0 #7b4a15; }
+.forge-button + .forge-button { margin-top: 8px; }
 .forge-button:active, .primary:active { transform: translate(2px, 2px); box-shadow: 2px 2px 0 #7b4a15; }
+.cell-edit-scope { margin: 8px 0 0; }
 .job-status { margin: 0 14px 14px; padding: 11px; border-left: 2px solid var(--cool); background: #0e1114; }
 .job-status b { font-size: 11px; }
 .job-status p { color: var(--muted); font-size: 10px; line-height: 1.4; }

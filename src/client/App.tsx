@@ -1,10 +1,11 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import type { SpriteProject } from "../core/types.ts";
-import { api, completedFrameIndex, decodeProject, encodeProject, failedGenerationJob, generationPayload, generationStatusTitle, isRetryablePollingError, pollingErrorGenerationJob, type GenerationJob, type Session } from "./api.ts";
-import { EditorWorkspace } from "./editor/EditorWorkspace.tsx";
+import { api, cellEditPayload, codexJobStatusTitle, completedFrameIndex, decodeProject, encodeProject, failedCodexJob, generationPayload, isRetryablePollingError, pollingErrorCodexJob, type CellEditJob, type CodexJob, type GenerationJob, type Session } from "./api.ts";
+import { EditorWorkspace, type EditorWorkspaceHandle } from "./editor/EditorWorkspace.tsx";
 import { ExportDialog, type ExportResult, type ExportTarget } from "./ExportDialog.tsx";
 
 type ProjectSummary = { id: string; name: string };
+const CELL_EDIT_UNAVAILABLE = "설치된 Codex App Server에서 현재 셀 편집을 사용할 수 없습니다.";
 
 async function rgbaPngBase64(file: File): Promise<string> {
   const image = await createImageBitmap(file);
@@ -81,13 +82,16 @@ export function App() {
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
   const [project, setProject] = useState<SpriteProject>();
   const latestProject = useRef<SpriteProject | undefined>(undefined);
+  const editor = useRef<EditorWorkspaceHandle>(null);
   const [frameIndex, setFrameIndex] = useState(0);
   const [dirty, setDirty] = useState(false);
   const [prompt, setPrompt] = useState("칼을 휘두르는 2D 기사 캐릭터, 선명한 실루엣, 제한된 판타지 팔레트");
   const [frameCount, setFrameCount] = useState(8);
   const [columns, setColumns] = useState(4);
-  const [job, setJob] = useState<GenerationJob>();
-  const [generationStarting, setGenerationStarting] = useState(false);
+  const [job, setJob] = useState<CodexJob>();
+  const [startingKind, setStartingKind] = useState<"generation" | "cellEdit">();
+  const cellEditCancelRequested = useRef(false);
+  const [cellEditUnavailable, setCellEditUnavailable] = useState("");
   const [reference, setReference] = useState<{ name: string; path: string }>();
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
@@ -104,7 +108,7 @@ export function App() {
   }, []);
 
   latestProject.current = project;
-  const generationBusy = generationStarting || job?.status === "running" || job?.status === "awaitingApproval" || job?.status === "cancelling" || job?.status === "finalizing";
+  const codexBusy = Boolean(startingKind) || job?.status === "running" || job?.status === "awaitingApproval" || job?.status === "cancelling" || job?.status === "finalizing";
 
   const login = async () => {
     if (!session) return;
@@ -148,21 +152,42 @@ export function App() {
     return () => window.clearTimeout(timer);
   }, [dirty, project, session]);
 
-  const poll = async (id: string, projectId: string, requestedFrameId?: string) => {
+  const cancelCellEdit = async (id: string) => {
+    if (!session) return;
+    try {
+      await api<CellEditJob>(`/api/edits/${id}`, session.token, { method: "DELETE" });
+    } catch (reason) {
+      const response = reason instanceof Error && reason.cause instanceof Response ? reason.cause : undefined;
+      if (response?.status === 409) cellEditCancelRequested.current = false;
+    }
+  };
+
+  const poll = async (started: CodexJob, projectId: string, requestedFrameId?: string) => {
     for (;;) {
-      let next: GenerationJob;
+      let next: CodexJob;
       try {
-        next = await api<GenerationJob>(`/api/generations/${id}`);
+        const collection = started.kind === "generation" ? "generations" : "edits";
+        next = await api<CodexJob>(`/api/${collection}/${started.id}`);
       } catch (reason) {
         if (!isRetryablePollingError(reason)) throw reason;
         const message = reason instanceof Error ? reason.message : String(reason);
-        setJob((current) => pollingErrorGenerationJob(current, id, message));
+        setJob((current) => pollingErrorCodexJob(current, started.id, message));
         await new Promise((resolve) => window.setTimeout(resolve, 500));
         continue;
       }
       if (latestProject.current?.id !== projectId) return;
+      if (next.kind !== started.kind) throw new Error("작업 종류가 요청과 일치하지 않습니다.");
+      if (next.kind === "cellEdit" && cellEditCancelRequested.current) {
+        if (next.status === "running" || next.status === "awaitingApproval") await cancelCellEdit(next.id);
+        else if (next.status === "finalizing" || next.status === "completed" || next.status === "failed" || next.status === "cancelled") cellEditCancelRequested.current = false;
+      }
+      setJob(next);
       if (next.status === "completed") {
-        if (!next.project) {
+        if (next.kind === "cellEdit") {
+          if (!next.result || !editor.current) throw new Error("완료된 현재 셀 편집 결과가 없습니다.");
+          const applied = editor.current.applyAiEdit(next.target, next.result);
+          setNotice(`동작 ${applied.actionCount}개 적용 · ${applied.summary}`);
+        } else if (!next.project) {
           completedFrameIndex(undefined, requestedFrameId, next.frameId);
         } else {
           const completedProject = decodeProject(next.project);
@@ -175,7 +200,6 @@ export function App() {
         }
         return;
       }
-      setJob(next);
       if (next.status === "failed" || next.status === "cancelled") return;
       await new Promise((resolve) => window.setTimeout(resolve, 500));
     }
@@ -185,7 +209,7 @@ export function App() {
     if (!session || !project) return;
     setError("");
     setNotice("");
-    setGenerationStarting(true);
+    setStartingKind("generation");
     try {
       if (!(await save())) return;
       const started = await api<GenerationJob>("/api/generations", session.token, {
@@ -193,32 +217,84 @@ export function App() {
         body: JSON.stringify(generationPayload(project, prompt, frameCount, Math.min(columns, frameCount), reference?.path, frameId)),
       });
       setJob(started);
-      void poll(started.id, project.id, frameId).catch((reason) => {
+      setStartingKind(undefined);
+      void poll(started, project.id, frameId).catch((reason) => {
         const message = reason instanceof Error ? reason.message : String(reason);
         setError(message);
-        setJob((current) => failedGenerationJob(current, started.id, message));
+        setJob((current) => failedCodexJob(current, started.id, message));
       });
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
-      setGenerationStarting(false);
+      setStartingKind((current) => current === "generation" ? undefined : current);
+    }
+  };
+
+  const editCurrentCell = async () => {
+    if (!session || !project || !editor.current) return;
+    setError("");
+    setNotice("");
+    let request;
+    try {
+      request = editor.current.captureAiEditRequest(prompt);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+      return;
+    }
+    let started: CellEditJob | undefined;
+    cellEditCancelRequested.current = false;
+    setStartingKind("cellEdit");
+    try {
+      if (!(await save()) || cellEditCancelRequested.current) return;
+      started = await api<CellEditJob>("/api/edits", session.token, {
+        method: "POST",
+        body: JSON.stringify(cellEditPayload(project.id, request)),
+      });
+      setJob(started);
+      if (cellEditCancelRequested.current) await cancelCellEdit(started.id);
+      setStartingKind(undefined);
+      void poll(started, project.id).catch((reason) => {
+        const message = reason instanceof Error ? reason.message : String(reason);
+        setError(message);
+        setJob((current) => failedCodexJob(current, started!.id, message));
+      });
+    } catch (reason) {
+      const message = reason instanceof Error ? reason.message : String(reason);
+      if (message === CELL_EDIT_UNAVAILABLE) setCellEditUnavailable(message);
+      setError(message);
+    } finally {
+      if (!started) cellEditCancelRequested.current = false;
+      setStartingKind((current) => current === "cellEdit" ? undefined : current);
     }
   };
 
   const cancel = async () => {
-    if (!session || !job) return;
-    await api(`/api/generations/${job.id}`, session.token, { method: "DELETE" });
-    setJob({ ...job, status: "cancelled" });
+    if (!session) return;
+    if (startingKind === "cellEdit") {
+      cellEditCancelRequested.current = true;
+      return;
+    }
+    if (!job) return;
+    if (job.kind === "cellEdit") {
+      cellEditCancelRequested.current = true;
+      await cancelCellEdit(job.id);
+      return;
+    }
+    try {
+      setJob(await api<GenerationJob>(`/api/generations/${job.id}`, session.token, { method: "DELETE" }));
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    }
   };
 
   const approve = async (accept: boolean) => {
-    if (!session || !job) return;
+    if (!session || !job || job.kind !== "generation") return;
     await api("/api/approvals", session.token, { method: "POST", body: JSON.stringify({ jobId: job.id, accept }) });
     setJob({ ...job, status: accept ? "running" : "cancelled", approval: undefined });
   };
 
   const uploadReference = async (file?: File) => {
-    if (!file || !session || !project || generationBusy) return;
+    if (!file || !session || !project || codexBusy) return;
     setError("");
     try {
       const result = await api<{ path: string }>("/api/references", session.token, { method: "POST", body: JSON.stringify({ projectId: project.id, pngBase64: await rgbaPngBase64(file) }) });
@@ -228,7 +304,7 @@ export function App() {
   };
 
   const importSheet = async (file?: File) => {
-    if (!file || !session || !project || generationBusy) return;
+    if (!file || !session || !project || codexBusy) return;
     setError("");
     try {
       const imported = decodeProject(await api<SpriteProject>("/api/imports", session.token, {
@@ -258,7 +334,7 @@ export function App() {
   };
 
   const leaveProject = async () => {
-    if (generationBusy) return;
+    if (codexBusy) return;
     if (dirty && !(await save())) return;
     setProject(undefined);
     setJob(undefined);
@@ -277,57 +353,67 @@ export function App() {
 
   if (!session) return <main className="loading-screen"><span className="brand-mark">PF</span><p>{error || "작업실을 여는 중…"}</p></main>;
   const account = session.account.account;
+  const startingCellEdit = startingKind === "cellEdit";
 
   return (
     <main className="app-shell">
       <header className="topbar">
-        <button className="brand" type="button" disabled={generationBusy} onClick={() => void leaveProject()} aria-label="프로젝트 선택으로 이동"><span className="brand-mark">PF</span><b>PixelForge</b></button>
+        <button className="brand" type="button" disabled={codexBusy} onClick={() => void leaveProject()} aria-label="프로젝트 선택으로 이동"><span className="brand-mark">PF</span><b>PixelForge</b></button>
         <span className="divider" />
         <strong className="project-name">{project?.name ?? "프로젝트 선택"}</strong>
         <div className="top-actions">
           {account?.type === "chatgpt"
             ? <span className="account"><i />{account.planType || "ChatGPT"} · {account.email}</span>
             : <button type="button" onClick={() => void login()}>ChatGPT 로그인</button>}
-          {project && <button type="button" disabled={generationBusy} onClick={() => setShowExport(true)}>내보내기</button>}
-          {project && <button type="button" disabled={generationBusy} onClick={() => void save()}>저장 <kbd>Ctrl S</kbd></button>}
+          {project && <button type="button" disabled={codexBusy} onClick={() => setShowExport(true)}>내보내기</button>}
+          {project && <button type="button" disabled={codexBusy} onClick={() => void save()}>저장 <kbd>Ctrl S</kbd></button>}
         </div>
       </header>
 
       {!project ? <NewProject token={session.token} projects={projects} onOpen={selectProject} onCreate={(next) => {
         setProjects((current) => [{ id: next.id, name: next.name }, ...current]);
         selectProject(next);
-      }} /> : <EditorWorkspace project={project} frameIndex={frameIndex} readOnly={generationBusy} onFrameIndex={setFrameIndex} onChange={(next) => { setProject(next); setDirty(true); }} onSave={() => void save()} saveState={dirty ? "저장 대기" : "저장됨"} onError={setError} generationPanel={
+      }} /> : <EditorWorkspace ref={editor} project={project} frameIndex={frameIndex} readOnly={codexBusy} onFrameIndex={setFrameIndex} onChange={(next) => { setProject(next); setDirty(true); }} onSave={() => void save()} saveState={dirty ? "저장 대기" : "저장됨"} onError={setError} generationPanel={({ hasActiveCel, activeLayerLocked }) =>
           <section className="generation-panel">
             <div className="panel-title"><span>CODEX FORGE</span><b>{account?.type === "chatgpt" ? "연결됨" : "로그인 필요"}</b></div>
             <form onSubmit={(event) => { event.preventDefault(); void generate(); }}>
-              <label>프롬프트<textarea rows={6} disabled={generationBusy} value={prompt} onChange={(event) => setPrompt(event.target.value)} /></label>
+              <label>프롬프트<textarea rows={6} disabled={codexBusy} value={prompt} onChange={(event) => setPrompt(event.target.value)} /></label>
               <div className="form-grid">
-                <label>프레임<input type="number" min="1" max="256" disabled={generationBusy} value={frameCount} onChange={(event) => setFrameCount(Number(event.target.value))} /></label>
-                <label>열<input type="number" min="1" max={frameCount} disabled={generationBusy} value={columns} onChange={(event) => setColumns(Number(event.target.value))} /></label>
+                <label>프레임<input type="number" min="1" max="256" disabled={codexBusy} value={frameCount} onChange={(event) => setFrameCount(Number(event.target.value))} /></label>
+                <label>열<input type="number" min="1" max={frameCount} disabled={codexBusy} value={columns} onChange={(event) => setColumns(Number(event.target.value))} /></label>
               </div>
               <p className="hint">{project.document.width} × {project.document.height}px · 투명 배경 · PNG</p>
               <div className="asset-inputs">
-                <label>참조 PNG<input type="file" accept="image/png" disabled={generationBusy} onChange={(event) => void uploadReference(event.target.files?.[0])} /></label>
-                <label>시트 가져오기<input type="file" accept="image/png" disabled={generationBusy} onChange={(event) => void importSheet(event.target.files?.[0])} /></label>
+                <label>참조 PNG<input type="file" accept="image/png" disabled={codexBusy} onChange={(event) => void uploadReference(event.target.files?.[0])} /></label>
+                <label>시트 가져오기<input type="file" accept="image/png" disabled={codexBusy} onChange={(event) => void importSheet(event.target.files?.[0])} /></label>
               </div>
-              {reference && <p className="reference-file"><span>{reference.name}</span><button type="button" disabled={generationBusy} onClick={() => setReference(undefined)}>제거</button></p>}
-              <button className="forge-button" type="submit" disabled={!account || generationBusy}>
+              {reference && <p className="reference-file"><span>{reference.name}</span><button type="button" disabled={codexBusy} onClick={() => setReference(undefined)}>제거</button></p>}
+              <button className="forge-button" type="submit" disabled={!account || codexBusy}>
                 <span>{project.generationHistory.length ? "프롬프트로 다시 생성" : "스프라이트 생성"}</span><b>⌘ ↗</b>
               </button>
-              <button className="forge-button" type="button" disabled={!account || generationBusy || !project.document.frames[frameIndex]} onClick={() => void generate(project.document.frames[frameIndex]?.id)}>
+              <button className="forge-button" type="button" disabled={!account || codexBusy || !project.document.frames[frameIndex]} onClick={() => void generate(project.document.frames[frameIndex]?.id)}>
                 <span>선택 프레임 재생성</span><b>⌘ ↗</b>
               </button>
+              <button className="forge-button" type="button" disabled={account?.type !== "chatgpt" || !prompt.trim() || !hasActiveCel || activeLayerLocked || codexBusy || Boolean(cellEditUnavailable)} onClick={() => void editCurrentCell()}>
+                <span>현재 셀 편집</span><b>⌘ ↗</b>
+              </button>
+              <p className="hint cell-edit-scope">현재 프레임의 활성 레이어 셀 하나만 편집합니다.</p>
+              {cellEditUnavailable && <p className="error" role="status">{cellEditUnavailable}</p>}
             </form>
-            {job && <div className={`job-status ${job.status}`} aria-live="polite">
-              <b>{generationStatusTitle(job)}</b>
-              <p>{job.error || job.messages?.at(-1) || "캐릭터 일관성과 프레임 격자를 확인하고 있습니다."}</p>
-              {job.status === "running" && <button type="button" onClick={() => void cancel()}>생성 취소</button>}
-              {job.status === "awaitingApproval" && <div><button type="button" onClick={() => void approve(true)}>허용</button><button type="button" onClick={() => void approve(false)}>거부</button></div>}
+            {(startingCellEdit || job) && <div className={`job-status ${startingCellEdit ? "running" : job!.status}`} aria-live="polite">
+              <b>{startingCellEdit ? "현재 셀 편집 시작 중" : codexJobStatusTitle(job!)}</b>
+              <p>{startingCellEdit
+                ? "프로젝트를 저장하고 현재 셀 편집을 시작하고 있습니다."
+                : job!.error || job!.messages?.at(-1) || (job!.kind === "cellEdit" ? "현재 셀에 적용할 도구 동작을 구성하고 있습니다." : "캐릭터 일관성과 프레임 격자를 확인하고 있습니다.")}</p>
+              {startingCellEdit && <button type="button" onClick={() => void cancel()}>편집 취소</button>}
+              {!startingCellEdit && job!.kind === "cellEdit" && (job!.status === "running" || job!.status === "awaitingApproval") && <button type="button" onClick={() => void cancel()}>편집 취소</button>}
+              {!startingCellEdit && job!.kind === "generation" && job!.status === "running" && <button type="button" onClick={() => void cancel()}>생성 취소</button>}
+              {!startingCellEdit && job!.kind === "generation" && job!.status === "awaitingApproval" && <div><button type="button" onClick={() => void approve(true)}>허용</button><button type="button" onClick={() => void approve(false)}>거부</button></div>}
             </div>}
             <div className="history">
               <span>생성 이력</span>
               {project.generationHistory.length === 0 ? <p>첫 결과를 만들면 프롬프트 이력이 여기에 남습니다.</p> : [...project.generationHistory].reverse().map((item, index) =>
-                <button type="button" key={item.id} onClick={() => setPrompt(item.prompt)}><b>v{project.generationHistory.length - index}</b><span>{item.prompt}</span></button>)}
+                <button type="button" disabled={codexBusy} key={item.id} onClick={() => setPrompt(item.prompt)}><b>v{project.generationHistory.length - index}</b><span>{item.prompt}</span></button>)}
             </div>
           </section>
         } />}

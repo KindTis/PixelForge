@@ -1,4 +1,5 @@
-import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent, type ReactNode, type WheelEvent } from "react";
+import { forwardRef, useEffect, useImperativeHandle, useRef, useState, type PointerEvent as ReactPointerEvent, type ReactNode, type WheelEvent } from "react";
+import type { AiEditRequest, AiEditResult, AiEditTarget } from "../../core/ai-edit.ts";
 import { History, type EditCommand, type PixelChange } from "../../core/commands.ts";
 import { compositeFrame } from "../../core/render.ts";
 import { convertDocumentToIndexed, indexedToRgba, nearestPaletteColor, quantizeToPalette, replaceColor, sameColor } from "../../core/palette.ts";
@@ -20,6 +21,7 @@ import {
 } from "../../core/timeline.ts";
 import { celKey, type BlendMode, type RGBA, type SpriteDocument, type SpriteProject } from "../../core/types.ts";
 import { CanvasRenderer } from "./CanvasRenderer.ts";
+import { runAiEdit, selectionOverlay, selectionRuns } from "./ai-edit.ts";
 import { screenToPixel, ToolController, type EditorTool } from "./ToolController.ts";
 import { shortcutAction } from "./shortcuts.ts";
 
@@ -62,17 +64,24 @@ function FrameCanvas({ project, index }: { project: SpriteProject; index: number
   return <canvas ref={ref} className="pixel-canvas" aria-hidden="true" />;
 }
 
-export function EditorWorkspace({ project, frameIndex, readOnly, onFrameIndex, onChange, onSave, generationPanel, saveState, onError }: {
+export type EditorWorkspaceHandle = {
+  captureAiEditRequest(prompt: string): AiEditRequest;
+  applyAiEdit(target: AiEditTarget, result: AiEditResult): { actionCount: number; summary: string };
+};
+
+export type GenerationPanelContext = { hasActiveCel: boolean; activeLayerLocked: boolean };
+
+export const EditorWorkspace = forwardRef<EditorWorkspaceHandle, {
   project: SpriteProject;
   frameIndex: number;
   readOnly: boolean;
   onFrameIndex(index: number): void;
   onChange(project: SpriteProject): void;
   onSave(): void;
-  generationPanel: ReactNode;
+  generationPanel(context: GenerationPanelContext): ReactNode;
   saveState: string;
   onError(message: string): void;
-}) {
+}>(function EditorWorkspace({ project, frameIndex, readOnly, onFrameIndex, onChange, onSave, generationPanel, saveState, onError }, ref) {
   const history = useRef(new History(project.document));
   const emitted = useRef<SpriteDocument>(project.document);
   const canvas = useRef<HTMLCanvasElement>(null);
@@ -110,8 +119,53 @@ export function EditorWorkspace({ project, frameIndex, readOnly, onFrameIndex, o
   }, [project.document, activeLayerId]);
 
   const frame = project.document.frames[Math.min(frameIndex, project.document.frames.length - 1)];
+  const activeLayer = project.document.layers.find((layer) => layer.id === activeLayerId);
   const cel = project.document.cels[celKey(frame.id, activeLayerId)];
   const image = cel ? project.document.images[cel.imageId] : undefined;
+
+  useImperativeHandle(ref, () => ({
+    captureAiEditRequest(prompt) {
+      if (!cel || !image) throw new Error("현재 프레임의 활성 셀이 없습니다.");
+      if (activeLayer?.locked) throw new Error("잠긴 레이어는 편집할 수 없습니다.");
+      return {
+        prompt,
+        target: { frameId: frame.id, layerId: activeLayerId, celId: cel.id },
+        settings: {
+          tool, color, secondaryColor, brushSize, brushShape,
+          customBrush: customBrush?.map((point) => ({ ...point })),
+          filled, mirrorX, mirrorY,
+          selection: selectionRuns(selection, image, cel, project.document),
+        },
+      };
+    },
+    applyAiEdit(target, result) {
+      if (frame.id !== target.frameId || activeLayerId !== target.layerId) throw new Error("AI 편집 대상 프레임 또는 레이어가 변경되었습니다.");
+      const application = runAiEdit({
+        document: history.current.document,
+        tool, color, secondaryColor, brushSize, brushShape, customBrush,
+        filled, mirrorX, mirrorY, selection,
+      }, target, result);
+      if (application.actionCount === 0) return { actionCount: 0, summary: result.summary };
+      const document = application.historySteps.length
+        ? history.current.commitSteps(application.historySteps)
+        : history.current.document;
+      setTool(application.settings.tool);
+      setColor(application.settings.color);
+      setSecondaryColor(application.settings.secondaryColor);
+      setBrushSize(application.settings.brushSize);
+      setBrushShape(application.settings.brushShape);
+      setCustomBrush(application.settings.customBrush);
+      setFilled(application.settings.filled);
+      setMirrorX(application.settings.mirrorX);
+      setMirrorY(application.settings.mirrorY);
+      setSelection(application.settings.selection);
+      if (application.historySteps.length) {
+        emitted.current = document;
+        onChange({ ...project, document });
+      }
+      return { actionCount: application.actionCount, summary: result.summary };
+    },
+  }));
 
   const emit = (document: SpriteDocument) => {
     if (readOnly) return;
@@ -156,7 +210,11 @@ export function EditorWorkspace({ project, frameIndex, readOnly, onFrameIndex, o
   useEffect(() => {
     const element = canvas.current;
     if (!element) return;
-    const render = () => new CanvasRenderer(element).render(project.document, view(), { selection, mirrorX, mirrorY });
+    const render = () => new CanvasRenderer(element).render(project.document, view(), {
+      selection: image && cel ? selectionOverlay(selection, image, cel, project.document) : undefined,
+      mirrorX,
+      mirrorY,
+    });
     render();
     const observer = new ResizeObserver(render);
     observer.observe(element);
@@ -169,16 +227,23 @@ export function EditorWorkspace({ project, frameIndex, readOnly, onFrameIndex, o
     return () => window.clearTimeout(timer);
   }, [playing, frameIndex, frame.durationMs, project.document.frames.length]);
 
+  useEffect(() => {
+    if (readOnly) {
+      controller.current = undefined;
+      setPlaying(false);
+    }
+  }, [readOnly]);
+
   const point = (event: ReactPointerEvent<HTMLCanvasElement>) => screenToPixel(event.clientX, event.clientY, event.currentTarget.getBoundingClientRect(), view());
 
   const pointerDown = (event: ReactPointerEvent<HTMLCanvasElement>) => {
-    if (readOnly) return;
     if (event.button === 1) {
       event.preventDefault();
       event.currentTarget.setPointerCapture(event.pointerId);
       panDrag.current = { x: event.clientX, y: event.clientY, panX: panOffset.x, panY: panOffset.y };
       return;
     }
+    if (readOnly) return;
     if (!cel || !image || event.button !== 0) return;
     event.currentTarget.setPointerCapture(event.pointerId);
     controller.current = new ToolController({ tool, celId: cel.id, color, secondaryColor, brushSize, brushShape, customBrush, filled, mirrorX, mirrorY, selection }, image);
@@ -192,11 +257,12 @@ export function EditorWorkspace({ project, frameIndex, readOnly, onFrameIndex, o
     }
     const current = point(event);
     setCoordinate(current);
-    controller.current?.pointerMove(current);
+    if (!readOnly) controller.current?.pointerMove(current);
   };
 
   const pointerUp = (event: ReactPointerEvent<HTMLCanvasElement>) => {
     if (panDrag.current) { panDrag.current = undefined; return; }
+    if (readOnly) { controller.current = undefined; return; }
     const result = controller.current?.pointerUp(point(event));
     controller.current = undefined;
     if (result?.color) setColor(result.color);
@@ -221,8 +287,8 @@ export function EditorWorkspace({ project, frameIndex, readOnly, onFrameIndex, o
   };
 
   const clearSelectionPixels = () => {
-    if (!selection || !cel) return;
-    execute({ type: "setPixels", celId: cel.id, pixels: [...selection.keys()].filter((index) => selection[index]).map((index) => ({ x: index % project.document.width, y: Math.floor(index / project.document.width), rgba: [0, 0, 0, 0] })) });
+    if (!selection || !cel || !image) return;
+    execute({ type: "setPixels", celId: cel.id, pixels: [...selection.keys()].filter((index) => selection[index]).map((index) => ({ x: index % image.width, y: Math.floor(index / image.width), rgba: [0, 0, 0, 0] })) });
   };
 
   const copyPixels = () => {
@@ -348,22 +414,22 @@ export function EditorWorkspace({ project, frameIndex, readOnly, onFrameIndex, o
   return <>
     <section className="workspace editor-workspace">
       <aside className="tools-panel full-tools">
-        <div className="panel-title"><span>도구</span><div><button type="button" onClick={undo} aria-label="실행 취소">↶</button><button type="button" onClick={redo} aria-label="다시 실행">↷</button><b>{TOOLS.find((item) => item.id === tool)?.label}</b></div></div>
+        <div className="panel-title"><span>도구</span><div><button type="button" onClick={undo} disabled={readOnly} aria-label="실행 취소">↶</button><button type="button" onClick={redo} disabled={readOnly} aria-label="다시 실행">↷</button><b>{TOOLS.find((item) => item.id === tool)?.label}</b></div></div>
         <div className="editor-tools">
-          {TOOLS.map((item) => <button className={tool === item.id ? "active" : ""} type="button" key={item.id} onClick={() => setTool(item.id)} aria-label={`${item.label} (${item.key})`} title={`${item.label} · ${item.key}`}><span>{item.icon}</span><small>{item.label}</small></button>)}
+          {TOOLS.map((item) => <button className={tool === item.id ? "active" : ""} type="button" key={item.id} disabled={readOnly} onClick={() => setTool(item.id)} aria-label={`${item.label} (${item.key})`} title={`${item.label} · ${item.key}`}><span>{item.icon}</span><small>{item.label}</small></button>)}
         </div>
         <div className="tool-options">
-          <label>전경색<input type="color" value={hex(color)} onChange={(event) => { const next = rgba(event.target.value); setColor(project.document.colorMode === "indexed" ? nearestPaletteColor(next, project.document.palette.map((entry) => entry.color)) : next); }} /></label>
-          <label>배경색<input type="color" value={hex(secondaryColor)} onChange={(event) => { const next = rgba(event.target.value); setSecondaryColor(project.document.colorMode === "indexed" ? nearestPaletteColor(next, project.document.palette.map((entry) => entry.color)) : next); }} /></label>
-          <label>브러시 <output>{brushSize}px</output><input type="range" min="1" max="32" value={brushSize} onChange={(event) => setBrushSize(Number(event.target.value))} /></label>
-          <label>브러시 모양<select value={brushShape} onChange={(event) => { setBrushShape(event.target.value as typeof brushShape); setCustomBrush(undefined); }}><option value="square">사각</option><option value="circle">원형</option></select></label>
-          <button type="button" onClick={makeCustomBrush} disabled={!selection}>선택을 사용자 브러시로</button>
-          <div className="option-checks"><label><input type="checkbox" checked={filled} onChange={(event) => setFilled(event.target.checked)} /> 채움</label><label><input type="checkbox" checked={mirrorX} onChange={(event) => setMirrorX(event.target.checked)} /> 좌우 대칭</label><label><input type="checkbox" checked={mirrorY} onChange={(event) => setMirrorY(event.target.checked)} /> 상하 대칭</label></div>
+          <label>전경색<input type="color" value={hex(color)} disabled={readOnly} onChange={(event) => { const next = rgba(event.target.value); setColor(project.document.colorMode === "indexed" ? nearestPaletteColor(next, project.document.palette.map((entry) => entry.color)) : next); }} /></label>
+          <label>배경색<input type="color" value={hex(secondaryColor)} disabled={readOnly} onChange={(event) => { const next = rgba(event.target.value); setSecondaryColor(project.document.colorMode === "indexed" ? nearestPaletteColor(next, project.document.palette.map((entry) => entry.color)) : next); }} /></label>
+          <label>브러시 <output>{brushSize}px</output><input type="range" min="1" max="32" value={brushSize} disabled={readOnly} onChange={(event) => setBrushSize(Number(event.target.value))} /></label>
+          <label>브러시 모양<select value={brushShape} disabled={readOnly} onChange={(event) => { setBrushShape(event.target.value as typeof brushShape); setCustomBrush(undefined); }}><option value="square">사각</option><option value="circle">원형</option></select></label>
+          <button type="button" onClick={makeCustomBrush} disabled={readOnly || !selection}>선택을 사용자 브러시로</button>
+          <div className="option-checks"><label><input type="checkbox" checked={filled} disabled={readOnly} onChange={(event) => setFilled(event.target.checked)} /> 채움</label><label><input type="checkbox" checked={mirrorX} disabled={readOnly} onChange={(event) => setMirrorX(event.target.checked)} /> 좌우 대칭</label><label><input type="checkbox" checked={mirrorY} disabled={readOnly} onChange={(event) => setMirrorY(event.target.checked)} /> 상하 대칭</label></div>
         </div>
         <div className="selection-actions">
           <span>선택 · {selectedCount}px</span>
-          <div><button type="button" onClick={copyPixels}>복사</button><button type="button" onClick={() => { copyPixels(); clearSelectionPixels(); }}>잘라내기</button><button type="button" onClick={pastePixels}>붙여넣기</button><button type="button" onClick={clearSelectionPixels}>삭제</button></div>
-          <div><button type="button" onClick={() => transformPixels("flipX")}>↔ 뒤집기</button><button type="button" onClick={() => transformPixels("flipY")}>↕ 뒤집기</button><button type="button" onClick={() => transformPixels("rotate")}>↻ 90°</button><button type="button" onClick={() => transformPixels("half")}>½ 축소</button><button type="button" onClick={() => transformPixels("double")}>2× 확대</button><button type="button" onClick={() => setSelection(undefined)}>해제</button></div>
+          <div><button type="button" disabled={readOnly} onClick={copyPixels}>복사</button><button type="button" disabled={readOnly} onClick={() => { copyPixels(); clearSelectionPixels(); }}>잘라내기</button><button type="button" disabled={readOnly} onClick={pastePixels}>붙여넣기</button><button type="button" disabled={readOnly} onClick={clearSelectionPixels}>삭제</button></div>
+          <div><button type="button" disabled={readOnly} onClick={() => transformPixels("flipX")}>↔ 뒤집기</button><button type="button" disabled={readOnly} onClick={() => transformPixels("flipY")}>↕ 뒤집기</button><button type="button" disabled={readOnly} onClick={() => transformPixels("rotate")}>↻ 90°</button><button type="button" disabled={readOnly} onClick={() => transformPixels("half")}>½ 축소</button><button type="button" disabled={readOnly} onClick={() => transformPixels("double")}>2× 확대</button><button type="button" disabled={readOnly} onClick={() => setSelection(undefined)}>해제</button></div>
         </div>
       </aside>
 
@@ -376,41 +442,41 @@ export function EditorWorkspace({ project, frameIndex, readOnly, onFrameIndex, o
           <canvas ref={canvas} className="editor-canvas" aria-label="픽셀을 그리는 캔버스" onPointerDown={pointerDown} onPointerMove={pointerMove} onPointerUp={pointerUp} onPointerCancel={() => { controller.current = undefined; panDrag.current = undefined; }} onWheel={(event: WheelEvent<HTMLCanvasElement>) => { event.preventDefault(); setZoom((value) => Math.max(1, Math.min(32, value + (event.deltaY < 0 ? 1 : -1)))); }} />
         </div>
         <div className="playback">
-          <button type="button" onClick={() => onFrameIndex(0)} aria-label="처음 프레임">|◀</button>
-          <button className="play" type="button" onClick={() => setPlaying((value) => !value)} aria-label={playing ? "정지" : "재생"}>{playing ? "■" : "▶"}</button>
+          <button type="button" disabled={readOnly} onClick={() => onFrameIndex(0)} aria-label="처음 프레임">|◀</button>
+          <button className="play" type="button" disabled={readOnly} onClick={() => setPlaying((value) => !value)} aria-label={playing ? "정지" : "재생"}>{playing ? "■" : "▶"}</button>
           <span>{frameIndex + 1} / {project.document.frames.length} · {frame.durationMs}ms</span>
         </div>
       </section>
 
       <aside className="right-dock">
-        {generationPanel}
+        {generationPanel({ hasActiveCel: Boolean(cel && image), activeLayerLocked: Boolean(activeLayer?.locked) })}
         <section className="layers-panel">
           <div className="panel-title"><span>레이어</span><b>{project.document.layers.length}</b></div>
-          <div className="layer-actions"><button type="button" onClick={() => replace((document) => addLayer(document))}>＋</button><button type="button" onClick={() => replace((document) => duplicateLayer(document, activeLayerId))}>복제</button><button type="button" onClick={() => replace((document) => deleteLayer(document, activeLayerId))}>삭제</button><button type="button" onClick={() => replace((document) => moveLayer(document, activeLayerId, Math.max(0, document.layers.findIndex((layer) => layer.id === activeLayerId) - 1)))}>↑</button><button type="button" onClick={() => replace((document) => moveLayer(document, activeLayerId, Math.min(document.layers.length - 1, document.layers.findIndex((layer) => layer.id === activeLayerId) + 1)))}>↓</button><button type="button" disabled={frameIndex === 0} onClick={() => replace((document) => linkCel(document, document.frames[frameIndex - 1].id, activeLayerId, frame.id, activeLayerId))}>이전 셀 연결</button><button type="button" onClick={() => replace((document) => unlinkCel(document, frame.id, activeLayerId))}>셀 분리</button></div>
-          <div className="layer-list">{project.document.layers.map((layer) => <div className={activeLayerId === layer.id ? "selected" : ""} key={layer.id} onClick={() => setActiveLayerId(layer.id)}>
-            <button type="button" aria-label={layer.visible ? "레이어 숨기기" : "레이어 보이기"} onClick={(event) => { event.stopPropagation(); updateLayer(layer.id, { visible: !layer.visible }); }}>{layer.visible ? "◉" : "○"}</button>
-            <input value={layer.name} aria-label="레이어 이름" onChange={(event) => updateLayer(layer.id, { name: event.target.value })} />
-            <button type="button" aria-label={layer.locked ? "레이어 잠금 해제" : "레이어 잠금"} onClick={(event) => { event.stopPropagation(); updateLayer(layer.id, { locked: !layer.locked }); }}>{layer.locked ? "▣" : "▢"}</button>
-            <input type="range" aria-label="레이어 불투명도" min="0" max="1" step="0.01" value={layer.opacity} onChange={(event) => updateLayer(layer.id, { opacity: Number(event.target.value) })} />
-            <select aria-label="레이어 혼합 모드" value={layer.blendMode} onChange={(event) => updateLayer(layer.id, { blendMode: event.target.value as BlendMode })}>{["normal", "multiply", "screen", "overlay", "add"].map((mode) => <option value={mode} key={mode}>{mode}</option>)}</select>
+          <div className="layer-actions"><button type="button" disabled={readOnly} onClick={() => replace((document) => addLayer(document))}>＋</button><button type="button" disabled={readOnly} onClick={() => replace((document) => duplicateLayer(document, activeLayerId))}>복제</button><button type="button" disabled={readOnly} onClick={() => replace((document) => deleteLayer(document, activeLayerId))}>삭제</button><button type="button" disabled={readOnly} onClick={() => replace((document) => moveLayer(document, activeLayerId, Math.max(0, document.layers.findIndex((layer) => layer.id === activeLayerId) - 1)))}>↑</button><button type="button" disabled={readOnly} onClick={() => replace((document) => moveLayer(document, activeLayerId, Math.min(document.layers.length - 1, document.layers.findIndex((layer) => layer.id === activeLayerId) + 1)))}>↓</button><button type="button" disabled={readOnly || frameIndex === 0} onClick={() => replace((document) => linkCel(document, document.frames[frameIndex - 1].id, activeLayerId, frame.id, activeLayerId))}>이전 셀 연결</button><button type="button" disabled={readOnly} onClick={() => replace((document) => unlinkCel(document, frame.id, activeLayerId))}>셀 분리</button></div>
+          <div className="layer-list">{project.document.layers.map((layer) => <div className={activeLayerId === layer.id ? "selected" : ""} key={layer.id} aria-disabled={readOnly} onClick={() => { if (!readOnly) setActiveLayerId(layer.id); }}>
+            <button type="button" disabled={readOnly} aria-label={layer.visible ? "레이어 숨기기" : "레이어 보이기"} onClick={(event) => { event.stopPropagation(); updateLayer(layer.id, { visible: !layer.visible }); }}>{layer.visible ? "◉" : "○"}</button>
+            <input value={layer.name} disabled={readOnly} aria-label="레이어 이름" onChange={(event) => updateLayer(layer.id, { name: event.target.value })} />
+            <button type="button" disabled={readOnly} aria-label={layer.locked ? "레이어 잠금 해제" : "레이어 잠금"} onClick={(event) => { event.stopPropagation(); updateLayer(layer.id, { locked: !layer.locked }); }}>{layer.locked ? "▣" : "▢"}</button>
+            <input type="range" disabled={readOnly} aria-label="레이어 불투명도" min="0" max="1" step="0.01" value={layer.opacity} onChange={(event) => updateLayer(layer.id, { opacity: Number(event.target.value) })} />
+            <select aria-label="레이어 혼합 모드" disabled={readOnly} value={layer.blendMode} onChange={(event) => updateLayer(layer.id, { blendMode: event.target.value as BlendMode })}>{["normal", "multiply", "screen", "overlay", "add"].map((mode) => <option value={mode} key={mode}>{mode}</option>)}</select>
           </div>)}</div>
         </section>
         <section className="palette-panel">
           <div className="panel-title"><span>팔레트</span><b>{project.document.palette.length}/256</b></div>
-          <div className="palette-mode"><select aria-label="색상 모드" value={project.document.colorMode} onChange={(event) => changeColorMode(event.target.value as "rgba" | "indexed")}><option value="rgba">RGBA</option><option value="indexed">인덱스</option></select><button type="button" onClick={() => image && applyBuffer(replaceColor(image, secondaryColor, color, selection).data)}>배경색→전경색</button></div>
-          <div className="palette-grid">{project.document.palette.map((entry) => <button type="button" key={entry.id} title={entry.name} aria-label={`${entry.name} 선택`} className={sameColor(entry.color, color) ? "selected" : ""} style={{ background: `rgba(${entry.color.join(",")})` }} onClick={() => setColor(entry.color)} />)}<button className="add-color" type="button" aria-label="현재 색상을 팔레트에 추가" onClick={addPaletteColor}>＋</button><button className="add-color" type="button" aria-label="현재 색상을 팔레트에서 제거" onClick={removeCurrentPaletteColor}>−</button></div>
+          <div className="palette-mode"><select aria-label="색상 모드" disabled={readOnly} value={project.document.colorMode} onChange={(event) => changeColorMode(event.target.value as "rgba" | "indexed")}><option value="rgba">RGBA</option><option value="indexed">인덱스</option></select><button type="button" disabled={readOnly} onClick={() => image && applyBuffer(replaceColor(image, secondaryColor, color, selection).data)}>배경색→전경색</button></div>
+          <div className="palette-grid">{project.document.palette.map((entry) => <button type="button" key={entry.id} disabled={readOnly} title={entry.name} aria-label={`${entry.name} 선택`} className={sameColor(entry.color, color) ? "selected" : ""} style={{ background: `rgba(${entry.color.join(",")})` }} onClick={() => setColor(entry.color)} />)}<button className="add-color" type="button" disabled={readOnly} aria-label="현재 색상을 팔레트에 추가" onClick={addPaletteColor}>＋</button><button className="add-color" type="button" disabled={readOnly} aria-label="현재 색상을 팔레트에서 제거" onClick={removeCurrentPaletteColor}>−</button></div>
         </section>
       </aside>
     </section>
 
     <section className="timeline editor-timeline" aria-label="애니메이션 타임라인">
-      <div className="timeline-head"><span>타임라인</span><b>{project.document.frames.length} 프레임</b><small>{saveState}</small><div><button type="button" onClick={() => replace((document) => addFrame(document, frame.id))}>＋</button><button type="button" onClick={() => { const next = duplicateFrame(project.document, frame.id); replace(() => next); onFrameIndex(frameIndex + 1); }}>복제</button><button type="button" onClick={() => { if (project.document.frames.length < 2) return; const nextIndex = Math.min(frameIndex, project.document.frames.length - 2); replace((document) => deleteFrame(document, frame.id)); onFrameIndex(nextIndex); }}>삭제</button></div></div>
+      <div className="timeline-head"><span>타임라인</span><b>{project.document.frames.length} 프레임</b><small>{saveState}</small><div><button type="button" disabled={readOnly} onClick={() => replace((document) => addFrame(document, frame.id))}>＋</button><button type="button" disabled={readOnly} onClick={() => { const next = duplicateFrame(project.document, frame.id); replace(() => next); onFrameIndex(frameIndex + 1); }}>복제</button><button type="button" disabled={readOnly} onClick={() => { if (project.document.frames.length < 2) return; const nextIndex = Math.min(frameIndex, project.document.frames.length - 2); replace((document) => deleteFrame(document, frame.id)); onFrameIndex(nextIndex); }}>삭제</button></div></div>
       <div className="frames">{project.document.frames.map((item, index) => <div className={`frame-card ${index === frameIndex ? "selected" : ""}`} key={item.id}>
-        <button className="frame-image" type="button" aria-label={`${index + 1}번 프레임 선택`} onClick={() => onFrameIndex(index)}><FrameCanvas project={project} index={index} /></button>
-        <button className="frame-label" type="button" onClick={() => onFrameIndex(index)}>F{String(index + 1).padStart(2, "0")}</button><input aria-label={`${index + 1}번 프레임 시간`} type="number" min="1" max="60000" value={item.durationMs} onChange={(event) => replace((document) => setFrameDuration(document, item.id, Number(event.target.value)))} />
-        <i><button type="button" aria-label="프레임 왼쪽 이동" onClick={() => reorderFrame(item.id, index - 1)}>←</button><button type="button" aria-label="프레임 오른쪽 이동" onClick={() => reorderFrame(item.id, index + 1)}>→</button></i>
+        <button className="frame-image" type="button" disabled={readOnly} aria-label={`${index + 1}번 프레임 선택`} onClick={() => onFrameIndex(index)}><FrameCanvas project={project} index={index} /></button>
+        <button className="frame-label" type="button" disabled={readOnly} onClick={() => onFrameIndex(index)}>F{String(index + 1).padStart(2, "0")}</button><input aria-label={`${index + 1}번 프레임 시간`} disabled={readOnly} type="number" min="1" max="60000" value={item.durationMs} onChange={(event) => replace((document) => setFrameDuration(document, item.id, Number(event.target.value)))} />
+        <i><button type="button" disabled={readOnly} aria-label="프레임 왼쪽 이동" onClick={() => reorderFrame(item.id, index - 1)}>←</button><button type="button" disabled={readOnly} aria-label="프레임 오른쪽 이동" onClick={() => reorderFrame(item.id, index + 1)}>→</button></i>
       </div>)}</div>
-      <div className="tag-editor"><span>태그</span><input aria-label="태그 이름" placeholder="예: attack" value={tagName} onChange={(event) => setTagName(event.target.value)} /><select aria-label="태그 재생 방향" value={tagDirection} onChange={(event) => setTagDirection(event.target.value as typeof tagDirection)}><option value="forward">정방향</option><option value="reverse">역방향</option><option value="pingPong">핑퐁</option></select><button type="button" onClick={addAnimationTag}>전체 구간 추가</button>{project.document.tags.map((tag) => <button type="button" className="tag-chip" key={tag.id} onClick={() => replace((document) => deleteTag(document, tag.id))}>{tag.name} ×</button>)}</div>
+      <div className="tag-editor"><span>태그</span><input aria-label="태그 이름" disabled={readOnly} placeholder="예: attack" value={tagName} onChange={(event) => setTagName(event.target.value)} /><select aria-label="태그 재생 방향" disabled={readOnly} value={tagDirection} onChange={(event) => setTagDirection(event.target.value as typeof tagDirection)}><option value="forward">정방향</option><option value="reverse">역방향</option><option value="pingPong">핑퐁</option></select><button type="button" disabled={readOnly} onClick={addAnimationTag}>전체 구간 추가</button>{project.document.tags.map((tag) => <button type="button" className="tag-chip" disabled={readOnly} key={tag.id} onClick={() => replace((document) => deleteTag(document, tag.id))}>{tag.name} ×</button>)}</div>
     </section>
   </>;
-}
+});
