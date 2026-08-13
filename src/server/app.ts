@@ -1,7 +1,8 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { extname, join, resolve } from "node:path";
+import { AI_EDIT_OUTPUT_SCHEMA, parseAiEditResult, type AiEditRequest, type AiEditResult, type AiEditTarget } from "../core/ai-edit.ts";
 import { createDocument, createProject as makeProject, validateDocument } from "../core/document.ts";
 import { compositeFrame } from "../core/render.ts";
 import type { PixelBuffer, SpriteProject } from "../core/types.ts";
@@ -18,25 +19,42 @@ import {
 import { createProject, loadProject, resolveInside, saveProject } from "./project-store.ts";
 import { decodePng, encodePng } from "./png.ts";
 import { exportProject, type ExportOptions, type ExportTarget } from "./exporters/index.ts";
+import { activeCelFrame, buildAiEditPrompt, validateAiEditRequest } from "./ai-edit.ts";
 
-type CodexClient = Pick<CodexBridge, "getAccount" | "login" | "startGeneration" | "interrupt" | "respond"> & {
+type CodexClient = Pick<CodexBridge, "getAccount" | "login" | "startGeneration" | "startCellEdit" | "interrupt" | "respond"> & {
   on(event: "event", listener: (event: CodexEvent) => void): unknown;
 };
 
-type Job = {
+type JobStatus = "running" | "awaitingApproval" | "cancelling" | "finalizing" | "completed" | "failed" | "cancelled";
+type JobBase = {
   id: string;
   projectId: string;
+  runId?: string;
+  status: JobStatus;
+  messages: string[];
+  error?: string;
+};
+type GenerationJob = JobBase & {
+  kind: "generation";
   request: SpriteSheetRequest | FrameRegenerationRequest;
   frameId?: string;
   outputPath: string;
   relativeOutputPath: string;
-  runId?: string;
-  status: "running" | "awaitingApproval" | "cancelling" | "finalizing" | "completed" | "failed" | "cancelled";
-  messages: string[];
   approval?: { requestId: number; method: string; params: Record<string, unknown> };
-  error?: string;
   project?: SpriteProject;
 };
+type CellEditJob = JobBase & {
+  kind: "cellEdit";
+  request: AiEditRequest;
+  target: AiEditTarget;
+  tempDir: string;
+  compositePath: string;
+  celPath: string;
+  resultText?: string;
+  resultConflict?: boolean;
+  result?: AiEditResult;
+};
+type Job = GenerationJob | CellEditJob;
 
 export type ServerOptions = {
   projectsRoot: string;
@@ -71,6 +89,17 @@ function wireProject(project: SpriteProject): unknown {
     data: Array.from(image.data),
   }]));
   return { ...project, document: { ...project.document, images } };
+}
+
+function wireJob(job: Job): Record<string, unknown> {
+  const base = { id: job.id, kind: job.kind, status: job.status, messages: job.messages, error: job.error };
+  if (job.kind === "cellEdit") return { ...base, target: job.target, result: job.result };
+  return {
+    ...base,
+    frameId: job.frameId,
+    approval: job.approval ? { requestId: job.approval.requestId, method: job.approval.method } : undefined,
+    project: job.project ? wireProject(job.project) : undefined,
+  };
 }
 
 function projectFromWire(value: unknown): SpriteProject {
@@ -119,8 +148,7 @@ export function createPixelForgeServer({ projectsRoot, codex, staticRoot }: Serv
   const token = randomBytes(24).toString("base64url");
   const jobs = new Map<string, Job>();
   const runToJob = new Map<string, string>();
-  const earlyCompletions = new Map<string, string>();
-  const earlyApprovals = new Map<string, NonNullable<Job["approval"]>>();
+  const earlyEvents = new Map<string, CodexEvent[]>();
   const projectLocks = new Map<string, string>();
 
   const lockProject = (projectId: string, owner: string): boolean => {
@@ -133,7 +161,11 @@ export function createPixelForgeServer({ projectsRoot, codex, staticRoot }: Serv
     if (projectLocks.get(projectId) === owner) projectLocks.delete(projectId);
   };
 
-  const applyApproval = (job: Job, approval: NonNullable<Job["approval"]>): boolean => {
+  const cleanupCellJob = async (job: CellEditJob): Promise<void> => {
+    await rm(job.tempDir, { recursive: true, force: true });
+  };
+
+  const applyApproval = (job: GenerationJob, approval: NonNullable<GenerationJob["approval"]>): boolean => {
     if (job.status !== "running") return false;
     job.status = "awaitingApproval";
     job.approval = approval;
@@ -143,70 +175,125 @@ export function createPixelForgeServer({ projectsRoot, codex, staticRoot }: Serv
   const interruptJob = async (job: Job): Promise<void> => {
     try {
       await codex.interrupt(job.runId!);
+      if (job.kind === "cellEdit") await cleanupCellJob(job);
       job.status = "cancelled";
     } catch (error) {
+      if (job.kind === "cellEdit") await cleanupCellJob(job);
       job.status = "failed";
-      job.error = `Codex 생성 취소에 실패했습니다: ${error instanceof Error ? error.message : String(error)}`;
+      job.error = `Codex ${job.kind === "cellEdit" ? "편집" : "생성"} 취소에 실패했습니다: ${error instanceof Error ? error.message : String(error)}`;
       throw error;
     } finally {
       unlockProject(job.projectId, job.id);
     }
   };
 
+  const failCellJob = (job: CellEditJob, message: string): void => {
+    if (job.status !== "running" && job.status !== "awaitingApproval") return;
+    job.status = "failed";
+    job.error = message;
+    unlockProject(job.projectId, job.id);
+    if (job.runId) void codex.interrupt(job.runId).catch(() => undefined).finally(() => cleanupCellJob(job));
+    else void cleanupCellJob(job);
+  };
+
   const finish = async (runId: string, status: string): Promise<void> => {
     const jobId = runToJob.get(runId);
-    if (!jobId) {
-      earlyCompletions.set(runId, status);
-      return;
-    }
+    if (!jobId) return;
     const job = jobs.get(jobId);
     if (!job || (job.status !== "running" && job.status !== "awaitingApproval")) return;
-    if (status !== "completed") {
-      job.status = "failed";
-      job.error = `Codex 생성이 ${status} 상태로 끝났습니다.`;
-      unlockProject(job.projectId, job.id);
-      return;
-    }
     job.status = "finalizing";
+    let failure: unknown;
+    let cellResult: AiEditResult | undefined;
     try {
+      if (status !== "completed") throw new Error(`Codex ${job.kind === "cellEdit" ? "편집" : "생성"}이 ${status} 상태로 끝났습니다.`);
       const root = resolveInside(projectsRoot, safeProjectId(job.projectId));
       const project = await loadProject(root);
-      const png = await readFile(job.outputPath);
-      job.project = job.frameId !== undefined
-        ? importRegeneratedFrame(project, png, job.request as FrameRegenerationRequest, job.relativeOutputPath)
-        : importSpriteSheet(project, png, job.request as SpriteSheetRequest, job.relativeOutputPath);
-      await saveProject(root, job.project);
-      job.status = "completed";
+      if (job.kind === "cellEdit") {
+        validateAiEditRequest(project, job.request);
+        if (job.resultConflict) throw new Error("서로 다른 AI 편집 최종 응답이 둘 이상입니다.");
+        if (job.resultText === undefined) throw new Error("AI 편집 최종 응답이 없습니다.");
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(job.resultText);
+        } catch {
+          throw new Error("AI 편집 결과 JSON이 올바르지 않습니다.");
+        }
+        cellResult = parseAiEditResult(parsed, project.document.width, project.document.height);
+      } else {
+        const png = await readFile(job.outputPath);
+        job.project = job.frameId !== undefined
+          ? importRegeneratedFrame(project, png, job.request as FrameRegenerationRequest, job.relativeOutputPath)
+          : importSpriteSheet(project, png, job.request as SpriteSheetRequest, job.relativeOutputPath);
+        await saveProject(root, job.project);
+      }
     } catch (error) {
-      job.status = "failed";
-      job.error = error instanceof Error ? error.message : String(error);
+      failure = error;
     } finally {
+      if (job.kind === "cellEdit") await cleanupCellJob(job);
       unlockProject(job.projectId, job.id);
+    }
+    if (failure) {
+      job.status = "failed";
+      job.error = failure instanceof Error ? failure.message : String(failure);
+    } else {
+      if (job.kind === "cellEdit") job.result = cellResult;
+      job.status = "completed";
     }
   };
 
-  codex.on("event", (event: CodexEvent) => {
-    if (event.type === "completed") void finish(event.runId, event.status);
-    else if (event.type === "message") {
-      const job = event.runId ? jobs.get(runToJob.get(event.runId) ?? "") : undefined;
-      if (job && event.text.trim()) job.messages.push(event.text);
-    } else if (event.type === "approval") {
-      const approval = { requestId: event.requestId, method: event.method, params: event.params };
-      const jobId = event.runId ? runToJob.get(event.runId) : undefined;
-      const job = jobId ? jobs.get(jobId) : undefined;
-      if (job) {
-        if (!applyApproval(job, approval)) codex.respond(event.requestId, { decision: "decline" });
-      } else if (event.runId) earlyApprovals.set(event.runId, approval);
-      else codex.respond(event.requestId, { decision: "decline" });
-    } else if (event.type === "error") {
+  const handleCodexEvent = (event: CodexEvent): void => {
+    if (event.type === "error") {
       for (const job of jobs.values()) if (job.status === "running" || job.status === "awaitingApproval" || job.status === "cancelling") {
         job.status = "failed";
-        job.approval = undefined;
+        if (job.kind === "generation") job.approval = undefined;
         job.error = event.message;
         unlockProject(job.projectId, job.id);
+        if (job.kind === "cellEdit") void cleanupCellJob(job);
+      }
+      return;
+    }
+    const runId = "runId" in event ? event.runId : undefined;
+    if (!runId) {
+      if (event.type === "approval") codex.respond(event.requestId, { decision: "decline" });
+      return;
+    }
+    const jobId = runToJob.get(runId);
+    const job = jobId ? jobs.get(jobId) : undefined;
+    if (!job) {
+      const queued = earlyEvents.get(runId) ?? [];
+      queued.push(event);
+      earlyEvents.set(runId, queued);
+      return;
+    }
+    if (event.type === "completed") void finish(runId, event.status);
+    else if (event.type === "message") {
+      if (event.text.trim()) job.messages.push(event.text);
+    } else if (event.type === "result") {
+      if (job.kind !== "cellEdit" || (job.status !== "running" && job.status !== "awaitingApproval")) return;
+      if (job.resultText === undefined) job.resultText = event.text;
+      else if (job.resultText !== event.text) job.resultConflict = true;
+    } else if (event.type === "toolAttempt") {
+      if (job.kind === "cellEdit") failCellJob(job, `AI 편집 중 금지된 도구 실행을 시도했습니다: ${event.tool}`);
+    } else if (event.type === "approval") {
+      const approval = { requestId: event.requestId, method: event.method, params: event.params };
+      if (job.kind === "cellEdit") {
+        codex.respond(event.requestId, { decision: "decline" });
+        failCellJob(job, "AI 편집 작업이 도구 실행 승인을 요청했습니다.");
+      } else if (!applyApproval(job, approval)) {
+        codex.respond(event.requestId, { decision: "decline" });
       }
     }
-  });
+  };
+
+  const connectRun = (job: Job, runId: string): void => {
+    job.runId = runId;
+    runToJob.set(runId, job.id);
+    const queued = earlyEvents.get(runId) ?? [];
+    earlyEvents.delete(runId);
+    for (const event of queued) handleCodexEvent(event);
+  };
+
+  codex.on("event", handleCodexEvent);
 
   return createServer(async (request, response) => {
     try {
@@ -375,22 +462,11 @@ export function createPixelForgeServer({ projectsRoot, codex, staticRoot }: Serv
           } else {
             prompt = buildSpriteSheetPrompt(generationRequest, outputPath);
           }
-          const job: Job = { id: jobId, projectId, request: jobRequest, frameId, outputPath, relativeOutputPath, status: "running", messages: [] };
+          const job: GenerationJob = { id: jobId, kind: "generation", projectId, request: jobRequest, frameId, outputPath, relativeOutputPath, status: "running", messages: [] };
           jobs.set(jobId, job);
           const run = await codex.startGeneration({ cwd: root, prompt });
-          job.runId = run.id;
-          runToJob.set(run.id, jobId);
-          const earlyApproval = earlyApprovals.get(run.id);
-          if (earlyApproval) {
-            earlyApprovals.delete(run.id);
-            applyApproval(job, earlyApproval);
-          }
-          const early = earlyCompletions.get(run.id);
-          if (early) {
-            earlyCompletions.delete(run.id);
-            void finish(run.id, early);
-          }
-          return send(response, 202, { id: jobId, status: job.status, frameId });
+          connectRun(job, run.id);
+          return send(response, 202, wireJob(job));
         } catch (error) {
           jobs.delete(jobId);
           unlockProject(projectId, jobId);
@@ -398,27 +474,80 @@ export function createPixelForgeServer({ projectsRoot, codex, staticRoot }: Serv
         }
       }
 
-      const generationMatch = url.pathname.match(/^\/api\/generations\/([0-9a-f-]{36})$/i);
-      if (generationMatch && request.method === "GET") {
-        const job = jobs.get(generationMatch[1]);
-        if (!job) return send(response, 404, { error: "생성 작업을 찾을 수 없습니다." });
-        return send(response, 200, { ...job, outputPath: undefined, project: job.project ? wireProject(job.project) : undefined });
+      if (request.method === "POST" && url.pathname === "/api/edits") {
+        const input = await body(request) as { projectId?: unknown; request?: unknown };
+        const projectId = safeProjectId(String(input.projectId ?? ""));
+        const jobId = randomUUID();
+        if (!lockProject(projectId, jobId)) return send(response, 409, { error: "이미 Codex 작업 중인 프로젝트입니다." });
+        let job: CellEditJob | undefined;
+        try {
+          const root = resolveInside(projectsRoot, projectId);
+          const project = await loadProject(root);
+          const editRequest = validateAiEditRequest(project, input.request);
+          const tempDir = resolveInside(root, `generated/${jobId}`);
+          const compositePath = resolveInside(tempDir, "composite.png");
+          const celPath = resolveInside(tempDir, "cel.png");
+          const composite = compositeFrame(project.document, editRequest.target.frameId);
+          const cel = activeCelFrame(project.document, editRequest.target);
+          await mkdir(tempDir, { recursive: true });
+          await Promise.all([
+            writeFile(compositePath, encodePng(composite.width, composite.height, composite.data)),
+            writeFile(celPath, encodePng(cel.width, cel.height, cel.data)),
+          ]);
+          job = {
+            id: jobId,
+            kind: "cellEdit",
+            projectId,
+            request: editRequest,
+            target: editRequest.target,
+            tempDir,
+            compositePath,
+            celPath,
+            status: "running",
+            messages: [],
+          };
+          jobs.set(jobId, job);
+          const run = await codex.startCellEdit({
+            cwd: root,
+            prompt: buildAiEditPrompt(project, editRequest),
+            compositePath,
+            celPath,
+            outputSchema: AI_EDIT_OUTPUT_SCHEMA,
+          });
+          connectRun(job, run.id);
+          return send(response, 202, wireJob(job));
+        } catch (error) {
+          jobs.delete(jobId);
+          unlockProject(projectId, jobId);
+          if (job) await cleanupCellJob(job);
+          throw error;
+        }
       }
-      if (generationMatch && request.method === "DELETE") {
-        const job = jobs.get(generationMatch[1]);
-        if (!job?.runId) return send(response, 404, { error: "생성 작업을 찾을 수 없습니다." });
-        if (job.status !== "running" && job.status !== "awaitingApproval") return send(response, 409, { error: "이미 종료 중이거나 종료된 생성 작업입니다." });
-        if (job.approval) codex.respond(job.approval.requestId, { decision: "decline" });
-        job.approval = undefined;
+
+      const jobMatch = url.pathname.match(/^\/api\/(generations|edits)\/([0-9a-f-]{36})$/i);
+      if (jobMatch && request.method === "GET") {
+        const job = jobs.get(jobMatch[2]);
+        const expectedKind = jobMatch[1] === "edits" ? "cellEdit" : "generation";
+        if (!job || job.kind !== expectedKind) return send(response, 404, { error: "작업을 찾을 수 없습니다." });
+        return send(response, 200, wireJob(job));
+      }
+      if (jobMatch && request.method === "DELETE") {
+        const job = jobs.get(jobMatch[2]);
+        const expectedKind = jobMatch[1] === "edits" ? "cellEdit" : "generation";
+        if (!job?.runId || job.kind !== expectedKind) return send(response, 404, { error: "작업을 찾을 수 없습니다." });
+        if (job.status === "finalizing") return send(response, 409, { error: "이미 적용 준비가 시작되어 취소할 수 없습니다." });
+        if (job.status !== "running" && job.status !== "awaitingApproval") return send(response, 409, { error: "이미 종료 중이거나 종료된 작업입니다." });
+        if (job.kind === "generation" && job.approval) codex.respond(job.approval.requestId, { decision: "decline" });
+        if (job.kind === "generation") job.approval = undefined;
         job.status = "cancelling";
         await interruptJob(job);
-        return send(response, 200, { status: job.status });
+        return send(response, 200, wireJob(job));
       }
 
       if (request.method === "POST" && url.pathname === "/api/approvals") {
         const input = await body(request) as { jobId?: unknown; accept?: unknown };
         const job = jobs.get(String(input.jobId ?? ""));
-        if (!job?.approval || !job.runId) return send(response, 404, { error: "승인 요청을 찾을 수 없습니다." });
+        if (!job || job.kind !== "generation" || !job.approval || !job.runId) return send(response, 404, { error: "승인 요청을 찾을 수 없습니다." });
         const approval = job.approval;
         job.approval = undefined;
         if (input.accept === true) {
