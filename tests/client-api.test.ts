@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import type { AiEditRequest } from "../src/core/ai-edit.ts";
 import { createDocument, createProject } from "../src/core/document.ts";
-import { api, completedFrameIndex, decodeProject, encodeProject, failedGenerationJob, generationPayload, generationStatusTitle, isRetryablePollingError, pollingErrorGenerationJob, type GenerationJob, type WireProject } from "../src/client/api.ts";
+import { api, cellEditPayload, codexJobStatusTitle, completedFrameIndex, decodeProject, encodeProject, failedCodexJob, generationPayload, isRetryablePollingError, pollingErrorCodexJob, type CellEditJob, type GenerationJob, type WireProject } from "../src/client/api.ts";
 
 test("프로젝트 픽셀을 JSON 배열로 보내고 Uint8ClampedArray로 복원한다", () => {
   const project = createProject("저장", createDocument({ width: 1, height: 1 }));
@@ -38,6 +39,24 @@ test("전체 및 선택 프레임 생성을 위한 요청 본문을 조립한다
   });
 });
 
+test("현재 셀 편집 요청 본문을 그대로 조립한다", () => {
+  const request: AiEditRequest = {
+    prompt: "배경을 빨갛게 칠해줘",
+    target: { frameId: "frame", layerId: "layer", celId: "cel" },
+    settings: {
+      tool: "pencil",
+      color: [0, 0, 0, 255],
+      secondaryColor: [255, 255, 255, 0],
+      brushSize: 1,
+      brushShape: "square",
+      filled: false,
+      mirrorX: false,
+      mirrorY: false,
+    },
+  };
+  assert.deepEqual(cellEditPayload("project", request), { projectId: "project", request });
+});
+
 test("선택 프레임 작업의 모든 상태 제목에 프레임 문맥을 표시한다", () => {
   const selectedTitles: Record<GenerationJob["status"], string> = {
     running: "선택 프레임을 재생성 중입니다",
@@ -49,9 +68,24 @@ test("선택 프레임 작업의 모든 상태 제목에 프레임 문맥을 표
     cancelled: "선택 프레임 재생성 취소됨",
   };
   for (const [status, title] of Object.entries(selectedTitles) as Array<[GenerationJob["status"], string]>) {
-    assert.equal(generationStatusTitle({ frameId: "frame", status }), title);
+    assert.equal(codexJobStatusTitle({ kind: "generation", frameId: "frame", status }), title);
   }
-  assert.equal(generationStatusTitle({ status: "awaitingApproval" }), "Codex 승인 필요");
+  assert.equal(codexJobStatusTitle({ kind: "generation", status: "awaitingApproval" }), "Codex 승인 필요");
+});
+
+test("현재 셀 편집 작업의 모든 상태 제목에 셀 문맥을 표시한다", () => {
+  const titles: Record<CellEditJob["status"], string> = {
+    running: "현재 셀 편집 중",
+    awaitingApproval: "현재 셀 편집 승인 거부 중",
+    cancelling: "현재 셀 편집 취소 중",
+    finalizing: "도구 동작 검증 중",
+    completed: "현재 셀 편집 준비 완료",
+    failed: "현재 셀 편집 실패",
+    cancelled: "현재 셀 편집 취소됨",
+  };
+  for (const [status, title] of Object.entries(titles) as Array<[CellEditJob["status"], string]>) {
+    assert.equal(codexJobStatusTitle({ kind: "cellEdit", status }), title);
+  }
 });
 
 test("선택 재생성 완료는 시작한 프레임과 일치하는 결과만 선택한다", () => {
@@ -67,7 +101,7 @@ test("선택 재생성 완료는 시작한 프레임과 일치하는 결과만 �
 });
 
 test("폴링 전송 오류는 같은 비종결 작업의 상태를 유지하고 오류만 반영한다", () => {
-  const running: GenerationJob = { id: "job", frameId: "frame", status: "running", messages: [] };
+  const running: GenerationJob = { id: "job", kind: "generation", frameId: "frame", status: "running", messages: [] };
   const awaiting: GenerationJob = {
     ...running,
     status: "awaitingApproval",
@@ -75,23 +109,28 @@ test("폴링 전송 오류는 같은 비종결 작업의 상태를 유지하고 
   };
   const completed: GenerationJob = { ...running, status: "completed" };
 
-  assert.deepEqual(pollingErrorGenerationJob(running, "job", "연결이 끊어졌습니다."), {
+  assert.deepEqual(pollingErrorCodexJob(running, "job", "연결이 끊어졌습니다."), {
     ...running,
     error: "연결이 끊어졌습니다.",
   });
-  assert.deepEqual(pollingErrorGenerationJob(awaiting, "job", "응답을 읽을 수 없습니다."), {
+  assert.deepEqual(pollingErrorCodexJob(awaiting, "job", "응답을 읽을 수 없습니다."), {
     ...awaiting,
     error: "응답을 읽을 수 없습니다.",
   });
-  assert.equal(pollingErrorGenerationJob(running, "new-job", "연결이 끊어졌습니다."), running);
-  assert.equal(pollingErrorGenerationJob(completed, "job", "연결이 끊어졌습니다."), completed);
+  assert.equal(pollingErrorCodexJob(running, "new-job", "연결이 끊어졌습니다."), running);
+  assert.equal(pollingErrorCodexJob(completed, "job", "연결이 끊어졌습니다."), completed);
+
+  const cell: CellEditJob = { id: "edit", kind: "cellEdit", status: "running", messages: [], target: { frameId: "f", layerId: "l", celId: "c" } };
+  assert.deepEqual(pollingErrorCodexJob(cell, "edit", "재시도"), { ...cell, error: "재시도" });
 });
 
-test("폴링 실패는 같은 생성 작업만 실패 상태로 바꾼다", () => {
-  const job: GenerationJob = { id: "job", frameId: "frame", status: "running", messages: [] };
+test("폴링 실패는 같은 Codex 작업만 종류별 필드를 보존해 실패로 바꾼다", () => {
+  const job: GenerationJob = { id: "job", kind: "generation", frameId: "frame", status: "running", messages: [] };
 
-  assert.deepEqual(failedGenerationJob(job, "job", "연결이 끊어졌습니다."), { ...job, status: "failed", error: "연결이 끊어졌습니다." });
-  assert.equal(failedGenerationJob(job, "new-job", "연결이 끊어졌습니다."), job);
+  assert.deepEqual(failedCodexJob(job, "job", "연결이 끊어졌습니다."), { ...job, status: "failed", error: "연결이 끊어졌습니다." });
+  assert.equal(failedCodexJob(job, "new-job", "연결이 끊어졌습니다."), job);
+  const cell: CellEditJob = { id: "edit", kind: "cellEdit", status: "running", messages: [], target: { frameId: "f", layerId: "l", celId: "c" } };
+  assert.deepEqual(failedCodexJob(cell, "edit", "적용 실패"), { ...cell, status: "failed", error: "적용 실패" });
 });
 
 test("HTTP 응답 오류는 폴링 재시도에서 제외하고 전송·JSON 오류는 재시도한다", async () => {

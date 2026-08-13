@@ -1,3 +1,4 @@
+import type { AiEditRequest, AiEditResult, AiEditTarget } from "../core/ai-edit.ts";
 import type { PixelBuffer, SpriteProject } from "../core/types.ts";
 
 export type WireProject = Omit<SpriteProject, "document"> & {
@@ -14,15 +15,27 @@ export type AccountResponse = {
 
 export type Session = { token: string; account: AccountResponse };
 
-export type GenerationJob = {
+type JobBase = {
   id: string;
-  frameId?: string;
   status: "running" | "awaitingApproval" | "cancelling" | "finalizing" | "completed" | "failed" | "cancelled";
   messages: string[];
   error?: string;
+};
+
+export type GenerationJob = JobBase & {
+  kind: "generation";
+  frameId?: string;
   approval?: { requestId: number; method: string };
   project?: SpriteProject;
 };
+
+export type CellEditJob = JobBase & {
+  kind: "cellEdit";
+  target: AiEditTarget;
+  result?: AiEditResult;
+};
+
+export type CodexJob = GenerationJob | CellEditJob;
 
 export function decodeProject(value: SpriteProject | WireProject): SpriteProject {
   const images = Object.fromEntries(Object.entries(value.document.images).map(([id, image]) => [id, {
@@ -57,7 +70,20 @@ export function generationPayload(project: SpriteProject, prompt: string, frameC
   };
 }
 
-export function generationStatusTitle(job: Pick<GenerationJob, "status" | "frameId">): string {
+export function cellEditPayload(projectId: string, request: AiEditRequest): { projectId: string; request: AiEditRequest } {
+  return { projectId, request };
+}
+
+export function codexJobStatusTitle(job: Pick<GenerationJob, "kind" | "status" | "frameId"> | Pick<CellEditJob, "kind" | "status">): string {
+  if (job.kind === "cellEdit") return {
+    running: "현재 셀 편집 중",
+    awaitingApproval: "현재 셀 편집 승인 거부 중",
+    cancelling: "현재 셀 편집 취소 중",
+    finalizing: "도구 동작 검증 중",
+    completed: "현재 셀 편집 준비 완료",
+    failed: "현재 셀 편집 실패",
+    cancelled: "현재 셀 편집 취소됨",
+  }[job.status];
   const titles: Record<GenerationJob["status"], [string, string]> = {
     running: ["Codex가 제작 중입니다", "선택 프레임을 재생성 중입니다"],
     awaitingApproval: ["Codex 승인 필요", "선택 프레임 재생성 승인 필요"],
@@ -80,7 +106,7 @@ export function completedFrameIndex(project: SpriteProject | undefined, requeste
   return index;
 }
 
-export function pollingErrorGenerationJob(job: GenerationJob | undefined, id: string, error: string): GenerationJob | undefined {
+export function pollingErrorCodexJob(job: CodexJob | undefined, id: string, error: string): CodexJob | undefined {
   if (job?.id !== id || job.status === "completed" || job.status === "failed" || job.status === "cancelled") return job;
   return { ...job, error };
 }
@@ -89,7 +115,7 @@ export function isRetryablePollingError(error: unknown): boolean {
   return !(error instanceof Error && error.cause instanceof Response);
 }
 
-export function failedGenerationJob(job: GenerationJob | undefined, id: string, error: string): GenerationJob | undefined {
+export function failedCodexJob(job: CodexJob | undefined, id: string, error: string): CodexJob | undefined {
   return job?.id === id ? { ...job, status: "failed", error } : job;
 }
 
