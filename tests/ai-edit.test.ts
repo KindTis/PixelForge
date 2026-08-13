@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { AI_EDIT_OUTPUT_SCHEMA, EDITOR_TOOLS, parseAiEditResult } from "../src/core/ai-edit.ts";
+import { AI_EDIT_OUTPUT_SCHEMA, EDITOR_TOOLS, parseAiEditResult, type AiEditRequest } from "../src/core/ai-edit.ts";
+import { createDocument, createProject } from "../src/core/document.ts";
+import { celKey } from "../src/core/types.ts";
+import { activeCelFrame, buildAiEditPrompt, validateAiEditRequest } from "../src/server/ai-edit.ts";
 
 const validPoints = {
   pencil: [{ x: 0, y: 0 }],
@@ -85,4 +88,91 @@ test("AI 편집 결과는 동작과 전체 좌표 상한을 적용하고 입력�
   const before = structuredClone(input);
   parseAiEditResult(input, 4, 4);
   assert.deepEqual(input, before);
+});
+
+function editFixture() {
+  const document = createDocument({ width: 4, height: 3 });
+  const frame = document.frames[0];
+  const layer = document.layers[0];
+  layer.name = "잉크";
+  const cel = document.cels[celKey(frame.id, layer.id)];
+  cel.x = 1;
+  cel.y = 2;
+  document.images[cel.imageId] = {
+    width: 2,
+    height: 1,
+    data: new Uint8ClampedArray([255, 0, 0, 255, 0, 255, 0, 255]),
+  };
+  const project = createProject("기사", document);
+  const request: AiEditRequest = {
+    prompt: "  배경을 정리해 줘  ",
+    target: { frameId: frame.id, layerId: layer.id, celId: cel.id },
+    settings: {
+      tool: "pencil",
+      color: [1, 2, 3, 255],
+      secondaryColor: [4, 5, 6, 255],
+      brushSize: 2,
+      brushShape: "circle",
+      customBrush: [{ x: -1, y: 0 }, { x: 0, y: 0 }],
+      filled: true,
+      mirrorX: false,
+      mirrorY: true,
+      selection: [{ y: 2, startX: 1, endX: 2 }],
+    },
+  };
+  return { project, request, frame, layer, cel };
+}
+
+test("활성 셀 참조는 셀 픽셀을 문서 좌표에 정렬한다", () => {
+  const { project, request } = editFixture();
+  const aligned = activeCelFrame(project.document, request.target);
+  assert.equal(aligned.width, 4);
+  assert.equal(aligned.height, 3);
+  assert.deepEqual(Array.from(aligned.data.slice((2 * 4 + 1) * 4, (2 * 4 + 3) * 4)), [255, 0, 0, 255, 0, 255, 0, 255]);
+  assert.equal(aligned.data.reduce((sum, value) => sum + value, 0), 1020);
+});
+
+test("저장 프로젝트의 AI 편집 요청은 대상과 모든 편집 설정을 검증한다", () => {
+  const { project, request } = editFixture();
+  assert.deepEqual(validateAiEditRequest(project, request), { ...request, prompt: "배경을 정리해 줘" });
+  assert.doesNotThrow(() => validateAiEditRequest(project, { ...request, settings: { ...request.settings, customBrush: [{ x: -1, y: 0 }] } }));
+
+  assert.throws(() => validateAiEditRequest(project, { ...request, prompt: " " }), /프롬프트/);
+  assert.throws(() => validateAiEditRequest(project, { ...request, target: { ...request.target, frameId: "missing" } }), /프레임/);
+  assert.throws(() => validateAiEditRequest(project, { ...request, target: { ...request.target, layerId: "missing" } }), /레이어/);
+  assert.throws(() => validateAiEditRequest(project, { ...request, target: { ...request.target, celId: "missing" } }), /셀/);
+  project.document.layers[0].locked = true;
+  assert.throws(() => validateAiEditRequest(project, request), /잠긴 레이어/);
+  project.document.layers[0].locked = false;
+
+  assert.throws(() => validateAiEditRequest(project, { ...request, settings: { ...request.settings, tool: "clone" } }), /도구/);
+  assert.throws(() => validateAiEditRequest(project, { ...request, settings: { ...request.settings, color: [0, 0, 0, 256] } }), /RGBA/);
+  assert.throws(() => validateAiEditRequest(project, { ...request, settings: { ...request.settings, brushSize: 0 } }), /브러시 크기/);
+  assert.throws(() => validateAiEditRequest(project, { ...request, settings: { ...request.settings, brushShape: "triangle" } }), /브러시 모양/);
+  assert.throws(() => validateAiEditRequest(project, { ...request, settings: { ...request.settings, mirrorX: "false" } }), /불리언/);
+  assert.throws(() => validateAiEditRequest(project, { ...request, settings: { ...request.settings, customBrush: [{ x: -2, y: 0 }] } }), /사용자 브러시/);
+  assert.throws(() => validateAiEditRequest(project, { ...request, settings: { ...request.settings, customBrush: [{ x: 0, y: 0 }, { x: 1, y: 0 }, { x: -1, y: 0 }] } }), /사용자 브러시/);
+  assert.throws(() => validateAiEditRequest(project, { ...request, settings: { ...request.settings, selection: [{ y: 3, startX: 0, endX: 0 }] } }), /선택/);
+  assert.throws(() => validateAiEditRequest(project, { ...request, settings: { ...request.settings, selection: Array.from({ length: 13 }, () => ({ y: 0, startX: 0, endX: 0 })) } }), /선택/);
+});
+
+test("AI 편집 프롬프트는 대상·설정·도구 계약과 금지 동작을 명시한다", () => {
+  const { project, request, frame, layer, cel } = editFixture();
+  const prompt = buildAiEditPrompt(project, request);
+  assert.match(prompt, /배경을 정리해 줘/);
+  assert.match(prompt, /4 × 3/);
+  assert.match(prompt, new RegExp(`F1.*${frame.id}`));
+  assert.match(prompt, new RegExp(`잉크.*${layer.id}`));
+  assert.match(prompt, new RegExp(cel.id));
+  assert.match(prompt, /pencil/);
+  assert.match(prompt, /\[1,2,3,255\]/);
+  assert.match(prompt, /\[4,5,6,255\]/);
+  assert.match(prompt, /circle/);
+  assert.match(prompt, /selection.*startX/s);
+  for (const tool of EDITOR_TOOLS) assert.match(prompt, new RegExp(tool));
+  assert.match(prompt, /좌상단 \(0, 0\)/);
+  assert.match(prompt, /불확실.*빈 actions/s);
+  assert.match(prompt, /첫 번째 이미지.*합성/s);
+  assert.match(prompt, /두 번째 이미지.*활성 셀/s);
+  assert.match(prompt, /파일 쓰기.*명령 실행.*이미지 생성/s);
 });
