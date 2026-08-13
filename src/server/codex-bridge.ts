@@ -36,6 +36,14 @@ export type GenerationRequest = {
   prompt: string;
 };
 
+export type CellEditRunRequest = {
+  cwd: string;
+  prompt: string;
+  compositePath: string;
+  celPath: string;
+  outputSchema: unknown;
+};
+
 export type GenerationRun = {
   id: string;
   threadId: string;
@@ -44,6 +52,8 @@ export type GenerationRun = {
 
 export type CodexEvent =
   | { type: "message"; text: string; runId?: string }
+  | { type: "result"; runId: string; text: string }
+  | { type: "toolAttempt"; runId: string; tool: string }
   | { type: "completed"; runId: string; status: string }
   | { type: "approval"; requestId: number; method: string; params: Record<string, unknown>; runId?: string; threadId?: string }
   | { type: "notification"; method: string; params: Record<string, unknown> }
@@ -56,6 +66,7 @@ type Pending = {
 };
 
 type Skill = { name: string; path: string; enabled: boolean };
+const FORBIDDEN_CELL_EDIT_ITEMS = new Set(["commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall", "collabAgentToolCall", "subAgentActivity", "webSearch", "sleep", "imageGeneration"]);
 
 function defaultProcessFactory(): JsonlProcess {
   const command = process.platform === "win32" ? (process.env.ComSpec ?? "cmd.exe") : "codex";
@@ -110,10 +121,7 @@ export class CodexBridge extends EventEmitter {
   }
 
   async startGeneration(request: GenerationRequest): Promise<GenerationRun> {
-    const account = await this.getAccount();
-    if (account.account?.type !== "chatgpt") {
-      throw new Error("개인 구독을 사용하려면 ChatGPT 로그인이 필요합니다.");
-    }
+    await this.requireChatGptAccount();
     const skill = await this.imagegenSkill(request.cwd);
     const thread = await this.request<{ thread: { id: string } }>("thread/start", {
       cwd: request.cwd,
@@ -133,6 +141,35 @@ export class CodexBridge extends EventEmitter {
     return run;
   }
 
+  async startCellEdit(request: CellEditRunRequest): Promise<GenerationRun> {
+    await this.requireChatGptAccount();
+    try {
+      const thread = await this.request<{ thread: { id: string } }>("thread/start", {
+        cwd: request.cwd,
+        approvalPolicy: "never",
+        sandbox: "read-only",
+        serviceName: "pixelforge",
+        developerInstructions: "제공된 텍스트와 두 이미지만 읽고 JSON 최종 응답만 작성하세요. 도구, 명령, 파일 쓰기, 스킬을 사용하지 마세요.",
+      });
+      const turn = await this.request<{ turn: { id: string } }>("turn/start", {
+        threadId: thread.thread.id,
+        input: [
+          { type: "text", text: request.prompt, text_elements: [] },
+          { type: "localImage", path: request.compositePath },
+          { type: "localImage", path: request.celPath },
+        ],
+        outputSchema: request.outputSchema,
+      });
+      const run = { id: turn.turn.id, threadId: thread.thread.id, turnId: turn.turn.id };
+      this.runs.set(run.id, run);
+      return run;
+    } catch (error) {
+      const code = error instanceof Error && "code" in error ? error.code : undefined;
+      if (code === -32601 || code === -32602) throw new Error("설치된 Codex App Server에서 현재 셀 편집을 사용할 수 없습니다.");
+      throw error;
+    }
+  }
+
   async interrupt(runId: string): Promise<void> {
     const run = this.runs.get(runId);
     if (!run) throw new Error("실행 중인 생성 작업을 찾을 수 없습니다.");
@@ -147,6 +184,11 @@ export class CodexBridge extends EventEmitter {
     this.process?.kill();
     this.process = undefined;
     this.failPending("Codex 연결이 닫혔습니다.");
+  }
+
+  private async requireChatGptAccount(): Promise<void> {
+    const account = await this.getAccount();
+    if (account.account?.type !== "chatgpt") throw new Error("개인 구독을 사용하려면 ChatGPT 로그인이 필요합니다.");
   }
 
   private async imagegenSkill(cwd: string): Promise<Skill> {
@@ -209,7 +251,11 @@ export class CodexBridge extends EventEmitter {
       if (!pending) return;
       clearTimeout(pending.timer);
       this.pending.delete(message.id);
-      if (message.error) pending.reject(new Error(message.error.message ?? "Codex 요청에 실패했습니다."));
+      if (message.error) {
+        const error = new Error(message.error.message ?? "Codex 요청에 실패했습니다.") as Error & { code?: number };
+        error.code = message.error.code;
+        pending.reject(error);
+      }
       else pending.resolve(message.result);
       return;
     }
@@ -229,6 +275,20 @@ export class CodexBridge extends EventEmitter {
     const params = message.params ?? {};
     if (message.method === "item/agentMessage/delta") {
       this.emitEvent({ type: "message", text: String(params.delta ?? ""), runId: typeof params.turnId === "string" ? params.turnId : undefined });
+      return;
+    }
+    if (message.method === "item/completed") {
+      const item = params.item as { type?: string; text?: string; phase?: string | null } | undefined;
+      if (item?.type === "agentMessage" && item.phase !== "commentary" && typeof item.text === "string" && typeof params.turnId === "string") {
+        this.emitEvent({ type: "result", runId: params.turnId, text: item.text });
+      }
+      return;
+    }
+    if (message.method === "item/started") {
+      const item = params.item as { type?: string } | undefined;
+      if (item?.type && FORBIDDEN_CELL_EDIT_ITEMS.has(item.type) && typeof params.turnId === "string") {
+        this.emitEvent({ type: "toolAttempt", runId: params.turnId, tool: item.type });
+      }
       return;
     }
     if (message.method === "turn/completed") {

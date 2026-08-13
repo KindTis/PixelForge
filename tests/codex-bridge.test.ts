@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import test from "node:test";
+import { AI_EDIT_OUTPUT_SCHEMA } from "../src/core/ai-edit.ts";
 import { CodexBridge, type JsonlProcess, type RpcMessage } from "../src/server/codex-bridge.ts";
 
 class FakeProcess extends EventEmitter implements JsonlProcess {
@@ -152,4 +153,95 @@ test("알림을 UI 이벤트로 정규화한다", async () => {
     { type: "message", text: "생성 중", runId: "r" },
     { type: "completed", runId: "r", status: "completed" },
   ]);
+});
+
+test("셀 편집은 도구 없이 읽기 전용 스레드와 구조화 턴을 시작한다", async () => {
+  const process = new FakeProcess();
+  const bridge = await startedBridge(process);
+  process.responder = (message) => {
+    if (message.method === "account/read") return { id: message.id, result: { account: { type: "chatgpt" }, requiresOpenaiAuth: true } };
+    if (message.method === "thread/start") return { id: message.id, result: { thread: { id: "thread-edit" } } };
+    if (message.method === "turn/start") return { id: message.id, result: { turn: { id: "turn-edit" } } };
+    return undefined;
+  };
+
+  const run = await bridge.startCellEdit({
+    cwd: "C:/project",
+    prompt: "현재 셀을 편집하세요.",
+    compositePath: "C:/project/tmp/composite.png",
+    celPath: "C:/project/tmp/cel.png",
+    outputSchema: AI_EDIT_OUTPUT_SCHEMA,
+  });
+
+  assert.deepEqual(run, { id: "turn-edit", threadId: "thread-edit", turnId: "turn-edit" });
+  const thread = process.messages.find((message) => message.method === "thread/start")!;
+  assert.deepEqual(thread.params, {
+    cwd: "C:/project",
+    approvalPolicy: "never",
+    sandbox: "read-only",
+    serviceName: "pixelforge",
+    developerInstructions: "제공된 텍스트와 두 이미지만 읽고 JSON 최종 응답만 작성하세요. 도구, 명령, 파일 쓰기, 스킬을 사용하지 마세요.",
+  });
+  const turn = process.messages.find((message) => message.method === "turn/start")!;
+  assert.deepEqual(turn.params, {
+    threadId: "thread-edit",
+    input: [
+      { type: "text", text: "현재 셀을 편집하세요.", text_elements: [] },
+      { type: "localImage", path: "C:/project/tmp/composite.png" },
+      { type: "localImage", path: "C:/project/tmp/cel.png" },
+    ],
+    outputSchema: AI_EDIT_OUTPUT_SCHEMA,
+  });
+  assert.equal(process.messages.some((message) => message.method === "skills/list"), false);
+});
+
+test("셀 편집 최종 메시지와 금지 도구 시작을 별도 이벤트로 정규화한다", async () => {
+  const process = new FakeProcess();
+  const bridge = await startedBridge(process);
+  const events: unknown[] = [];
+  bridge.on("event", (event) => events.push(event));
+
+  process.respond({ method: "item/agentMessage/delta", params: { threadId: "thread-edit", turnId: "turn-edit", delta: "분석 중" } });
+  process.respond({ method: "item/completed", params: { threadId: "thread-edit", turnId: "turn-edit", item: { type: "agentMessage", text: "중간", phase: "commentary" } } });
+  process.respond({ method: "item/completed", params: { threadId: "thread-edit", turnId: "turn-edit", item: { type: "agentMessage", text: '{"summary":"완료","actions":[]}', phase: "final_answer" } } });
+  for (const type of ["commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall", "collabAgentToolCall", "subAgentActivity", "webSearch", "sleep", "imageGeneration"]) {
+    process.respond({ method: "item/started", params: { threadId: "thread-edit", turnId: "turn-edit", item: { type } } });
+  }
+  for (const type of ["imageView", "userMessage", "agentMessage", "reasoning", "contextCompaction"]) {
+    process.respond({ method: "item/started", params: { threadId: "thread-edit", turnId: "turn-edit", item: { type } } });
+  }
+
+  assert.deepEqual(events[0], { type: "message", text: "분석 중", runId: "turn-edit" });
+  assert.deepEqual(events[1], { type: "result", runId: "turn-edit", text: '{"summary":"완료","actions":[]}' });
+  assert.deepEqual(events.slice(2), ["commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall", "collabAgentToolCall", "subAgentActivity", "webSearch", "sleep", "imageGeneration"].map((tool) => ({
+    type: "toolAttempt", runId: "turn-edit", tool,
+  })));
+});
+
+test("셀 편집 구조화 시작 계약을 지원하지 않는 App Server는 기능 불가로 구분한다", async () => {
+  for (const failingMethod of ["thread/start", "turn/start"]) {
+    for (const code of [-32601, -32602]) {
+      const process = new FakeProcess();
+      const bridge = await startedBridge(process);
+      process.responder = (message) => {
+        if (message.method === "account/read") return { id: message.id, result: { account: { type: "chatgpt" }, requiresOpenaiAuth: true } };
+        if (message.method === "thread/start" && failingMethod !== "thread/start") return { id: message.id, result: { thread: { id: "thread-edit" } } };
+        if (message.method === failingMethod) return { id: message.id, error: { code, message: "unsupported" } };
+        return undefined;
+      };
+
+      await assert.rejects(bridge.startCellEdit({ cwd: "C:/project", prompt: "편집", compositePath: "a.png", celPath: "b.png", outputSchema: {} }), /설치된 Codex App Server에서 현재 셀 편집을 사용할 수 없습니다/);
+      assert.equal(process.messages.some((message) => message.method === "skills/list"), false);
+      bridge.close();
+    }
+  }
+
+  const process = new FakeProcess();
+  const bridge = await startedBridge(process);
+  process.responder = (message) => message.method === "account/read"
+    ? { id: message.id, result: { account: { type: "chatgpt" }, requiresOpenaiAuth: true } }
+    : message.method === "thread/start"
+      ? { id: message.id, error: { code: -32000, message: "인증 실패" } }
+      : undefined;
+  await assert.rejects(bridge.startCellEdit({ cwd: "C:/project", prompt: "편집", compositePath: "a.png", celPath: "b.png", outputSchema: {} }), /인증 실패/);
 });
