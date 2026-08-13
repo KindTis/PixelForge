@@ -14,10 +14,11 @@ export function applyCommand(document: SpriteDocument, command: EditCommand): Sp
   const pixels = command.pixels.filter(({ x, y }) => Number.isInteger(x) && Number.isInteger(y) && x >= 0 && y >= 0 && x < source.width && y < source.height);
   if (pixels.length === 0) return document;
 
-  const linked = Object.values(document.cels).filter((candidate) => candidate.imageId === cel.imageId).length > 1;
-  const imageId = linked ? crypto.randomUUID() : cel.imageId;
   const data = new Uint8ClampedArray(source.data);
   for (const pixel of pixels) data.set(pixel.rgba, (pixel.y * source.width + pixel.x) * 4);
+  if (data.every((channel, index) => channel === source.data[index])) return document;
+  const linked = Object.values(document.cels).filter((candidate) => candidate.imageId === cel.imageId).length > 1;
+  const imageId = linked ? crypto.randomUUID() : cel.imageId;
   return {
     ...document,
     cels: linked ? { ...document.cels, [key]: { ...cel, imageId } } : document.cels,
@@ -52,6 +53,15 @@ export class History {
     }
     this.document = document;
     return document;
+  }
+
+  commitSteps(documents: readonly SpriteDocument[]): SpriteDocument {
+    if (this.transactionStart) throw new Error("편집 트랜잭션 중에는 격리 결과를 반영할 수 없습니다.");
+    if (documents.length === 0) return this.document;
+    this.undoStack.push(this.document, ...documents.slice(0, -1));
+    this.redoStack.length = 0;
+    this.document = documents.at(-1)!;
+    return this.document;
   }
 
   beginTransaction(): void {

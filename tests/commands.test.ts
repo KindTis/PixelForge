@@ -59,3 +59,57 @@ test("구조 변경도 히스토리 한 단계로 기록한다", () => {
   history.undo();
   assert.equal(history.document.layers[0].name, "레이어 1");
 });
+
+test("순변화 없는 픽셀 명령은 문서와 이력을 바꾸지 않는다", () => {
+  const original = createDocument({ width: 1, height: 1 });
+  const layer = original.layers[0];
+  const sourceFrame = original.frames[0];
+  const cel = Object.values(original.cels)[0];
+  const linkedFrame = { id: crypto.randomUUID(), durationMs: 100 };
+  original.frames.push(linkedFrame);
+  original.cels[celKey(linkedFrame.id, layer.id)] = { ...cel, id: crypto.randomUUID() };
+  const history = new History(original);
+
+  assert.equal(history.execute({ type: "setPixels", celId: cel.id, pixels: [{ x: 0, y: 0, rgba: [0, 0, 0, 0] }] }), original);
+  assert.equal(history.undo(), original);
+  assert.equal(history.document.cels[celKey(sourceFrame.id, layer.id)].imageId, cel.imageId);
+  assert.equal(history.document.cels[celKey(linkedFrame.id, layer.id)].imageId, cel.imageId);
+});
+
+test("격리된 문서 단계는 픽셀 동작별 undo와 redo로 합쳐진다", () => {
+  const original = createDocument({ width: 2, height: 1 });
+  const cel = Object.values(original.cels)[0];
+  const first = applyCommand(original, { type: "setPixels", celId: cel.id, pixels: [{ x: 0, y: 0, rgba: [1, 1, 1, 255] }] });
+  const second = applyCommand(first, { type: "setPixels", celId: cel.id, pixels: [{ x: 1, y: 0, rgba: [2, 2, 2, 255] }] });
+  const history = new History(original);
+
+  history.commitSteps([first, second]);
+  assert.equal(history.document, second);
+  assert.equal(history.undo(), first);
+  assert.equal(history.undo(), original);
+  assert.equal(history.redo(), first);
+  assert.equal(history.redo(), second);
+});
+
+test("빈 격리 단계는 redo를 보존하고 새 단계는 redo를 지운다", () => {
+  const original = createDocument({ width: 1, height: 1 });
+  const cel = Object.values(original.cels)[0];
+  const first = applyCommand(original, { type: "setPixels", celId: cel.id, pixels: [{ x: 0, y: 0, rgba: [1, 1, 1, 255] }] });
+  const second = applyCommand(original, { type: "setPixels", celId: cel.id, pixels: [{ x: 0, y: 0, rgba: [2, 2, 2, 255] }] });
+  const history = new History(original);
+
+  history.replace(first);
+  history.undo();
+  assert.equal(history.commitSteps([]), original);
+  assert.equal(history.redo(), first);
+  history.undo();
+  history.commitSteps([second]);
+  assert.equal(history.redo(), second);
+});
+
+test("편집 트랜잭션 중에는 격리 단계를 합치지 않는다", () => {
+  const original = createDocument({ width: 1, height: 1 });
+  const history = new History(original);
+  history.beginTransaction();
+  assert.throws(() => history.commitSteps([structuredClone(original)]), /편집 트랜잭션 중/);
+});
