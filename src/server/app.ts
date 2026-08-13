@@ -220,7 +220,14 @@ export function createPixelForgeServer({ projectsRoot, codex, staticRoot }: Serv
         }
         cellResult = parseAiEditResult(parsed, project.document.width, project.document.height);
       } else {
-        const png = await readFile(job.outputPath);
+        let png: Buffer;
+        try {
+          png = await readFile(job.outputPath);
+        } catch (error) {
+          if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
+          const message = job.messages.join("").trim();
+          throw new Error(`Codex가 결과 이미지를 생성하지 않았습니다.${message ? ` ${message}` : ""}`);
+        }
         job.project = job.frameId !== undefined
           ? importRegeneratedFrame(project, png, job.request as FrameRegenerationRequest, job.relativeOutputPath)
           : importSpriteSheet(project, png, job.request as SpriteSheetRequest, job.relativeOutputPath);

@@ -1,6 +1,7 @@
 .worktrees/
 .playwright-cli/
 .codex/
+.superpowers/
 docs/
 /graphify-out/
 /AGENTS.md

@@ -124,6 +124,7 @@ export function buildAiEditPrompt(project: SpriteProject, value: AiEditRequest):
     `활성 셀 ID: ${request.target.celId}`,
     `현재 편집기 settings: ${JSON.stringify(request.settings)}`,
     `사용 가능한 도구: ${EDITOR_TOOLS.join(", ")}`,
+    "points 좌표 수: pencil, eraser, spray는 1개 이상; line, curve, rectangle, ellipse, polygon, gradient, select는 정확히 2개; fill, eyedropper, wand는 정확히 1개; lasso는 서로 다른 좌표 3개 이상이며 첫 좌표를 끝에 반복하지 마세요.",
     "모든 좌표는 문서 좌상단 (0, 0)을 기준으로 한 정수 좌표입니다.",
     "첫 번째 이미지는 현재 프레임의 합성 결과이고, 두 번째 이미지는 같은 문서 좌표에 정렬한 활성 셀입니다.",
     "기존 도구의 제스처로 현재 셀 하나만 편집할 actions를 작성하세요.",

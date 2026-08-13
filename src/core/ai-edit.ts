@@ -63,7 +63,7 @@ export const AI_EDIT_OUTPUT_SCHEMA = {
       items: {
         type: "object",
         additionalProperties: false,
-        required: ["tool", "points"],
+        required: ["tool", "points", "color", "secondaryColor", "brushSize", "brushShape", "filled", "mirrorX", "mirrorY"],
         properties: {
           tool: { type: "string", enum: EDITOR_TOOLS },
           points: { type: "array", minItems: 1, maxItems: 16384, items: pointSchema },

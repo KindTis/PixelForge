@@ -34,6 +34,11 @@ test("AI 편집 계약은 현재 편집기의 14개 도구와 빈 동작 결과�
   assert.equal((AI_EDIT_OUTPUT_SCHEMA as { additionalProperties?: boolean }).additionalProperties, false);
 });
 
+test("AI 편집 출력 스키마는 모든 동작 속성을 required로 선언한다", () => {
+  const actionSchema = AI_EDIT_OUTPUT_SCHEMA.properties.actions.items;
+  assert.deepEqual([...actionSchema.required].sort(), Object.keys(actionSchema.properties).sort());
+});
+
 test("AI 편집 결과는 모든 도구의 좌표 수와 선택 설정을 검증한다", () => {
   for (const tool of EDITOR_TOOLS) {
     const result = parseAiEditResult({
@@ -170,9 +175,20 @@ test("AI 편집 프롬프트는 대상·설정·도구 계약과 금지 동작�
   assert.match(prompt, /circle/);
   assert.match(prompt, /selection.*startX/s);
   for (const tool of EDITOR_TOOLS) assert.match(prompt, new RegExp(tool));
+  assert.match(prompt, /pencil.*eraser.*spray.*1개 이상/);
+  assert.match(prompt, /line.*curve.*rectangle.*ellipse.*polygon.*gradient.*select.*정확히 2개/);
+  assert.match(prompt, /fill.*eyedropper.*wand.*정확히 1개/);
+  assert.match(prompt, /lasso.*서로 다른 좌표 3개 이상.*반복하지/);
   assert.match(prompt, /좌상단 \(0, 0\)/);
   assert.match(prompt, /불확실.*빈 actions/s);
   assert.match(prompt, /첫 번째 이미지.*합성/s);
   assert.match(prompt, /두 번째 이미지.*활성 셀/s);
   assert.match(prompt, /파일 쓰기.*명령 실행.*이미지 생성/s);
+});
+
+test("AI 편집 프롬프트는 특정 의상 교체 전략을 강제하지 않는다", () => {
+  const { project, request } = editFixture();
+  const prompt = buildAiEditPrompt(project, request);
+
+  assert.doesNotMatch(prompt, /골반 회전|새 의상|정면 의상|주름과 명암/);
 });

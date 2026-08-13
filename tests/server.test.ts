@@ -264,6 +264,49 @@ test("잘못된 선택 프레임 결과는 실패하고 저장 프로젝트를 �
   }
 });
 
+test("완료된 생성의 결과 파일이 없으면 Codex 메시지를 포함해 실패하고 프로젝트를 보존한다", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pixelforge-missing-generation-output-"));
+  const project = threeFrameProject();
+  const projectRoot = join(root, project.id);
+  await createProject(projectRoot, project);
+  const before = JSON.stringify(await loadProject(projectRoot));
+  const codex = new FakeCodex();
+  const { server, base, token } = await startGenerationServer(root, codex);
+
+  const start = () => fetch(`${base}/api/generations`, {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-pixelforge-token": token },
+    body: JSON.stringify({
+      projectId: project.id,
+      request: { prompt: "전체 재생성", frameCount: 3, columns: 3, cellWidth: 2, cellHeight: 1, durationMs: 100 },
+    }),
+  });
+
+  try {
+    const response = await start();
+    assert.equal(response.status, 202);
+    const job = await response.json() as { id: string };
+    codex.event({ type: "message", runId: "run-1", text: "참조 이미지가 첨부되지 않았습니다. " });
+    codex.event({ type: "message", runId: "run-1", text: "이미지를 첨부해 주세요." });
+    codex.event({ type: "completed", runId: "run-1", status: "completed" });
+
+    const failed = await waitForJob(base, job.id);
+    assert.equal(failed.status, "failed");
+    assert.match(failed.error ?? "", /^Codex가 결과 이미지를 생성하지 않았습니다\./);
+    assert.match(failed.error ?? "", /참조 이미지가 첨부되지 않았습니다\. 이미지를 첨부해 주세요\./);
+    assert.doesNotMatch(failed.error ?? "", /ENOENT|generated[\\/]|sheet\.png/);
+    assert.equal(JSON.stringify(await loadProject(projectRoot)), before);
+
+    const retry = await start();
+    assert.equal(retry.status, 202);
+    const retryJob = await retry.json() as { id: string };
+    await fetch(`${base}/api/generations/${retryJob.id}`, { method: "DELETE", headers: { "x-pixelforge-token": token } });
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("빈 frameId는 전체 시트 생성으로 폴백하지 않는다", async () => {
   const root = await mkdtemp(join(tmpdir(), "pixelforge-empty-frame-"));
   const project = threeFrameProject();
