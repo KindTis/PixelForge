@@ -1,4 +1,4 @@
-import type { AiEditRequest, AiEditResult, AiEditTarget } from "../core/ai-edit.ts";
+import type { AiEditReadyResult, AiEditRequest, AiEditTarget } from "../core/ai-edit.ts";
 import type { PixelBuffer, SpriteProject } from "../core/types.ts";
 
 export type WireProject = Omit<SpriteProject, "document"> & {
@@ -32,7 +32,12 @@ export type GenerationJob = JobBase & {
 export type CellEditJob = JobBase & {
   kind: "cellEdit";
   target: AiEditTarget;
-  result?: AiEditResult;
+  phase: "editing" | "judging";
+  attempt: number;
+  maxAttempts: number;
+  lastVerdict?: string;
+  logPath?: string;
+  result?: AiEditReadyResult;
 };
 
 export type CodexJob = GenerationJob | CellEditJob;
@@ -74,12 +79,12 @@ export function cellEditPayload(projectId: string, request: AiEditRequest): { pr
   return { projectId, request };
 }
 
-export function codexJobStatusTitle(job: Pick<GenerationJob, "kind" | "status" | "frameId"> | Pick<CellEditJob, "kind" | "status">): string {
+export function codexJobStatusTitle(job: Pick<GenerationJob, "kind" | "status" | "frameId"> | Pick<CellEditJob, "kind" | "status" | "phase" | "attempt" | "maxAttempts">): string {
   if (job.kind === "cellEdit") return {
-    running: "현재 셀 편집 중",
+    running: `현재 셀 편집 · ${job.attempt}/${job.maxAttempts} · ${job.phase === "judging" ? "판정 중" : "편집 중"}`,
     awaitingApproval: "현재 셀 편집 승인 거부 중",
     cancelling: "현재 셀 편집 취소 중",
-    finalizing: "도구 동작 검증 중",
+    finalizing: "현재 셀 편집 · 적용 확인 중",
     completed: "현재 셀 편집 준비 완료",
     failed: "현재 셀 편집 실패",
     cancelled: "현재 셀 편집 취소됨",
@@ -94,6 +99,22 @@ export function codexJobStatusTitle(job: Pick<GenerationJob, "kind" | "status" |
     cancelled: ["생성 취소됨", "선택 프레임 재생성 취소됨"],
   };
   return titles[job.status][job.frameId === undefined ? 0 : 1];
+}
+
+export function cellEditCompletionNotice(result: AiEditReadyResult, actionCount: number): string {
+  if (result.direct) return "판정 없이 선택·스포이드 동작을 적용했습니다.";
+  if (result.acceptedAttempt === undefined) throw new Error("완료 응답에 합격 회차가 없습니다.");
+  return `동작 ${actionCount}개 적용 · ${result.acceptedAttempt}회차 판정 합격 · 완료`;
+}
+
+export function cellEditApplicationDisposition(
+  job: CellEditJob,
+  deadline: number,
+  now: number,
+): "pending" | "completed" | "rollback" {
+  if (job.status === "completed") return "completed";
+  if (job.status === "failed" || (deadline > 0 && now >= deadline)) return "rollback";
+  return "pending";
 }
 
 export function completedFrameIndex(project: SpriteProject | undefined, requestedFrameId?: string, responseFrameId?: string): number {

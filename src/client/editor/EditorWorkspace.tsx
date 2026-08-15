@@ -1,5 +1,5 @@
 import { forwardRef, useEffect, useImperativeHandle, useRef, useState, type PointerEvent as ReactPointerEvent, type ReactNode, type WheelEvent } from "react";
-import type { AiEditRequest, AiEditResult, AiEditTarget } from "../../core/ai-edit.ts";
+import type { AiEditReadyResult, AiEditRequest, AiEditTarget } from "../../core/ai-edit.ts";
 import { History, type EditCommand, type PixelChange } from "../../core/commands.ts";
 import { compositeFrame } from "../../core/render.ts";
 import { convertDocumentToIndexed, indexedToRgba, nearestPaletteColor, quantizeToPalette, replaceColor, sameColor } from "../../core/palette.ts";
@@ -20,7 +20,7 @@ import {
   unlinkCel,
 } from "../../core/timeline.ts";
 import { celKey, type BlendMode, type RGBA, type SpriteDocument, type SpriteProject } from "../../core/types.ts";
-import { runAiEdit } from "../../core/ai-edit-runner.ts";
+import { runAiEditAttempts, type AiEditorSettings } from "../../core/ai-edit-runner.ts";
 import { screenToPixel, ToolController, type EditorTool } from "../../core/tool-controller.ts";
 import { CanvasRenderer } from "./CanvasRenderer.ts";
 import { selectionOverlay, selectionRuns } from "./ai-edit.ts";
@@ -67,7 +67,12 @@ function FrameCanvas({ project, index }: { project: SpriteProject; index: number
 
 export type EditorWorkspaceHandle = {
   captureAiEditRequest(prompt: string): AiEditRequest;
-  applyAiEdit(target: AiEditTarget, result: AiEditResult): { actionCount: number; summary: string };
+  applyAiEdit(target: AiEditTarget, result: AiEditReadyResult): {
+    actionCount: number;
+    summary: string;
+    documentChanged: boolean;
+    rollback(): void;
+  };
 };
 
 export type GenerationPanelContext = { hasActiveCel: boolean; activeLayerLocked: boolean };
@@ -124,6 +129,19 @@ export const EditorWorkspace = forwardRef<EditorWorkspaceHandle, {
   const cel = project.document.cels[celKey(frame.id, activeLayerId)];
   const image = cel ? project.document.images[cel.imageId] : undefined;
 
+  const applySettings = (next: AiEditorSettings) => {
+    setTool(next.tool);
+    setColor(next.color);
+    setSecondaryColor(next.secondaryColor);
+    setBrushSize(next.brushSize);
+    setBrushShape(next.brushShape);
+    setCustomBrush(next.customBrush);
+    setFilled(next.filled);
+    setMirrorX(next.mirrorX);
+    setMirrorY(next.mirrorY);
+    setSelection(next.selection);
+  };
+
   useImperativeHandle(ref, () => ({
     captureAiEditRequest(prompt) {
       if (!cel || !image) throw new Error("현재 프레임의 활성 셀이 없습니다.");
@@ -140,31 +158,47 @@ export const EditorWorkspace = forwardRef<EditorWorkspaceHandle, {
       };
     },
     applyAiEdit(target, result) {
-      if (frame.id !== target.frameId || activeLayerId !== target.layerId) throw new Error("AI 편집 대상 프레임 또는 레이어가 변경되었습니다.");
-      const application = runAiEdit({
+      if (frame.id !== target.frameId || activeLayerId !== target.layerId || cel?.id !== target.celId) {
+        throw new Error("AI 편집 대상 프레임, 레이어 또는 셀이 변경되었습니다.");
+      }
+      if (activeLayer?.locked) throw new Error("잠긴 레이어는 편집할 수 없습니다.");
+      const settingsSnapshot: AiEditorSettings = {
+        tool, color, secondaryColor, brushSize, brushShape,
+        customBrush: customBrush?.map((point) => ({ ...point })),
+        filled, mirrorX, mirrorY, selection: selection?.slice(),
+      };
+      const application = runAiEditAttempts({
+        ...settingsSnapshot,
         document: history.current.document,
-        tool, color, secondaryColor, brushSize, brushShape, customBrush,
-        filled, mirrorX, mirrorY, selection,
-      }, target, result, 0);
-      if (application.actionCount === 0) return { actionCount: 0, summary: result.summary };
+      }, target, result.attempts);
+
+      const historySnapshot = history.current.snapshot();
+      const documentChanged = application.historySteps.length > 0;
       const document = application.historySteps.length
         ? history.current.commitSteps(application.historySteps)
         : history.current.document;
-      setTool(application.settings.tool);
-      setColor(application.settings.color);
-      setSecondaryColor(application.settings.secondaryColor);
-      setBrushSize(application.settings.brushSize);
-      setBrushShape(application.settings.brushShape);
-      setCustomBrush(application.settings.customBrush);
-      setFilled(application.settings.filled);
-      setMirrorX(application.settings.mirrorX);
-      setMirrorY(application.settings.mirrorY);
-      setSelection(application.settings.selection);
+      if (application.actionCount > 0) applySettings(application.settings);
       if (application.historySteps.length) {
         emitted.current = document;
         onChange({ ...project, document });
       }
-      return { actionCount: application.actionCount, summary: result.summary };
+
+      let active = true;
+      return {
+        actionCount: application.actionCount,
+        summary: result.summary,
+        documentChanged,
+        rollback() {
+          if (!active) return;
+          active = false;
+          const restored = history.current.restore(historySnapshot);
+          if (application.actionCount > 0) applySettings(settingsSnapshot);
+          if (documentChanged) {
+            emitted.current = restored;
+            onChange({ ...project, document: restored });
+          }
+        },
+      };
     },
   }));
 

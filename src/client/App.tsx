@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import type { SpriteProject } from "../core/types.ts";
-import { api, cellEditPayload, codexJobStatusTitle, completedFrameIndex, decodeProject, encodeProject, failedCodexJob, generationPayload, isRetryablePollingError, pollingErrorCodexJob, type CellEditJob, type CodexJob, type GenerationJob, type Session } from "./api.ts";
+import { api, cellEditApplicationDisposition, cellEditCompletionNotice, cellEditPayload, codexJobStatusTitle, completedFrameIndex, decodeProject, encodeProject, failedCodexJob, generationPayload, isRetryablePollingError, pollingErrorCodexJob, type CellEditJob, type CodexJob, type GenerationJob, type Session } from "./api.ts";
 import { EditorWorkspace, type EditorWorkspaceHandle } from "./editor/EditorWorkspace.tsx";
 import { ExportDialog, type ExportResult, type ExportTarget } from "./ExportDialog.tsx";
 
@@ -91,6 +91,7 @@ export function App() {
   const [job, setJob] = useState<CodexJob>();
   const [startingKind, setStartingKind] = useState<"generation" | "cellEdit">();
   const cellEditCancelRequested = useRef(false);
+  const cellEditApplicationPending = useRef(false);
   const [cellEditUnavailable, setCellEditUnavailable] = useState("");
   const [reference, setReference] = useState<{ name: string; path: string }>();
   const [notice, setNotice] = useState("");
@@ -163,45 +164,114 @@ export function App() {
   };
 
   const poll = async (started: CodexJob, projectId: string, requestedFrameId?: string) => {
-    for (;;) {
-      let next: CodexJob;
-      try {
-        const collection = started.kind === "generation" ? "generations" : "edits";
-        next = await api<CodexJob>(`/api/${collection}/${started.id}`);
-      } catch (reason) {
-        if (!isRetryablePollingError(reason)) throw reason;
-        const message = reason instanceof Error ? reason.message : String(reason);
-        setJob((current) => pollingErrorCodexJob(current, started.id, message));
-        await new Promise((resolve) => window.setTimeout(resolve, 500));
-        continue;
-      }
-      if (latestProject.current?.id !== projectId) return;
-      if (next.kind !== started.kind) throw new Error("작업 종류가 요청과 일치하지 않습니다.");
-      if (next.kind === "cellEdit" && cellEditCancelRequested.current) {
-        if (next.status === "running" || next.status === "awaitingApproval") await cancelCellEdit(next.id);
-        else if (next.status === "finalizing" || next.status === "completed" || next.status === "failed" || next.status === "cancelled") cellEditCancelRequested.current = false;
-      }
-      setJob(next);
-      if (next.status === "completed") {
-        if (next.kind === "cellEdit") {
-          if (!next.result || !editor.current) throw new Error("완료된 현재 셀 편집 결과가 없습니다.");
-          const applied = editor.current.applyAiEdit(next.target, next.result);
-          setNotice(`동작 ${applied.actionCount}개 적용 · ${applied.summary}`);
-        } else if (!next.project) {
-          completedFrameIndex(undefined, requestedFrameId, next.frameId);
-        } else {
-          const completedProject = decodeProject(next.project);
-          const selectedFrameIndex = completedFrameIndex(completedProject, requestedFrameId, next.frameId);
-          setJob({ ...next, project: completedProject });
-          setProject(completedProject);
-          setDirty(false);
-          setFrameIndex(selectedFrameIndex);
-          setNotice(requestedFrameId === undefined ? "생성 결과를 프레임으로 가져와 저장했습니다." : "선택 프레임을 재생성해 저장했습니다.");
+    let applied: ReturnType<EditorWorkspaceHandle["applyAiEdit"]> | undefined;
+    let applicationError = "";
+    let applicationDeadline = 0;
+    let applicationCompleted = false;
+
+    try {
+      for (;;) {
+        let next: CodexJob;
+        try {
+          const collection = started.kind === "generation" ? "generations" : "edits";
+          next = await api<CodexJob>(`/api/${collection}/${started.id}`);
+        } catch (reason) {
+          if (!isRetryablePollingError(reason)) throw reason;
+          const message = reason instanceof Error ? reason.message : String(reason);
+          setJob((current) => pollingErrorCodexJob(current, started.id, message));
+          if (started.kind === "cellEdit" && applicationDeadline > 0
+            && cellEditApplicationDisposition({ ...started, status: "finalizing" }, applicationDeadline, Date.now()) === "rollback") {
+            const timeout = "적용 확인 시간이 초과되어 원본 셀을 유지했습니다.";
+            applied?.rollback();
+            cellEditApplicationPending.current = false;
+            setDirty(false);
+            setJob((current) => failedCodexJob(current, started.id, timeout));
+            setError(timeout);
+            return;
+          }
+          await new Promise((resolve) => window.setTimeout(resolve, 500));
+          continue;
         }
-        return;
+        if (latestProject.current?.id !== projectId) return;
+        if (next.kind !== started.kind) throw new Error("작업 종류가 요청과 일치하지 않습니다.");
+        if (next.kind === "cellEdit" && cellEditCancelRequested.current) {
+          if (next.status === "running" || next.status === "awaitingApproval") await cancelCellEdit(next.id);
+          else if (next.status === "finalizing" || next.status === "completed" || next.status === "failed" || next.status === "cancelled") cellEditCancelRequested.current = false;
+        }
+
+        if (next.kind === "cellEdit" && next.status === "finalizing") {
+          if (!next.result || !editor.current) throw new Error("적용 대기 중인 현재 셀 편집 결과가 없습니다.");
+          if (applicationDeadline === 0) applicationDeadline = Date.now() + 60_000;
+          if (!applied && !applicationError) {
+            cellEditApplicationPending.current = true;
+            try {
+              applied = editor.current.applyAiEdit(next.target, next.result);
+            } catch (reason) {
+              applicationError = reason instanceof Error ? reason.message : String(reason);
+              cellEditApplicationPending.current = false;
+            }
+          }
+          try {
+            next = await api<CellEditJob>(`/api/edits/${next.id}/application`, session!.token, {
+              method: "POST",
+              body: JSON.stringify(applicationError
+                ? { outcome: "failed", error: applicationError }
+                : { outcome: "applied" }),
+            });
+          } catch (reason) {
+            if (!isRetryablePollingError(reason)) throw reason;
+          }
+        }
+
+        setJob(next);
+
+        if (next.kind === "cellEdit") {
+          const disposition = cellEditApplicationDisposition(next, applicationDeadline, Date.now());
+          if (disposition === "completed") {
+            if (!next.result) throw new Error("완료된 현재 셀 편집 결과가 없습니다.");
+            const completionNotice = cellEditCompletionNotice(next.result, applied?.actionCount ?? next.result.actionCount);
+            applicationCompleted = true;
+            cellEditApplicationPending.current = false;
+            if (applied?.documentChanged) setDirty(true);
+            setNotice(completionNotice);
+            return;
+          }
+          if (disposition === "rollback") {
+            applied?.rollback();
+            cellEditApplicationPending.current = false;
+            setDirty(false);
+            if (next.status !== "failed") {
+              const timeout = "적용 확인 시간이 초과되어 원본 셀을 유지했습니다.";
+              setJob(failedCodexJob(next, next.id, timeout));
+              setError(timeout);
+            }
+            return;
+          }
+        }
+
+        if (next.kind === "generation" && next.status === "completed") {
+          if (!next.project) {
+            completedFrameIndex(undefined, requestedFrameId, next.frameId);
+          } else {
+            const completedProject = decodeProject(next.project);
+            const selectedFrameIndex = completedFrameIndex(completedProject, requestedFrameId, next.frameId);
+            setJob({ ...next, project: completedProject });
+            setProject(completedProject);
+            setDirty(false);
+            setFrameIndex(selectedFrameIndex);
+            setNotice(requestedFrameId === undefined ? "생성 결과를 프레임으로 가져와 저장했습니다." : "선택 프레임을 재생성해 저장했습니다.");
+          }
+          return;
+        }
+        if (next.status === "failed" || next.status === "cancelled") return;
+        await new Promise((resolve) => window.setTimeout(resolve, 500));
       }
-      if (next.status === "failed" || next.status === "cancelled") return;
-      await new Promise((resolve) => window.setTimeout(resolve, 500));
+    } finally {
+      if (!applicationCompleted) {
+        applied?.rollback();
+        cellEditApplicationPending.current = false;
+        if (applied) setDirty(false);
+      }
     }
   };
 
@@ -373,7 +443,10 @@ export function App() {
       {!project ? <NewProject token={session.token} projects={projects} onOpen={selectProject} onCreate={(next) => {
         setProjects((current) => [{ id: next.id, name: next.name }, ...current]);
         selectProject(next);
-      }} /> : <EditorWorkspace ref={editor} project={project} frameIndex={frameIndex} readOnly={codexBusy} onFrameIndex={setFrameIndex} onChange={(next) => { setProject(next); setDirty(true); }} onSave={() => void save()} saveState={dirty ? "저장 대기" : "저장됨"} onError={setError} generationPanel={({ hasActiveCel, activeLayerLocked }) =>
+      }} /> : <EditorWorkspace ref={editor} project={project} frameIndex={frameIndex} readOnly={codexBusy} onFrameIndex={setFrameIndex} onChange={(next) => {
+        setProject(next);
+        if (!cellEditApplicationPending.current) setDirty(true);
+      }} onSave={() => void save()} saveState={dirty ? "저장 대기" : "저장됨"} onError={setError} generationPanel={({ hasActiveCel, activeLayerLocked }) =>
           <section className="generation-panel">
             <div className="panel-title"><span>CODEX FORGE</span><b>{account?.type === "chatgpt" ? "연결됨" : "로그인 필요"}</b></div>
             <form onSubmit={(event) => { event.preventDefault(); void generate(); }}>
@@ -405,6 +478,8 @@ export function App() {
               <p>{startingCellEdit
                 ? "프로젝트를 저장하고 현재 셀 편집을 시작하고 있습니다."
                 : job!.error || job!.messages?.at(-1) || (job!.kind === "cellEdit" ? "현재 셀에 적용할 도구 동작을 구성하고 있습니다." : "캐릭터 일관성과 프레임 격자를 확인하고 있습니다.")}</p>
+              {job?.kind === "cellEdit" && job.lastVerdict && <p>{job.lastVerdict}</p>}
+              {job?.kind === "cellEdit" && job.logPath && <p>로그: {job.logPath}</p>}
               {startingCellEdit && <button type="button" onClick={() => void cancel()}>편집 취소</button>}
               {!startingCellEdit && job!.kind === "cellEdit" && (job!.status === "running" || job!.status === "awaitingApproval") && <button type="button" onClick={() => void cancel()}>편집 취소</button>}
               {!startingCellEdit && job!.kind === "generation" && job!.status === "running" && <button type="button" onClick={() => void cancel()}>생성 취소</button>}

@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { AiEditRequest } from "../src/core/ai-edit.ts";
+import type { AiEditReadyResult, AiEditRequest } from "../src/core/ai-edit.ts";
 import { createDocument, createProject } from "../src/core/document.ts";
-import { api, cellEditPayload, codexJobStatusTitle, completedFrameIndex, decodeProject, encodeProject, failedCodexJob, generationPayload, isRetryablePollingError, pollingErrorCodexJob, type CellEditJob, type GenerationJob, type WireProject } from "../src/client/api.ts";
+import { api, cellEditApplicationDisposition, cellEditCompletionNotice, cellEditPayload, codexJobStatusTitle, completedFrameIndex, decodeProject, encodeProject, failedCodexJob, generationPayload, isRetryablePollingError, pollingErrorCodexJob, type CellEditJob, type GenerationJob, type WireProject } from "../src/client/api.ts";
 
 test("프로젝트 픽셀을 JSON 배열로 보내고 Uint8ClampedArray로 복원한다", () => {
   const project = createProject("저장", createDocument({ width: 1, height: 1 }));
@@ -74,17 +74,40 @@ test("선택 프레임 작업의 모든 상태 제목에 프레임 문맥을 표
 });
 
 test("현재 셀 편집 작업의 모든 상태 제목에 셀 문맥을 표시한다", () => {
-  const titles: Record<CellEditJob["status"], string> = {
-    running: "현재 셀 편집 중",
-    awaitingApproval: "현재 셀 편집 승인 거부 중",
-    cancelling: "현재 셀 편집 취소 중",
-    finalizing: "도구 동작 검증 중",
-    completed: "현재 셀 편집 준비 완료",
-    failed: "현재 셀 편집 실패",
-    cancelled: "현재 셀 편집 취소됨",
+  const target = { frameId: "frame", layerId: "layer", celId: "cel" };
+  const judging: CellEditJob = {
+    id: "edit",
+    kind: "cellEdit",
+    status: "running",
+    phase: "judging",
+    attempt: 2,
+    maxAttempts: 6,
+    messages: [],
+    target,
+    logPath: "generated/cell-edit-logs/edit",
+    lastVerdict: "팔 위치를 수정해야 합니다.",
   };
-  for (const [status, title] of Object.entries(titles) as Array<[CellEditJob["status"], string]>) {
-    assert.equal(codexJobStatusTitle({ kind: "cellEdit", status }), title);
+  const readyResult: AiEditReadyResult = {
+    summary: "수정 완료",
+    attempts: [],
+    actionCount: 3,
+    acceptedAttempt: 2,
+    direct: false,
+  };
+
+  assert.equal(codexJobStatusTitle(judging), "현재 셀 편집 · 2/6 · 판정 중");
+  assert.equal(codexJobStatusTitle({ ...judging, status: "finalizing" }), "현재 셀 편집 · 적용 확인 중");
+  assert.equal(cellEditCompletionNotice(readyResult, 3), "동작 3개 적용 · 2회차 판정 합격 · 완료");
+  assert.equal(cellEditCompletionNotice({ ...readyResult, acceptedAttempt: undefined, direct: true }, 1), "판정 없이 선택·스포이드 동작을 적용했습니다.");
+  assert.throws(() => cellEditCompletionNotice({ ...readyResult, acceptedAttempt: undefined }, 3), /합격 회차/);
+
+  for (const [status, deadline, now, expected] of [
+    ["finalizing", 1_000, 999, "pending"],
+    ["completed", 1_000, 999, "completed"],
+    ["failed", 1_000, 999, "rollback"],
+    ["finalizing", 1_000, 1_000, "rollback"],
+  ] as const) {
+    assert.equal(cellEditApplicationDisposition({ ...judging, status }, deadline, now), expected);
   }
 });
 
@@ -120,7 +143,7 @@ test("폴링 전송 오류는 같은 비종결 작업의 상태를 유지하고 
   assert.equal(pollingErrorCodexJob(running, "new-job", "연결이 끊어졌습니다."), running);
   assert.equal(pollingErrorCodexJob(completed, "job", "연결이 끊어졌습니다."), completed);
 
-  const cell: CellEditJob = { id: "edit", kind: "cellEdit", status: "running", messages: [], target: { frameId: "f", layerId: "l", celId: "c" } };
+  const cell: CellEditJob = { id: "edit", kind: "cellEdit", status: "running", phase: "editing", attempt: 1, maxAttempts: 6, messages: [], target: { frameId: "f", layerId: "l", celId: "c" } };
   assert.deepEqual(pollingErrorCodexJob(cell, "edit", "재시도"), { ...cell, error: "재시도" });
 });
 
@@ -129,7 +152,7 @@ test("폴링 실패는 같은 Codex 작업만 종류별 필드를 보존해 실�
 
   assert.deepEqual(failedCodexJob(job, "job", "연결이 끊어졌습니다."), { ...job, status: "failed", error: "연결이 끊어졌습니다." });
   assert.equal(failedCodexJob(job, "new-job", "연결이 끊어졌습니다."), job);
-  const cell: CellEditJob = { id: "edit", kind: "cellEdit", status: "running", messages: [], target: { frameId: "f", layerId: "l", celId: "c" } };
+  const cell: CellEditJob = { id: "edit", kind: "cellEdit", status: "running", phase: "editing", attempt: 1, maxAttempts: 6, messages: [], target: { frameId: "f", layerId: "l", celId: "c" } };
   assert.deepEqual(failedCodexJob(cell, "edit", "적용 실패"), { ...cell, status: "failed", error: "적용 실패" });
 });
 
