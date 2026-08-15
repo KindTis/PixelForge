@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { ToolController, screenToPixel } from "../src/client/editor/ToolController.ts";
+import { ToolController, screenToPixel } from "../src/core/tool-controller.ts";
 
 const blank = { width: 4, height: 4, data: new Uint8ClampedArray(4 * 4 * 4) };
 

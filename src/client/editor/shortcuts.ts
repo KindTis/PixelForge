@@ -1,4 +1,4 @@
-import type { EditorTool } from "./ToolController.ts";
+import type { EditorTool } from "../../core/tool-controller.ts";
 
 export type ShortcutAction = `tool:${EditorTool}` | "undo" | "redo" | "copy" | "cut" | "paste" | "delete" | "move:left" | "move:right" | "move:up" | "move:down" | "play" | "brush:smaller" | "brush:larger" | "save";
 

@@ -2,6 +2,12 @@ import type { RGBA, SpriteDocument } from "./types.ts";
 
 export type PixelChange = { x: number; y: number; rgba: RGBA };
 export type EditCommand = { type: "setPixels"; celId: string; pixels: PixelChange[] };
+export type HistorySnapshot = {
+  document: SpriteDocument;
+  undoStack: readonly SpriteDocument[];
+  redoStack: readonly SpriteDocument[];
+  transactionStart?: SpriteDocument;
+};
 
 export function applyCommand(document: SpriteDocument, command: EditCommand): SpriteDocument {
   const entry = Object.entries(document.cels).find(([, cel]) => cel.id === command.celId);
@@ -32,6 +38,23 @@ export class History {
   private transactionStart?: SpriteDocument;
 
   constructor(public document: SpriteDocument) {}
+
+  snapshot(): HistorySnapshot {
+    return {
+      document: this.document,
+      undoStack: this.undoStack.slice(),
+      redoStack: this.redoStack.slice(),
+      transactionStart: this.transactionStart,
+    };
+  }
+
+  restore(snapshot: HistorySnapshot): SpriteDocument {
+    this.document = snapshot.document;
+    this.undoStack.splice(0, this.undoStack.length, ...snapshot.undoStack);
+    this.redoStack.splice(0, this.redoStack.length, ...snapshot.redoStack);
+    this.transactionStart = snapshot.transactionStart;
+    return this.document;
+  }
 
   execute(command: EditCommand): SpriteDocument {
     const before = this.document;

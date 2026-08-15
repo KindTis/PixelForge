@@ -20,9 +20,10 @@ import {
   unlinkCel,
 } from "../../core/timeline.ts";
 import { celKey, type BlendMode, type RGBA, type SpriteDocument, type SpriteProject } from "../../core/types.ts";
+import { runAiEdit } from "../../core/ai-edit-runner.ts";
+import { screenToPixel, ToolController, type EditorTool } from "../../core/tool-controller.ts";
 import { CanvasRenderer } from "./CanvasRenderer.ts";
-import { runAiEdit, selectionOverlay, selectionRuns } from "./ai-edit.ts";
-import { screenToPixel, ToolController, type EditorTool } from "./ToolController.ts";
+import { selectionOverlay, selectionRuns } from "./ai-edit.ts";
 import { shortcutAction } from "./shortcuts.ts";
 
 const TOOLS: Array<{ id: EditorTool; icon: string; label: string; key: string }> = [
@@ -144,7 +145,7 @@ export const EditorWorkspace = forwardRef<EditorWorkspaceHandle, {
         document: history.current.document,
         tool, color, secondaryColor, brushSize, brushShape, customBrush,
         filled, mirrorX, mirrorY, selection,
-      }, target, result);
+      }, target, result, 0);
       if (application.actionCount === 0) return { actionCount: 0, summary: result.summary };
       const document = application.historySteps.length
         ? history.current.commitSteps(application.historySteps)

@@ -33,6 +33,7 @@ export type AiToolAction = {
   mirrorY?: boolean;
 };
 export type AiEditResult = { summary: string; actions: AiToolAction[] };
+export type AiEditAttempt = { seed: number; result: AiEditResult };
 
 const pointSchema = {
   type: "object",

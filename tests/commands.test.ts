@@ -113,3 +113,16 @@ test("편집 트랜잭션 중에는 격리 단계를 합치지 않는다", () =>
   history.beginTransaction();
   assert.throws(() => history.commitSteps([structuredClone(original)]), /편집 트랜잭션 중/);
 });
+
+test("History 스냅샷 복원은 AI 적용 문서와 undo/redo 변경을 함께 되돌린다", () => {
+  const original = createDocument({ width: 2, height: 1 });
+  const celId = Object.values(original.cels)[0].id;
+  const history = new History(original);
+  const beforeAi = history.execute({ type: "setPixels", celId, pixels: [{ x: 0, y: 0, rgba: [1, 2, 3, 255] }] });
+  const snapshot = history.snapshot();
+  history.commitSteps([applyCommand(beforeAi, { type: "setPixels", celId, pixels: [{ x: 1, y: 0, rgba: [4, 5, 6, 255] }] })]);
+
+  assert.equal(history.restore(snapshot), beforeAi);
+  assert.equal(history.undo(), original);
+  assert.equal(history.redo(), beforeAi);
+});

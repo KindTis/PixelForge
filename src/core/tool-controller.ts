@@ -1,5 +1,5 @@
-import type { EditorTool } from "../../core/ai-edit.ts";
-import type { EditCommand, PixelChange } from "../../core/commands.ts";
+import type { EditorTool } from "./ai-edit.ts";
+import type { EditCommand, PixelChange } from "./commands.ts";
 import {
   ellipse,
   floodFill,
@@ -12,11 +12,11 @@ import {
   spray,
   stampBrush,
   type Point,
-} from "../../core/raster.ts";
-import { lassoMask, magicWandMask, rectangleMask } from "../../core/selection.ts";
-import type { PixelBuffer, RGBA } from "../../core/types.ts";
+} from "./raster.ts";
+import { lassoMask, magicWandMask, rectangleMask } from "./selection.ts";
+import type { PixelBuffer, RGBA } from "./types.ts";
 
-export type { EditorTool } from "../../core/ai-edit.ts";
+export type { EditorTool } from "./ai-edit.ts";
 
 export type ToolSettings = {
   tool: EditorTool;
@@ -95,7 +95,7 @@ export class ToolController {
             : this.settings.tool === "rectangle" ? rectangle(start, end, this.settings.filled)
               : this.settings.tool === "ellipse" ? ellipse(start, end, this.settings.filled)
                 : this.settings.tool === "polygon" ? polygon([start, { x: start.x, y: end.y }, end], this.settings.filled)
-                  : unique(this.path.flatMap((point) => spray(point, Math.max(1, this.settings.brushSize * 2), Math.max(8, this.settings.brushSize * 8), this.settings.random)))
+                  : unique(this.path.flatMap((point) => spray(point, Math.max(1, this.settings.brushSize * 2), Math.max(8, this.settings.brushSize * 8), this.settings.random)));
       points = this.settings.customBrush?.length
         ? unique(points.flatMap((point) => this.settings.customBrush!.map((offset) => ({ x: point.x + offset.x, y: point.y + offset.y }))))
         : stampBrush(unique(points), this.settings.brushSize, this.settings.brushShape);
