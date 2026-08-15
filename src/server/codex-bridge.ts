@@ -72,7 +72,7 @@ const FORBIDDEN_CELL_EDIT_ITEMS = new Set(["commandExecution", "fileChange", "mc
 const CELL_EDIT_UNAVAILABLE = "설치된 Codex App Server에서 현재 셀 편집을 사용할 수 없습니다.";
 const CELL_EDIT_DISABLED_FEATURES = [
   "shell_tool", "unified_exec", "apps", "browser_use", "browser_use_external", "browser_use_full_cdp_access",
-  "computer_use", "hooks", "image_generation", "memories", "multi_agent", "plugins", "plugin_sharing",
+  "computer_use", "goals", "hooks", "image_generation", "memories", "multi_agent", "plugins", "plugin_sharing",
   "remote_plugin", "skill_mcp_dependency_install", "skill_search", "tool_suggest", "view_image", "workspace_dependencies",
 ] as const;
 
@@ -225,6 +225,7 @@ export class CodexBridge extends EventEmitter {
         || !isRecord(config.mcp_servers)
         || Object.keys(config.mcp_servers).length > 0) throw new Error(CELL_EDIT_UNAVAILABLE);
 
+      const seenCursors = new Set<string>();
       let cursor: string | undefined;
       do {
         const page = await this.request<{ data: unknown; nextCursor: unknown }>("mcpServerStatus/list", {
@@ -236,7 +237,9 @@ export class CodexBridge extends EventEmitter {
           || (nextCursor !== null && (typeof nextCursor !== "string" || !nextCursor))) {
           throw new Error(CELL_EDIT_UNAVAILABLE);
         }
+        if (typeof nextCursor === "string" && seenCursors.has(nextCursor)) throw new Error(CELL_EDIT_UNAVAILABLE);
         cursor = typeof nextCursor === "string" ? nextCursor : undefined;
+        if (cursor) seenCursors.add(cursor);
       } while (cursor);
 
       const installed = await this.request<{ apps: unknown }>("app/installed", { forceRefresh: true });

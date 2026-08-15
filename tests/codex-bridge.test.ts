@@ -13,7 +13,7 @@ import {
 
 const disabledCellEditFeatures = [
   "shell_tool", "unified_exec", "apps", "browser_use", "browser_use_external", "browser_use_full_cdp_access",
-  "computer_use", "hooks", "image_generation", "memories", "multi_agent", "plugins", "plugin_sharing",
+  "computer_use", "goals", "hooks", "image_generation", "memories", "multi_agent", "plugins", "plugin_sharing",
   "remote_plugin", "skill_mcp_dependency_install", "skill_search", "tool_suggest", "view_image", "workspace_dependencies",
 ] as const;
 
@@ -228,6 +228,7 @@ test("셀 편집은 제한 설정을 검사한 뒤 도구 없는 읽기 전용 �
     "--disable", "browser_use_external",
     "--disable", "browser_use_full_cdp_access",
     "--disable", "computer_use",
+    "--disable", "goals",
     "--disable", "hooks",
     "--disable", "image_generation",
     "--disable", "memories",
@@ -316,6 +317,21 @@ test("셀 편집은 MCP 상태의 모든 빈 페이지를 검사한다", async (
     { detail: "toolsAndAuthOnly" },
     { detail: "toolsAndAuthOnly", cursor: "next" },
   ]);
+});
+
+test("셀 편집은 반복된 MCP 페이지 cursor를 즉시 기능 불가로 거부한다", async () => {
+  const process = new FakeProcess();
+  const bridge = await startedBridge(process);
+  let pageCount = 0;
+  process.responder = (message) => {
+    if (message.method !== "mcpServerStatus/list") return undefined;
+    pageCount += 1;
+    return { id: message.id, result: { data: [], nextCursor: pageCount < 3 ? "same" : null } };
+  };
+
+  await assert.rejects(bridge.startCellEdit(cellEditRequest), /설치된 Codex App Server에서 현재 셀 편집을 사용할 수 없습니다/);
+  assert.equal(pageCount, 2);
+  assert.equal(process.messages.some(({ method }) => method === "thread/start"), false);
 });
 
 test("셀 편집 사전 검사가 불완전하거나 제한 설정이 다르면 thread 시작 전에 거부한다", async () => {
