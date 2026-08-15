@@ -192,6 +192,7 @@ type CellEditWire = {
   phase?: "editing" | "judging";
   attempt?: number;
   maxAttempts?: number;
+  lastVerdict?: string;
   logPath?: string;
   error?: string;
   result?: AiEditReadyResult;
@@ -778,6 +779,8 @@ test("불합격 피드백으로 직전 후보를 재편집한 뒤 합격한다",
     const retried = await fixture.startEdit();
     await fixture.codex.completeResult(pixelEdit, "judging");
     await fixture.codex.completeResult(failVerdict, "editing");
+    const judging = await fetch(`${fixture.base}/api/edits/${retried.id}`).then((response) => response.json()) as CellEditWire;
+    assert.equal(judging.lastVerdict, failVerdict.summary);
     const firstEdit = fixture.codex.cellEdits[0];
     const retryEdit = fixture.codex.cellEdits[1];
     assert.equal(retryEdit.originalCompositePath, firstEdit.originalCompositePath);

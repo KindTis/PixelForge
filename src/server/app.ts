@@ -143,7 +143,7 @@ function wireJob(job: Job): Record<string, unknown> {
     phase: job.phase,
     attempt: job.attempt,
     maxAttempts: job.maxAttempts,
-    lastVerdict: job.lastVerdict,
+    lastVerdict: job.lastVerdict?.summary,
     logPath: job.log.relativeDir,
     result: job.result,
   };
