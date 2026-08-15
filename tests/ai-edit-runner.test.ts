@@ -7,7 +7,7 @@ import { moveSelection } from "../src/core/selection.ts";
 import { celKey, type SpriteDocument } from "../src/core/types.ts";
 import { runAiEdit, runAiEditAttempts, selectionMask, type AiEditExecutionState } from "../src/core/ai-edit-runner.ts";
 import { ToolController } from "../src/core/tool-controller.ts";
-import { selectionOverlay, selectionRuns } from "../src/client/editor/ai-edit.ts";
+import { selectionOverlay, selectionReplayMask, selectionRuns } from "../src/client/editor/ai-edit.ts";
 
 const validPoints: Record<EditorTool, Array<{ x: number; y: number }>> = {
   pencil: [{ x: 1, y: 1 }],
@@ -192,6 +192,34 @@ test("선택 마스크는 셀과 문서 좌표 사이를 오프셋과 경계에 
   assert.deepEqual(selectionMask(runs, image, cel, document), mask);
   assert.deepEqual(Array.from(selectionOverlay(mask, image, cel, document)!), [0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 1, 0]);
   assert.throws(() => selectionRuns(new Uint8Array(3), image, cel, document), /선택 마스크 크기/);
+});
+
+test("문서 경계를 넘는 셀도 서버 후보와 클라이언트 재생의 전체 이미지가 같다", () => {
+  const document = createDocument({ width: 2, height: 1 });
+  const target = targetOf(document);
+  const cel = document.cels[celKey(target.frameId, target.layerId)];
+  cel.x = -1;
+  const image = { width: 3, height: 1, data: new Uint8ClampedArray(12) };
+  document.images[cel.imageId] = image;
+  const localSelection = new Uint8Array([1, 1, 0]);
+  const attempts = [{
+    seed: 7,
+    result: {
+      summary: "경계 선택",
+      actions: [{ tool: "pencil" as const, points: [{ x: 0, y: 0 }], brushSize: 3 }],
+    },
+  }];
+  const runs = selectionRuns(localSelection, image, cel, document);
+  const serverCandidate = runAiEditAttempts({
+    ...stateOf(document),
+    selection: selectionMask(runs, image, cel, document),
+  }, target, attempts);
+  const clientReplay = runAiEditAttempts({
+    ...stateOf(document),
+    selection: selectionReplayMask(localSelection, image, cel, document),
+  }, target, attempts);
+
+  assert.deepEqual(imageBytes(clientReplay.document, target), imageBytes(serverCandidate.document, target));
 });
 
 test("오프셋 셀의 새 선택은 로컬 마스크로 그리기를 제한한다", () => {

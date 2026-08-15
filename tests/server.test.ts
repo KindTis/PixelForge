@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import { request as httpRequest } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -32,6 +32,7 @@ class FakeCodex extends EventEmitter {
   cellEdits: CellEditRunRequest[] = [];
   judgments: CellEditRunRequest[] = [];
   runs: Array<{ id: string; role: "editing" | "judging" }> = [];
+  runDirectories: Array<{ role: "editing" | "judging"; cwd: string; entries: string[] }> = [];
   responses: Array<{ id: number; result: unknown }> = [];
   interrupts: string[] = [];
   approvalDuringStart = false;
@@ -71,8 +72,7 @@ class FakeCodex extends EventEmitter {
     this.lastCellEdit = request;
     this.cellEdits.push(request);
     if (this.cellEditError) throw this.cellEditError;
-    const candidate = basename(request.candidateCompositePath).match(/^attempt-(\d+)-composite\.png$/);
-    if (candidate) await readFile(join(dirname(request.candidateCompositePath), `attempt-${candidate[1]}-verdict.json`));
+    this.runDirectories.push({ role: "editing", cwd: request.cwd, entries: (await readdir(request.cwd)).sort() });
     const run = this.startRun("editing");
     for (const event of this.cellEditEventsDuringStart) this.event({ ...event, runId: run.id } as CodexEvent);
     this.cellEditEventsDuringStart = [];
@@ -81,6 +81,7 @@ class FakeCodex extends EventEmitter {
 
   async startCellEditJudgment(request: CellEditRunRequest) {
     this.judgments.push(request);
+    this.runDirectories.push({ role: "judging", cwd: request.cwd, entries: (await readdir(request.cwd)).sort() });
     await Promise.all([readFile(request.candidateCompositePath), readFile(request.candidateCelPath)]);
     await this.judgmentWait;
     return this.startRun("judging");
@@ -724,6 +725,40 @@ test("로컬 API는 세션 토큰으로 프로젝트 생성과 Codex 결과 가�
   }
 });
 
+test("셀 편집 모델 실행 디렉터리에는 복사된 PNG 네 개만 보인다", async () => {
+  const fixture = await cellEditFixture();
+  try {
+    const started = await fixture.startEdit();
+    assert.ok(started.logPath);
+    await fixture.codex.completeResult(pixelEdit, "judging");
+    assert.equal(fixture.codex.runDirectories.length, 2);
+    assert.notEqual(fixture.codex.runDirectories[0].cwd, fixture.codex.runDirectories[1].cwd);
+    const requests = [fixture.codex.cellEdits[0]!, fixture.codex.judgments[0]!];
+    for (const [snapshot, request] of fixture.codex.runDirectories.map((snapshot, index) => [snapshot, requests[index]!] as const)) {
+      assert.notEqual(snapshot.cwd, join(fixture.projectRoot, started.logPath));
+      assert.deepEqual(snapshot.entries, [
+        "candidate-cel.png",
+        "candidate-composite.png",
+        "original-cel.png",
+        "original-composite.png",
+      ]);
+      assert.deepEqual([
+        request.candidateCelPath,
+        request.candidateCompositePath,
+        request.originalCelPath,
+        request.originalCompositePath,
+      ].map(dirname), Array(4).fill(snapshot.cwd));
+    }
+    await fetch(`${fixture.base}/api/edits/${started.id}`, {
+      method: "DELETE",
+      headers: { "x-pixelforge-token": fixture.headers["x-pixelforge-token"] },
+    });
+    for (const { cwd } of fixture.codex.runDirectories) await assert.rejects(readdir(cwd), { code: "ENOENT" });
+  } finally {
+    await fixture.close();
+  }
+});
+
 test("첫 픽셀 후보가 합격하면 한 번만 편집·판정하고 적용 확인을 기다린다", async () => {
   const fixture = await cellEditFixture();
   try {
@@ -763,7 +798,7 @@ test("첫 픽셀 후보가 합격하면 한 번만 편집·판정하고 적용 �
     );
     const loggedCel = decodePng(await fixture.readLog(ready, "attempt-01-cel.png"));
     assert.deepEqual(Array.from(activeCelFrame(replay.document, fixture.request.target).data), Array.from(loggedCel.data));
-    for (const internal of ["request", "project", "runId", "resultText", "resultConflict", "activeRun", "tempDir", "timer", "log"]) {
+    for (const internal of ["request", "project", "runId", "resultText", "resultConflict", "activeRun", "tempDir", "timer", "log", "logTail"]) {
       assert.equal(internal in ready, false);
     }
     assert.equal(JSON.stringify(await loadProject(fixture.projectRoot)), JSON.stringify(fixture.before));
@@ -783,10 +818,14 @@ test("불합격 피드백으로 직전 후보를 재편집한 뒤 합격한다",
     assert.equal(judging.lastVerdict, failVerdict.summary);
     const firstEdit = fixture.codex.cellEdits[0];
     const retryEdit = fixture.codex.cellEdits[1];
-    assert.equal(retryEdit.originalCompositePath, firstEdit.originalCompositePath);
-    assert.equal(retryEdit.originalCelPath, firstEdit.originalCelPath);
-    assert.equal(basename(retryEdit.candidateCompositePath), "attempt-01-composite.png");
-    assert.equal(basename(retryEdit.candidateCelPath), "attempt-01-cel.png");
+    assert.notEqual(dirname(retryEdit.originalCompositePath), dirname(firstEdit.originalCompositePath));
+    assert.equal(basename(retryEdit.originalCompositePath), "original-composite.png");
+    assert.equal(basename(retryEdit.originalCelPath), "original-cel.png");
+    assert.equal(basename(retryEdit.candidateCompositePath), "candidate-composite.png");
+    assert.equal(basename(retryEdit.candidateCelPath), "candidate-cel.png");
+    assert.deepEqual(await readFile(retryEdit.candidateCompositePath), await fixture.readLog(retried, "attempt-01-composite.png"));
+    assert.deepEqual(await readFile(retryEdit.candidateCelPath), await fixture.readLog(retried, "attempt-01-cel.png"));
+    assert.deepEqual(JSON.parse(await fixture.readLog(retried, "attempt-01-verdict.json").then((value) => value.toString("utf8"))), failVerdict);
     assert.match(retryEdit.prompt, /직전 판정 피드백:/);
     assert.match(retryEdit.prompt, new RegExp(failVerdict.summary));
     assert.equal(retryEdit.prompt.match(/직전 판정 피드백:/g)?.length, 1);
@@ -885,6 +924,64 @@ test("판정 불변식 위반은 품질 실패가 아닌 기술 실패로 끝난
     assert.equal(JSON.parse(await fixture.readLog(failed, "summary.json").then((value) => value.toString("utf8"))).outcome, "technical_error");
   } finally {
     await fixture.close();
+  }
+});
+
+test("초기 로그 중 terminal 선점은 성공한 파일을 summary에 포함하고 첫 실행을 막는다", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pixelforge-cell-edit-log-race-"));
+  const project = threeFrameProject();
+  const projectRoot = join(root, project.id);
+  await createProject(projectRoot, project);
+  const codex = new FakeCodex();
+  let enterInitial!: () => void;
+  let releaseInitial!: () => void;
+  const initialEntered = new Promise<void>((resolve) => { enterInitial = resolve; });
+  const initialReleased = new Promise<void>((resolve) => { releaseInitial = resolve; });
+  const options = {
+    projectsRoot: root,
+    codex,
+    cellEditCodex: codex,
+    cellEditLogWriteBarrier: async (kind: string) => {
+      if (kind !== "initial") return;
+      enterInitial();
+      await initialReleased;
+    },
+  } as Parameters<typeof createPixelForgeServer>[0] & { cellEditLogWriteBarrier(kind: string): Promise<void> };
+  const server = createPixelForgeServer(options);
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  const { token } = await fetch(`${base}/api/session`).then((response) => response.json()) as { token: string };
+
+  try {
+    const response = fetch(`${base}/api/edits`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-pixelforge-token": token },
+      body: JSON.stringify({ projectId: project.id, request: cellEditRequest(project) }),
+    });
+    await Promise.race([
+      initialEntered,
+      new Promise((_, reject) => setTimeout(() => reject(new Error("초기 로그 barrier에 진입하지 않았습니다.")), 1_000)),
+    ]);
+    codex.event({ type: "error", message: "초기 로그 중 연결 종료" });
+    releaseInitial();
+
+    const failed = await (await response).json() as CellEditWire;
+    assert.equal(failed.status, "failed");
+    assert.equal(codex.cellEdits.length, 0);
+    const logDir = join(projectRoot, failed.logPath!);
+    const summary = JSON.parse(await readFile(join(logDir, "summary.json"), "utf8"));
+    assert.deepEqual(summary.files, [
+      `${failed.logPath}/original-composite.png`,
+      `${failed.logPath}/original-cel.png`,
+      `${failed.logPath}/request.json`,
+    ]);
+    const terminalFiles = (await readdir(logDir)).sort();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.deepEqual((await readdir(logDir)).sort(), terminalFiles);
+  } finally {
+    releaseInitial();
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    await rm(root, { recursive: true, force: true });
   }
 });
 
@@ -1183,6 +1280,12 @@ test("셀 편집 승인과 도구 시도는 즉시 거부·중단하고 실패�
     assert.equal(approvalFailed.status, "failed");
     assert.deepEqual(codex.responses.at(-1), { id: 101, result: { decision: "decline" } });
     assert.equal(JSON.parse(await readFile(join(projectRoot, approval.logPath!, "summary.json"), "utf8")).outcome, "technical_error");
+    const terminalRuns = codex.runs.length;
+    codex.event({ type: "approval", requestId: 102, method: "item/fileChange/requestApproval", params: {}, runId: approvalRun });
+    await waitUntil(() => codex.responses.some(({ id }) => id === 102), "종료된 실행의 늦은 승인이 거부되지 않았습니다.");
+    assert.deepEqual(codex.responses.filter(({ id }) => id === 102), [{ id: 102, result: { decision: "decline" } }]);
+    assert.equal(((await fetch(`${base}/api/edits/${approval.id}`).then((response) => response.json())) as CellEditWire).status, "failed");
+    assert.equal(codex.runs.length, terminalRuns);
 
     const tool = await start();
     const toolRun = codex.lastRunId;

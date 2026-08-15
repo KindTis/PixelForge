@@ -1,4 +1,5 @@
 import type { AiSelectionRun } from "../../core/ai-edit.ts";
+import { selectionMask } from "../../core/ai-edit-runner.ts";
 import type { Cel, PixelBuffer, SpriteDocument } from "../../core/types.ts";
 
 function validateMask(mask: Uint8Array, image: PixelBuffer): void {
@@ -24,6 +25,10 @@ export function selectionRuns(mask: Uint8Array | undefined, image: PixelBuffer, 
     }
   }
   return runs;
+}
+
+export function selectionReplayMask(mask: Uint8Array | undefined, image: PixelBuffer, cel: Cel, document: SpriteDocument): Uint8Array | undefined {
+  return selectionMask(selectionRuns(mask, image, cel, document), image, cel, document);
 }
 
 export function selectionOverlay(mask: Uint8Array | undefined, image: PixelBuffer, cel: Cel, document: SpriteDocument): Uint8Array | undefined {

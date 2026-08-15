@@ -1,6 +1,6 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { mkdir, readFile, readdir, stat, writeFile } from "node:fs/promises";
+import { copyFile, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { extname, join, resolve } from "node:path";
 import {
   AI_EDIT_OUTPUT_SCHEMA,
@@ -90,7 +90,9 @@ type CellEditJob = JobBase & {
     resultText?: string;
     resultConflict?: boolean;
     completionClaimed?: boolean;
+    inputDir: string;
   };
+  logTail: Promise<void>;
   terminalDecision?: CellEditTerminal;
   terminalFinalization?: Promise<void>;
   applicationTimer?: ReturnType<typeof setTimeout>;
@@ -104,6 +106,7 @@ export type ServerOptions = {
   cellEditCodex?: CodexClient;
   staticRoot?: string;
   cellEditApplicationTimeoutMs?: number;
+  cellEditLogWriteBarrier?: (kind: "initial" | "attempt" | "verdict" | "summary") => Promise<void>;
 };
 
 function send(response: ServerResponse, status: number, body: unknown): void {
@@ -203,6 +206,7 @@ export function createPixelForgeServer({
   cellEditCodex,
   staticRoot,
   cellEditApplicationTimeoutMs = 60_000,
+  cellEditLogWriteBarrier,
 }: ServerOptions) {
   const token = randomBytes(24).toString("base64url");
   const jobs = new Map<string, Job>();
@@ -210,6 +214,8 @@ export function createPixelForgeServer({
   const earlyEvents = new Map<CodexClient, Map<string, CodexEvent[]>>();
   const ignoredRuns = new Map<CodexClient, Set<string>>();
   const projectLocks = new Map<string, string>();
+  const runDirectories = new Set<string>();
+  let closing = false;
 
   const bridgeForJob = (job: Job): CodexClient => job.kind === "generation" ? codex : cellEditCodex!;
 
@@ -223,13 +229,65 @@ export function createPixelForgeServer({
     if (projectLocks.get(projectId) === owner) projectLocks.delete(projectId);
   };
 
+  const writeCellEditLog = <T>(
+    job: CellEditJob,
+    kind: "initial" | "attempt" | "verdict" | "summary",
+    write: () => Promise<T>,
+  ): Promise<T> => {
+    const result = job.logTail.then(async () => {
+      await cellEditLogWriteBarrier?.(kind);
+      return write();
+    });
+    job.logTail = result.then(() => undefined, () => undefined);
+    return result;
+  };
+
+  const removeRunDirectory = async (path: string): Promise<void> => {
+    if (!runDirectories.has(path)) return;
+    await rm(path, { recursive: true, force: true });
+    runDirectories.delete(path);
+  };
+
+  const prepareRunDirectory = async (
+    job: CellEditJob,
+    source: { originalCompositePath: string; originalCelPath: string; candidateCompositePath: string; candidateCelPath: string },
+  ) => {
+    const root = resolveInside(job.log.projectRoot, "generated/cell-edit-runs");
+    await mkdir(root, { recursive: true });
+    const cwd = await mkdtemp(join(root, "run-"));
+    runDirectories.add(cwd);
+    const paths = {
+      cwd,
+      originalCompositePath: join(cwd, "original-composite.png"),
+      originalCelPath: join(cwd, "original-cel.png"),
+      candidateCompositePath: join(cwd, "candidate-composite.png"),
+      candidateCelPath: join(cwd, "candidate-cel.png"),
+    };
+    try {
+      await Promise.all([
+        copyFile(source.originalCompositePath, paths.originalCompositePath),
+        copyFile(source.originalCelPath, paths.originalCelPath),
+        copyFile(source.candidateCompositePath, paths.candidateCompositePath),
+        copyFile(source.candidateCelPath, paths.candidateCelPath),
+      ]);
+      return paths;
+    } catch (error) {
+      await removeRunDirectory(cwd).catch(() => undefined);
+      throw error;
+    }
+  };
+
   const isTerminal = (status: JobStatus): status is CellEditTerminal["status"] => (
     status === "completed" || status === "failed" || status === "cancelled"
   );
 
   const ignoreRun = (bridge: CodexClient, runId: string): void => {
     runToJob.get(bridge)?.delete(runId);
-    earlyEvents.get(bridge)?.delete(runId);
+    const bridgeEvents = earlyEvents.get(bridge);
+    for (const event of bridgeEvents?.get(runId) ?? []) {
+      if (event.type === "approval") bridge.respond(event.requestId, { decision: "decline" });
+    }
+    bridgeEvents?.delete(runId);
     const ignored = ignoredRuns.get(bridge) ?? new Set<string>();
     ignoredRuns.set(bridge, ignored);
     ignored.add(runId);
@@ -245,7 +303,7 @@ export function createPixelForgeServer({
   const finalizeClaimedCellJob = async (job: CellEditJob, terminal: CellEditTerminal): Promise<void> => {
     clearTimeout(job.applicationTimer);
     try {
-      await writeCellEditSummary(job.log, terminal.summary);
+      await writeCellEditLog(job, "summary", () => writeCellEditSummary(job.log, terminal.summary));
       job.status = terminal.status;
       job.error = terminal.error;
       if (terminal.status !== "completed") job.result = undefined;
@@ -262,11 +320,15 @@ export function createPixelForgeServer({
   const finalizeCellJob = (job: CellEditJob, terminal: CellEditTerminal): Promise<void> => {
     if (!job.terminalFinalization) {
       job.terminalDecision = terminal;
-      const runId = job.activeRun?.id;
+      const activeRun = job.activeRun;
+      const runId = activeRun?.id;
       if (runId) ignoreRun(bridgeForJob(job), runId);
       job.activeRun = undefined;
-      if (runId && terminal.summary.outcome === "technical_error") {
-        void bridgeForJob(job).interrupt(runId).catch(() => undefined);
+      if (activeRun && terminal.summary.outcome === "technical_error") {
+        void bridgeForJob(job).interrupt(activeRun.id).catch(() => undefined)
+          .then(() => removeRunDirectory(activeRun.inputDir).catch(() => undefined));
+      } else if (activeRun) {
+        void removeRunDirectory(activeRun.inputDir).catch(() => undefined);
       }
       job.terminalFinalization = finalizeClaimedCellJob(job, terminal);
     }
@@ -310,10 +372,12 @@ export function createPixelForgeServer({
 
   const interruptJob = async (job: Job): Promise<void> => {
     if (job.kind === "cellEdit") {
-      const runId = job.activeRun?.id ?? job.runId!;
+      const activeRun = job.activeRun;
+      const runId = activeRun?.id ?? job.runId!;
       ignoreRun(bridgeForJob(job), runId);
       try {
         await bridgeForJob(job).interrupt(runId);
+        if (activeRun) await removeRunDirectory(activeRun.inputDir).catch(() => undefined);
       } catch (error) {
         const message = `Codex 편집 취소에 실패했습니다: ${error instanceof Error ? error.message : String(error)}`;
         await failCellJob(job, message);
@@ -343,8 +407,16 @@ export function createPixelForgeServer({
     }
   };
 
+  const currentCellJob = (job: CellEditJob): boolean => (
+    jobs.get(job.id) === job
+    && projectLocks.get(job.projectId) === job.id
+    && job.status === "running"
+    && !job.terminalDecision
+    && !closing
+  );
+
   const currentCellRun = (job: CellEditJob, activeRun: NonNullable<CellEditJob["activeRun"]>): boolean => (
-    job.status === "running" && !job.terminalDecision && job.activeRun === activeRun
+    currentCellJob(job) && job.activeRun === activeRun
   );
 
   const enterFinalizing = async (
@@ -382,22 +454,39 @@ export function createPixelForgeServer({
   const startEditing = async (job: CellEditJob, owner?: NonNullable<CellEditJob["activeRun"]>): Promise<void> => {
     const originalCompositePath = join(job.log.absoluteDir, "original-composite.png");
     const originalCelPath = join(job.log.absoluteDir, "original-cel.png");
-    const run = await cellEditCodex!.startCellEdit({
-      cwd: job.log.absoluteDir,
-      prompt: buildAiEditPrompt(job.originalProject, job.request, { attempt: job.attempt, previousVerdict: job.lastVerdict }),
+    const current = () => owner
+      ? currentCellRun(job, owner)
+      : currentCellJob(job);
+    if (!current()) return;
+    const paths = await prepareRunDirectory(job, {
       originalCompositePath,
       originalCelPath,
       candidateCompositePath: job.candidatePaths?.compositeAbsolute ?? originalCompositePath,
       candidateCelPath: job.candidatePaths?.celAbsolute ?? originalCelPath,
-      outputSchema: AI_EDIT_OUTPUT_SCHEMA,
     });
-    if ((owner && !currentCellRun(job, owner)) || (!owner && (job.status !== "running" || !!job.terminalDecision))) {
+    if (!current()) {
+      await removeRunDirectory(paths.cwd).catch(() => undefined);
+      return;
+    }
+    let run: Awaited<ReturnType<CodexClient["startCellEdit"]>>;
+    try {
+      run = await cellEditCodex!.startCellEdit({
+        ...paths,
+        prompt: buildAiEditPrompt(job.originalProject, job.request, { attempt: job.attempt, previousVerdict: job.lastVerdict }),
+        outputSchema: AI_EDIT_OUTPUT_SCHEMA,
+      });
+    } catch (error) {
+      await removeRunDirectory(paths.cwd).catch(() => undefined);
+      throw error;
+    }
+    if (!current()) {
       ignoreRun(cellEditCodex!, run.id);
-      void cellEditCodex!.interrupt(run.id).catch(() => undefined);
+      void cellEditCodex!.interrupt(run.id).catch(() => undefined)
+        .then(() => removeRunDirectory(paths.cwd).catch(() => undefined));
       return;
     }
     job.phase = "editing";
-    connectRun(job, cellEditCodex!, run.id, "editing");
+    connectRun(job, cellEditCodex!, run.id, "editing", paths.cwd);
   };
 
   const startJudgment = async (
@@ -405,22 +494,36 @@ export function createPixelForgeServer({
     paths: CellEditAttemptPaths,
     owner: NonNullable<CellEditJob["activeRun"]>,
   ): Promise<void> => {
-    const run = await cellEditCodex!.startCellEditJudgment({
-      cwd: job.log.absoluteDir,
-      prompt: buildAiEditVerdictPrompt(job.request),
+    if (!currentCellRun(job, owner)) return;
+    const runPaths = await prepareRunDirectory(job, {
       originalCompositePath: join(job.log.absoluteDir, "original-composite.png"),
       originalCelPath: join(job.log.absoluteDir, "original-cel.png"),
       candidateCompositePath: paths.compositeAbsolute,
       candidateCelPath: paths.celAbsolute,
-      outputSchema: AI_EDIT_VERDICT_OUTPUT_SCHEMA,
     });
     if (!currentCellRun(job, owner)) {
+      await removeRunDirectory(runPaths.cwd).catch(() => undefined);
+      return;
+    }
+    let run: Awaited<ReturnType<CodexClient["startCellEditJudgment"]>>;
+    try {
+      run = await cellEditCodex!.startCellEditJudgment({
+        ...runPaths,
+        prompt: buildAiEditVerdictPrompt(job.request),
+        outputSchema: AI_EDIT_VERDICT_OUTPUT_SCHEMA,
+      });
+    } catch (error) {
+      await removeRunDirectory(runPaths.cwd).catch(() => undefined);
+      throw error;
+    }
+    if (!currentCellRun(job, owner)) {
       ignoreRun(cellEditCodex!, run.id);
-      void cellEditCodex!.interrupt(run.id).catch(() => undefined);
+      void cellEditCodex!.interrupt(run.id).catch(() => undefined)
+        .then(() => removeRunDirectory(runPaths.cwd).catch(() => undefined));
       return;
     }
     job.phase = "judging";
-    connectRun(job, cellEditCodex!, run.id, "judging");
+    connectRun(job, cellEditCodex!, run.id, "judging", runPaths.cwd);
   };
 
   const finishCellRun = async (job: CellEditJob, runId: string, status: string): Promise<void> => {
@@ -428,6 +531,8 @@ export function createPixelForgeServer({
     if (!activeRun || activeRun.id !== runId || !currentCellRun(job, activeRun) || activeRun.completionClaimed) return;
     activeRun.completionClaimed = true;
     try {
+      await removeRunDirectory(activeRun.inputDir).catch(() => undefined);
+      if (!currentCellRun(job, activeRun)) return;
       if (status !== "completed") throw new Error(`Codex ${activeRun.role === "editing" ? "편집" : "판정"}이 ${status} 상태로 끝났습니다.`);
       if (activeRun.resultConflict) throw new Error(`서로 다른 AI 편집 ${activeRun.role === "editing" ? "최종 응답" : "판정 응답"}이 둘 이상입니다.`);
       if (activeRun.resultText === undefined) throw new Error(`AI 편집 ${activeRun.role === "editing" ? "최종 응답" : "판정 응답"}이 없습니다.`);
@@ -460,10 +565,10 @@ export function createPixelForgeServer({
 
         let paths: CellEditAttemptPaths;
         try {
-          paths = await writeCellEditAttempt(job.log, job.attempt, {
+          paths = await writeCellEditLog(job, "attempt", () => writeCellEditAttempt(job.log, job.attempt, {
             composite: compositeFrame(application.document, job.target.frameId),
             cel: activeCelFrame(application.document, job.target),
-          });
+          }));
         } catch (error) {
           await failCellJob(job, error instanceof Error ? error.message : String(error));
           return;
@@ -480,7 +585,7 @@ export function createPixelForgeServer({
 
       const verdict = parseAiEditVerdict(parsed);
       try {
-        await writeCellEditVerdict(job.log, job.attempt, verdict);
+        await writeCellEditLog(job, "verdict", () => writeCellEditVerdict(job.log, job.attempt, verdict));
       } catch (error) {
         await failCellJob(job, error instanceof Error ? error.message : String(error));
         return;
@@ -578,7 +683,10 @@ export function createPixelForgeServer({
     const jobId = runToJob.get(bridge)?.get(runId);
     const job = jobId ? jobs.get(jobId) : undefined;
     if (!job) {
-      if (ignoredRuns.get(bridge)?.has(runId)) return;
+      if (ignoredRuns.get(bridge)?.has(runId)) {
+        if (event.type === "approval") bridge.respond(event.requestId, { decision: "decline" });
+        return;
+      }
       const bridgeEvents = earlyEvents.get(bridge) ?? new Map<string, CodexEvent[]>();
       earlyEvents.set(bridge, bridgeEvents);
       const queued = bridgeEvents.get(runId) ?? [];
@@ -612,13 +720,16 @@ export function createPixelForgeServer({
     }
   };
 
-  const connectRun = (job: Job, bridge: CodexClient, runId: string, role?: "editing" | "judging"): void => {
+  const connectRun = (job: Job, bridge: CodexClient, runId: string, role?: "editing" | "judging", inputDir?: string): void => {
     const bridgeRuns = runToJob.get(bridge) ?? new Map<string, string>();
     runToJob.set(bridge, bridgeRuns);
     if (job.kind === "cellEdit") {
-      if (!role) throw new Error("AI 셀 편집 실행 역할이 필요합니다.");
-      if (job.activeRun) ignoreRun(bridge, job.activeRun.id);
-      job.activeRun = { id: runId, role };
+      if (!role || !inputDir) throw new Error("AI 셀 편집 실행 역할과 입력 디렉터리가 필요합니다.");
+      if (job.activeRun) {
+        ignoreRun(bridge, job.activeRun.id);
+        void removeRunDirectory(job.activeRun.inputDir).catch(() => undefined);
+      }
+      job.activeRun = { id: runId, role, inputDir };
     }
     ignoredRuns.get(bridge)?.delete(runId);
     job.runId = runId;
@@ -632,7 +743,7 @@ export function createPixelForgeServer({
   codex.on("event", (event) => handleCodexEvent(codex, event));
   if (cellEditCodex && cellEditCodex !== codex) cellEditCodex.on("event", (event) => handleCodexEvent(cellEditCodex, event));
 
-  return createServer(async (request, response) => {
+  const server = createServer(async (request, response) => {
     try {
       if (!allowedOrigin(request)) return send(response, 403, { error: "로컬 앱에서만 요청할 수 있습니다." });
       const url = new URL(request.url ?? "/", "http://127.0.0.1");
@@ -838,6 +949,7 @@ export function createPixelForgeServer({
             attempt: 1,
             maxAttempts: 6,
             log,
+            logTail: Promise.resolve(),
             originalProject: project,
             candidate: {
               document: structuredClone(project.document),
@@ -850,8 +962,13 @@ export function createPixelForgeServer({
             messages: [],
           };
           jobs.set(jobId, job);
-          await writeCellEditInitial(log, editRequest, { composite, cel: celFrame });
+          await writeCellEditLog(job, "initial", () => writeCellEditInitial(log, editRequest, { composite, cel: celFrame }));
+          if (!currentCellJob(job)) {
+            await job.terminalFinalization;
+            return send(response, 202, wireJob(job));
+          }
           await startEditing(job);
+          if (job.terminalFinalization) await job.terminalFinalization;
           return send(response, 202, wireJob(job));
         } catch (error) {
           if (!job) {
@@ -960,4 +1077,20 @@ export function createPixelForgeServer({
       send(response, 400, { error: error instanceof Error ? error.message : String(error) });
     }
   });
+  const beginServerClose = () => {
+    if (closing) return;
+    closing = true;
+    for (const job of jobs.values()) {
+      if (job.kind === "cellEdit" && !isTerminal(job.status) && !job.terminalDecision) {
+        void failCellJob(job, "서버가 종료되어 셀 편집을 중단했습니다.");
+      }
+    }
+  };
+  const closeServer = server.close.bind(server);
+  server.close = ((callback?: (error?: Error) => void) => {
+    beginServerClose();
+    return closeServer(callback);
+  }) as typeof server.close;
+  server.on("close", beginServerClose);
+  return server;
 }

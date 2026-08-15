@@ -23,7 +23,7 @@ import { celKey, type BlendMode, type RGBA, type SpriteDocument, type SpriteProj
 import { runAiEditAttempts, type AiEditorSettings } from "../../core/ai-edit-runner.ts";
 import { screenToPixel, ToolController, type EditorTool } from "../../core/tool-controller.ts";
 import { CanvasRenderer } from "./CanvasRenderer.ts";
-import { selectionOverlay, selectionRuns } from "./ai-edit.ts";
+import { selectionOverlay, selectionReplayMask, selectionRuns } from "./ai-edit.ts";
 import { shortcutAction } from "./shortcuts.ts";
 
 const TOOLS: Array<{ id: EditorTool; icon: string; label: string; key: string }> = [
@@ -169,6 +169,7 @@ export const EditorWorkspace = forwardRef<EditorWorkspaceHandle, {
       };
       const application = runAiEditAttempts({
         ...settingsSnapshot,
+        selection: selectionReplayMask(settingsSnapshot.selection, image!, cel!, history.current.document),
         document: history.current.document,
       }, target, result.attempts);
 

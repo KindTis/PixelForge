@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import type { SpriteProject } from "../core/types.ts";
-import { api, cellEditApplicationDisposition, cellEditApplicationRequestTimeout, cellEditCompletionNotice, cellEditPayload, cellEditProjectMatches, codexJobStatusTitle, completedFrameIndex, decodeProject, encodeProject, failedCodexJob, generationPayload, isRetryablePollingError, pollingErrorCodexJob, type CellEditJob, type CodexJob, type GenerationJob, type Session } from "./api.ts";
+import { api, cellEditApplicationDisposition, cellEditApplicationRequestTimeout, cellEditCompletionNotice, cellEditPayload, codexJobStatusTitle, completedFrameIndex, decodeProject, encodeProject, failedCodexJob, generationPayload, isRetryablePollingError, pollingErrorCodexJob, projectJobOwnershipMatches, projectLifetimeMatches, releaseProjectJobOwnership, type CellEditJob, type CodexJob, type GenerationJob, type ProjectJobOwnership, type ProjectLifetime, type Session } from "./api.ts";
 import { EditorWorkspace, type EditorWorkspaceHandle } from "./editor/EditorWorkspace.tsx";
 import { ExportDialog, type ExportResult, type ExportTarget } from "./ExportDialog.tsx";
 
@@ -23,11 +23,10 @@ async function rgbaPngBase64(file: File): Promise<string> {
   });
 }
 
-function NewProject({ token, projects, onOpen, onCreate }: {
-  token: string;
+function NewProject({ projects, onOpen, onCreate }: {
   projects: ProjectSummary[];
-  onOpen(project: SpriteProject): void;
-  onCreate(project: SpriteProject): void;
+  onOpen(id: string): Promise<void>;
+  onCreate(name: string, size: number): Promise<void>;
 }) {
   const [name, setName] = useState("새 캐릭터");
   const [size, setSize] = useState(64);
@@ -35,17 +34,14 @@ function NewProject({ token, projects, onOpen, onCreate }: {
   const create = async (event: FormEvent) => {
     event.preventDefault();
     try {
-      onCreate(decodeProject(await api<SpriteProject>("/api/projects", token, {
-        method: "POST",
-        body: JSON.stringify({ name, width: size, height: size }),
-      })));
+      await onCreate(name, size);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     }
   };
   const open = async (id: string) => {
     try {
-      onOpen(decodeProject(await api<SpriteProject>(`/api/projects/${id}`)));
+      await onOpen(id);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : String(reason));
     }
@@ -82,6 +78,9 @@ export function App() {
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
   const [project, setProject] = useState<SpriteProject>();
   const latestProject = useRef<SpriteProject | undefined>(undefined);
+  const projectEpoch = useRef(0);
+  const projectLifetime = useRef<ProjectLifetime | undefined>(undefined);
+  const activeJobOwnership = useRef<ProjectJobOwnership | undefined>(undefined);
   const editor = useRef<EditorWorkspaceHandle>(null);
   const [frameIndex, setFrameIndex] = useState(0);
   const [dirty, setDirty] = useState(false);
@@ -89,9 +88,9 @@ export function App() {
   const [frameCount, setFrameCount] = useState(8);
   const [columns, setColumns] = useState(4);
   const [job, setJob] = useState<CodexJob>();
-  const [startingKind, setStartingKind] = useState<"generation" | "cellEdit">();
+  const [startingKind, setStartingKind] = useState<"generation" | "cellEdit" | "import">();
   const cellEditCancelRequested = useRef(false);
-  const cellEditApplicationPending = useRef(false);
+  const cellEditApplicationPending = useRef<ProjectJobOwnership | undefined>(undefined);
   const [cellEditUnavailable, setCellEditUnavailable] = useState("");
   const [reference, setReference] = useState<{ name: string; path: string }>();
   const [notice, setNotice] = useState("");
@@ -111,6 +110,19 @@ export function App() {
   latestProject.current = project;
   const codexBusy = Boolean(startingKind) || job?.status === "running" || job?.status === "awaitingApproval" || job?.status === "cancelling" || job?.status === "finalizing";
 
+  const setCurrentProject = (next: SpriteProject | undefined) => {
+    latestProject.current = next;
+    setProject(next);
+  };
+
+  const beginProjectLifetime = (projectId: string): ProjectLifetime => {
+    const next = { projectId, epoch: ++projectEpoch.current };
+    projectLifetime.current = next;
+    activeJobOwnership.current = undefined;
+    cellEditApplicationPending.current = undefined;
+    return next;
+  };
+
   const login = async () => {
     if (!session) return;
     try {
@@ -122,56 +134,62 @@ export function App() {
     }
   };
 
-  const save = async (): Promise<boolean> => {
-    if (!session || !project) return false;
+  const save = async (lifetime = projectLifetime.current): Promise<boolean> => {
+    if (!session || !project || !lifetime) return false;
     const saving = project;
     try {
       await api<SpriteProject>(`/api/projects/${project.id}`, session.token, {
         method: "PUT",
         body: JSON.stringify(encodeProject(project)),
       });
-      const current = latestProject.current === saving;
+      const current = latestProject.current === saving && projectLifetimeMatches(projectLifetime.current, lifetime);
       if (current) {
         setDirty(false);
         setNotice("프로젝트를 저장했습니다.");
       }
       return current;
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
+      if (projectLifetimeMatches(projectLifetime.current, lifetime)) setError(reason instanceof Error ? reason.message : String(reason));
       return false;
     }
   };
 
   useEffect(() => {
     if (!dirty || !project || !session) return;
+    const lifetime = projectLifetime.current;
+    if (!lifetime) return;
     const timer = window.setTimeout(() => {
       const saving = project;
       void api(`/api/projects/${project.id}`, session.token, { method: "PUT", body: JSON.stringify(encodeProject(project)) })
-        .then(() => { if (latestProject.current === saving) setDirty(false); })
-        .catch((reason) => setError(reason instanceof Error ? reason.message : String(reason)));
+        .then(() => { if (latestProject.current === saving && projectLifetimeMatches(projectLifetime.current, lifetime)) setDirty(false); })
+        .catch((reason) => { if (projectLifetimeMatches(projectLifetime.current, lifetime)) setError(reason instanceof Error ? reason.message : String(reason)); });
     }, 1200);
     return () => window.clearTimeout(timer);
   }, [dirty, project, session]);
 
-  const cancelCellEdit = async (id: string) => {
+  const cancelCellEdit = async (id: string, ownership?: ProjectJobOwnership) => {
     if (!session) return;
     try {
       await api<CellEditJob>(`/api/edits/${id}`, session.token, { method: "DELETE" });
     } catch (reason) {
       const response = reason instanceof Error && reason.cause instanceof Response ? reason.cause : undefined;
-      if (response?.status === 409) cellEditCancelRequested.current = false;
+      if (response?.status === 409 && ownership
+        && projectJobOwnershipMatches(projectLifetime.current, activeJobOwnership.current, ownership)) {
+        cellEditCancelRequested.current = false;
+      }
     }
   };
 
-  const poll = async (started: CodexJob, projectId: string, requestedFrameId?: string) => {
+  const poll = async (started: CodexJob, ownership: ProjectJobOwnership, requestedFrameId?: string) => {
     let applied: ReturnType<EditorWorkspaceHandle["applyAiEdit"]> | undefined;
     let applicationError = "";
     let applicationDeadline = 0;
     let applicationCompleted = false;
+    const current = () => projectJobOwnershipMatches(projectLifetime.current, activeJobOwnership.current, ownership);
 
     try {
       for (;;) {
-        if (!cellEditProjectMatches(latestProject.current?.id, projectId)) return;
+        if (!current()) return;
         let next: CodexJob;
         try {
           const collection = started.kind === "generation" ? "generations" : "edits";
@@ -180,7 +198,7 @@ export function App() {
             ? undefined
             : { signal: AbortSignal.timeout(requestTimeout) });
         } catch (reason) {
-          if (!cellEditProjectMatches(latestProject.current?.id, projectId)) return;
+          if (!current()) return;
           if (!isRetryablePollingError(reason)) throw reason;
           const message = reason instanceof Error ? reason.message : String(reason);
           setJob((current) => pollingErrorCodexJob(current, started.id, message));
@@ -188,7 +206,7 @@ export function App() {
             && cellEditApplicationDisposition({ ...started, status: "finalizing" }, applicationDeadline, Date.now()) === "rollback") {
             const timeout = "적용 확인 시간이 초과되어 원본 셀을 유지했습니다.";
             applied?.rollback();
-            cellEditApplicationPending.current = false;
+            cellEditApplicationPending.current = releaseProjectJobOwnership(cellEditApplicationPending.current, ownership);
             setDirty(false);
             setJob((current) => failedCodexJob(current, started.id, timeout));
             setError(timeout);
@@ -197,12 +215,12 @@ export function App() {
           await new Promise((resolve) => window.setTimeout(resolve, 500));
           continue;
         }
-        if (!cellEditProjectMatches(latestProject.current?.id, projectId)) return;
+        if (!current()) return;
         if (next.kind !== started.kind) throw new Error("작업 종류가 요청과 일치하지 않습니다.");
         if (next.kind === "cellEdit" && cellEditCancelRequested.current) {
           if (next.status === "running" || next.status === "awaitingApproval") {
-            await cancelCellEdit(next.id);
-            if (!cellEditProjectMatches(latestProject.current?.id, projectId)) return;
+            await cancelCellEdit(next.id, ownership);
+            if (!current()) return;
           }
           else if (next.status === "finalizing" || next.status === "completed" || next.status === "failed" || next.status === "cancelled") cellEditCancelRequested.current = false;
         }
@@ -211,12 +229,12 @@ export function App() {
           if (!next.result || !editor.current) throw new Error("적용 대기 중인 현재 셀 편집 결과가 없습니다.");
           if (applicationDeadline === 0) applicationDeadline = Date.now() + 60_000;
           if (!applied && !applicationError) {
-            cellEditApplicationPending.current = true;
+            cellEditApplicationPending.current = ownership;
             try {
               applied = editor.current.applyAiEdit(next.target, next.result);
             } catch (reason) {
               applicationError = reason instanceof Error ? reason.message : String(reason);
-              cellEditApplicationPending.current = false;
+              cellEditApplicationPending.current = releaseProjectJobOwnership(cellEditApplicationPending.current, ownership);
             }
           }
           try {
@@ -229,10 +247,10 @@ export function App() {
               signal: requestTimeout === undefined ? undefined : AbortSignal.timeout(requestTimeout),
             });
           } catch (reason) {
-            if (!cellEditProjectMatches(latestProject.current?.id, projectId)) return;
+            if (!current()) return;
             if (!isRetryablePollingError(reason)) throw reason;
           }
-          if (!cellEditProjectMatches(latestProject.current?.id, projectId)) return;
+          if (!current()) return;
         }
 
         setJob(next);
@@ -243,14 +261,14 @@ export function App() {
             if (!next.result) throw new Error("완료된 현재 셀 편집 결과가 없습니다.");
             const completionNotice = cellEditCompletionNotice(next.result, applied?.actionCount ?? next.result.actionCount);
             applicationCompleted = true;
-            cellEditApplicationPending.current = false;
+            cellEditApplicationPending.current = releaseProjectJobOwnership(cellEditApplicationPending.current, ownership);
             if (applied?.documentChanged) setDirty(true);
             setNotice(completionNotice);
             return;
           }
           if (disposition === "rollback") {
             applied?.rollback();
-            cellEditApplicationPending.current = false;
+            cellEditApplicationPending.current = releaseProjectJobOwnership(cellEditApplicationPending.current, ownership);
             setDirty(false);
             if (next.status !== "failed") {
               const timeout = "적용 확인 시간이 초과되어 원본 셀을 유지했습니다.";
@@ -268,7 +286,8 @@ export function App() {
             const completedProject = decodeProject(next.project);
             const selectedFrameIndex = completedFrameIndex(completedProject, requestedFrameId, next.frameId);
             setJob({ ...next, project: completedProject });
-            setProject(completedProject);
+            beginProjectLifetime(completedProject.id);
+            setCurrentProject(completedProject);
             setDirty(false);
             setFrameIndex(selectedFrameIndex);
             setNotice(requestedFrameId === undefined ? "생성 결과를 프레임으로 가져와 저장했습니다." : "선택 프레임을 재생성해 저장했습니다.");
@@ -279,41 +298,56 @@ export function App() {
         await new Promise((resolve) => window.setTimeout(resolve, 500));
       }
     } finally {
-      if (!applicationCompleted && cellEditProjectMatches(latestProject.current?.id, projectId)) {
+      if (!applicationCompleted && current()) {
         applied?.rollback();
         if (applied) setDirty(false);
       }
-      cellEditApplicationPending.current = false;
+      cellEditApplicationPending.current = releaseProjectJobOwnership(cellEditApplicationPending.current, ownership);
     }
   };
 
   const generate = async (frameId?: string) => {
     if (!session || !project) return;
+    const lifetime = beginProjectLifetime(project.id);
     setError("");
     setNotice("");
     setStartingKind("generation");
     try {
-      if (!(await save())) return;
+      if (!(await save(lifetime)) || !projectLifetimeMatches(projectLifetime.current, lifetime)) return;
       const started = await api<GenerationJob>("/api/generations", session.token, {
         method: "POST",
         body: JSON.stringify(generationPayload(project, prompt, frameCount, Math.min(columns, frameCount), reference?.path, frameId)),
       });
+      if (!projectLifetimeMatches(projectLifetime.current, lifetime)) {
+        await api(`/api/generations/${started.id}`, session.token, { method: "DELETE" }).catch(() => undefined);
+        return;
+      }
+      const ownership = { ...lifetime, jobId: started.id };
+      activeJobOwnership.current = ownership;
       setJob(started);
       setStartingKind(undefined);
-      void poll(started, project.id, frameId).catch((reason) => {
-        const message = reason instanceof Error ? reason.message : String(reason);
-        setError(message);
-        setJob((current) => failedCodexJob(current, started.id, message));
-      });
+      void poll(started, ownership, frameId)
+        .catch((reason) => {
+          if (!projectJobOwnershipMatches(projectLifetime.current, activeJobOwnership.current, ownership)) return;
+          const message = reason instanceof Error ? reason.message : String(reason);
+          setError(message);
+          setJob((current) => failedCodexJob(current, started.id, message));
+        })
+        .finally(() => {
+          activeJobOwnership.current = releaseProjectJobOwnership(activeJobOwnership.current, ownership);
+        });
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
+      if (projectLifetimeMatches(projectLifetime.current, lifetime)) setError(reason instanceof Error ? reason.message : String(reason));
     } finally {
-      setStartingKind((current) => current === "generation" ? undefined : current);
+      if (projectLifetimeMatches(projectLifetime.current, lifetime)) {
+        setStartingKind((current) => current === "generation" ? undefined : current);
+      }
     }
   };
 
   const editCurrentCell = async () => {
     if (!session || !project || !editor.current) return;
+    const lifetime = beginProjectLifetime(project.id);
     setError("");
     setNotice("");
     let request;
@@ -327,26 +361,44 @@ export function App() {
     cellEditCancelRequested.current = false;
     setStartingKind("cellEdit");
     try {
-      if (!(await save()) || cellEditCancelRequested.current) return;
+      if (!(await save(lifetime)) || !projectLifetimeMatches(projectLifetime.current, lifetime) || cellEditCancelRequested.current) return;
       started = await api<CellEditJob>("/api/edits", session.token, {
         method: "POST",
         body: JSON.stringify(cellEditPayload(project.id, request)),
       });
+      if (!projectLifetimeMatches(projectLifetime.current, lifetime)) {
+        await cancelCellEdit(started.id);
+        return;
+      }
+      const ownership = { ...lifetime, jobId: started.id };
+      activeJobOwnership.current = ownership;
       setJob(started);
-      if (cellEditCancelRequested.current) await cancelCellEdit(started.id);
+      if (cellEditCancelRequested.current) {
+        await cancelCellEdit(started.id, ownership);
+        if (!projectJobOwnershipMatches(projectLifetime.current, activeJobOwnership.current, ownership)) return;
+      }
       setStartingKind(undefined);
-      void poll(started, project.id).catch((reason) => {
-        const message = reason instanceof Error ? reason.message : String(reason);
-        setError(message);
-        setJob((current) => failedCodexJob(current, started!.id, message));
-      });
+      void poll(started, ownership)
+        .catch((reason) => {
+          if (!projectJobOwnershipMatches(projectLifetime.current, activeJobOwnership.current, ownership)) return;
+          const message = reason instanceof Error ? reason.message : String(reason);
+          setError(message);
+          setJob((current) => failedCodexJob(current, started!.id, message));
+        })
+        .finally(() => {
+          activeJobOwnership.current = releaseProjectJobOwnership(activeJobOwnership.current, ownership);
+        });
     } catch (reason) {
       const message = reason instanceof Error ? reason.message : String(reason);
-      if (message === CELL_EDIT_UNAVAILABLE) setCellEditUnavailable(message);
-      setError(message);
+      if (projectLifetimeMatches(projectLifetime.current, lifetime)) {
+        if (message === CELL_EDIT_UNAVAILABLE) setCellEditUnavailable(message);
+        setError(message);
+      }
     } finally {
-      if (!started) cellEditCancelRequested.current = false;
-      setStartingKind((current) => current === "cellEdit" ? undefined : current);
+      if (!started && projectLifetimeMatches(projectLifetime.current, lifetime)) cellEditCancelRequested.current = false;
+      if (projectLifetimeMatches(projectLifetime.current, lifetime)) {
+        setStartingKind((current) => current === "cellEdit" ? undefined : current);
+      }
     }
   };
 
@@ -359,53 +411,85 @@ export function App() {
     if (!job) return;
     if (job.kind === "cellEdit") {
       cellEditCancelRequested.current = true;
-      await cancelCellEdit(job.id);
+      await cancelCellEdit(job.id, activeJobOwnership.current);
       return;
     }
+    const ownership = activeJobOwnership.current;
+    if (!ownership || ownership.jobId !== job.id || !projectJobOwnershipMatches(projectLifetime.current, ownership, ownership)) return;
     try {
-      setJob(await api<GenerationJob>(`/api/generations/${job.id}`, session.token, { method: "DELETE" }));
+      const cancelled = await api<GenerationJob>(`/api/generations/${job.id}`, session.token, { method: "DELETE" });
+      if (projectJobOwnershipMatches(projectLifetime.current, activeJobOwnership.current, ownership)) setJob(cancelled);
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
+      if (projectJobOwnershipMatches(projectLifetime.current, activeJobOwnership.current, ownership)) {
+        setError(reason instanceof Error ? reason.message : String(reason));
+      }
     }
   };
 
   const approve = async (accept: boolean) => {
     if (!session || !job || job.kind !== "generation") return;
+    const ownership = activeJobOwnership.current;
+    if (!ownership || ownership.jobId !== job.id || !projectJobOwnershipMatches(projectLifetime.current, ownership, ownership)) return;
     await api("/api/approvals", session.token, { method: "POST", body: JSON.stringify({ jobId: job.id, accept }) });
-    setJob({ ...job, status: accept ? "running" : "cancelled", approval: undefined });
+    if (projectJobOwnershipMatches(projectLifetime.current, activeJobOwnership.current, ownership)) {
+      setJob({ ...job, status: accept ? "running" : "cancelled", approval: undefined });
+    }
   };
 
   const uploadReference = async (file?: File) => {
     if (!file || !session || !project || codexBusy) return;
+    const lifetime = projectLifetime.current;
+    if (!lifetime) return;
     setError("");
     try {
-      const result = await api<{ path: string }>("/api/references", session.token, { method: "POST", body: JSON.stringify({ projectId: project.id, pngBase64: await rgbaPngBase64(file) }) });
+      const pngBase64 = await rgbaPngBase64(file);
+      if (!projectLifetimeMatches(projectLifetime.current, lifetime)) return;
+      const result = await api<{ path: string }>("/api/references", session.token, { method: "POST", body: JSON.stringify({ projectId: project.id, pngBase64 }) });
+      if (!projectLifetimeMatches(projectLifetime.current, lifetime)) return;
       setReference({ name: file.name, path: result.path });
       setNotice("참조 이미지를 추가했습니다.");
-    } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
+    } catch (reason) {
+      if (projectLifetimeMatches(projectLifetime.current, lifetime)) setError(reason instanceof Error ? reason.message : String(reason));
+    }
   };
 
   const importSheet = async (file?: File) => {
     if (!file || !session || !project || codexBusy) return;
+    const lifetime = beginProjectLifetime(project.id);
+    setStartingKind("import");
     setError("");
     try {
+      const pngBase64 = await rgbaPngBase64(file);
+      if (!projectLifetimeMatches(projectLifetime.current, lifetime)) return;
       const imported = decodeProject(await api<SpriteProject>("/api/imports", session.token, {
         method: "POST",
         body: JSON.stringify({
           projectId: project.id,
-          pngBase64: await rgbaPngBase64(file),
+          pngBase64,
           request: { prompt: `직접 가져오기: ${file.name}`, frameCount, columns: Math.min(columns, frameCount), cellWidth: project.document.width, cellHeight: project.document.height, durationMs: 100 },
         }),
       }));
-      setProject(imported);
+      if (!projectLifetimeMatches(projectLifetime.current, lifetime)) return;
+      setCurrentProject(imported);
       setDirty(false);
       setFrameIndex(0);
       setNotice("PNG 시트를 프레임으로 가져왔습니다.");
-    } catch (reason) { setError(reason instanceof Error ? reason.message : String(reason)); }
+    } catch (reason) {
+      if (projectLifetimeMatches(projectLifetime.current, lifetime)) setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      if (projectLifetimeMatches(projectLifetime.current, lifetime)) {
+        setStartingKind((current) => current === "import" ? undefined : current);
+      }
+    }
   };
 
-  const selectProject = (next: SpriteProject) => {
-    setProject(next);
+  const selectProject = (next: SpriteProject, lifetime = beginProjectLifetime(next.id)) => {
+    projectLifetime.current = lifetime;
+    activeJobOwnership.current = undefined;
+    cellEditApplicationPending.current = undefined;
+    cellEditCancelRequested.current = false;
+    setCurrentProject(next);
+    setStartingKind(undefined);
     setJob(undefined);
     setReference(undefined);
     setDirty(false);
@@ -415,21 +499,59 @@ export function App() {
     setColumns(Math.min(next.exportSettings.columns, generatedFrames));
   };
 
+  const openProject = async (id: string) => {
+    const lifetime = beginProjectLifetime(id);
+    try {
+      const opened = decodeProject(await api<SpriteProject>(`/api/projects/${id}`));
+      if (projectLifetimeMatches(projectLifetime.current, lifetime)) selectProject(opened, lifetime);
+    } catch (reason) {
+      if (projectLifetimeMatches(projectLifetime.current, lifetime)) throw reason;
+    }
+  };
+
+  const createNewProject = async (name: string, size: number) => {
+    if (!session) return;
+    const lifetime = beginProjectLifetime("new-project");
+    try {
+      const created = decodeProject(await api<SpriteProject>("/api/projects", session.token, {
+        method: "POST",
+        body: JSON.stringify({ name, width: size, height: size }),
+      }));
+      if (!projectLifetimeMatches(projectLifetime.current, lifetime)) return;
+      setProjects((current) => [{ id: created.id, name: created.name }, ...current]);
+      selectProject(created);
+    } catch (reason) {
+      if (projectLifetimeMatches(projectLifetime.current, lifetime)) throw reason;
+    }
+  };
+
   const leaveProject = async () => {
     if (codexBusy) return;
-    if (dirty && !(await save())) return;
-    setProject(undefined);
+    const lifetime = projectLifetime.current;
+    if (!lifetime || (dirty && !(await save(lifetime))) || !projectLifetimeMatches(projectLifetime.current, lifetime)) return;
+    projectEpoch.current += 1;
+    projectLifetime.current = undefined;
+    activeJobOwnership.current = undefined;
+    cellEditApplicationPending.current = undefined;
+    setCurrentProject(undefined);
     setJob(undefined);
     setReference(undefined);
   };
 
   const runExport = async (target: ExportTarget, settings: SpriteProject["exportSettings"]): Promise<ExportResult> => {
     if (!session || !project) throw new Error("프로젝트를 먼저 여세요.");
+    const lifetime = projectLifetime.current;
+    if (!lifetime) throw new Error("프로젝트를 먼저 여세요.");
+    const exporting = project;
+    const current = () => latestProject.current === exporting && projectLifetimeMatches(projectLifetime.current, lifetime);
     const next = { ...project, exportSettings: settings };
     await api(`/api/projects/${project.id}`, session.token, { method: "PUT", body: JSON.stringify(encodeProject(next)) });
+    if (!current()) throw new Error("프로젝트가 변경되어 내보내기를 중단했습니다.");
     const result = await api<ExportResult>("/api/exports", session.token, { method: "POST", body: JSON.stringify({ projectId: project.id, target, options: settings }) });
-    setProject(next);
-    setDirty(false);
+    if (current()) {
+      setCurrentProject(next);
+      setDirty(false);
+    }
     return result;
   };
 
@@ -452,12 +574,10 @@ export function App() {
         </div>
       </header>
 
-      {!project ? <NewProject token={session.token} projects={projects} onOpen={selectProject} onCreate={(next) => {
-        setProjects((current) => [{ id: next.id, name: next.name }, ...current]);
-        selectProject(next);
-      }} /> : <EditorWorkspace ref={editor} project={project} frameIndex={frameIndex} readOnly={codexBusy} onFrameIndex={setFrameIndex} onChange={(next) => {
-        setProject(next);
-        if (!cellEditApplicationPending.current) setDirty(true);
+      {!project ? <NewProject projects={projects} onOpen={openProject} onCreate={createNewProject} /> : <EditorWorkspace ref={editor} project={project} frameIndex={frameIndex} readOnly={codexBusy} onFrameIndex={setFrameIndex} onChange={(next) => {
+        setCurrentProject(next);
+        const pending = cellEditApplicationPending.current;
+        if (!pending || !projectJobOwnershipMatches(projectLifetime.current, activeJobOwnership.current, pending)) setDirty(true);
       }} onSave={() => void save()} saveState={dirty ? "저장 대기" : "저장됨"} onError={setError} generationPanel={({ hasActiveCel, activeLayerLocked }) =>
           <section className="generation-panel">
             <div className="panel-title"><span>CODEX FORGE</span><b>{account?.type === "chatgpt" ? "연결됨" : "로그인 필요"}</b></div>

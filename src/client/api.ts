@@ -41,6 +41,8 @@ export type CellEditJob = JobBase & {
 };
 
 export type CodexJob = GenerationJob | CellEditJob;
+export type ProjectLifetime = { projectId: string; epoch: number };
+export type ProjectJobOwnership = ProjectLifetime & { jobId: string };
 
 export function decodeProject(value: SpriteProject | WireProject): SpriteProject {
   const images = Object.fromEntries(Object.entries(value.document.images).map(([id, image]) => [id, {
@@ -121,8 +123,27 @@ export function cellEditApplicationRequestTimeout(deadline: number, now: number)
   return deadline > 0 ? Math.max(0, deadline - now) : undefined;
 }
 
-export function cellEditProjectMatches(currentProjectId: string | undefined, projectId: string): boolean {
-  return currentProjectId === projectId;
+export function projectLifetimeMatches(current: ProjectLifetime | undefined, expected: ProjectLifetime): boolean {
+  return current?.projectId === expected.projectId && current.epoch === expected.epoch;
+}
+
+function sameProjectJobOwnership(current: ProjectJobOwnership | undefined, expected: ProjectJobOwnership): boolean {
+  return projectLifetimeMatches(current, expected) && current?.jobId === expected.jobId;
+}
+
+export function projectJobOwnershipMatches(
+  currentProject: ProjectLifetime | undefined,
+  activeJob: ProjectJobOwnership | undefined,
+  expected: ProjectJobOwnership,
+): boolean {
+  return projectLifetimeMatches(currentProject, expected) && sameProjectJobOwnership(activeJob, expected);
+}
+
+export function releaseProjectJobOwnership(
+  current: ProjectJobOwnership | undefined,
+  owner: ProjectJobOwnership,
+): ProjectJobOwnership | undefined {
+  return sameProjectJobOwnership(current, owner) ? undefined : current;
 }
 
 export function completedFrameIndex(project: SpriteProject | undefined, requestedFrameId?: string, responseFrameId?: string): number {
