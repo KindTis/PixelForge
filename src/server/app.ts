@@ -27,6 +27,7 @@ import {
   writeCellEditVerdict,
   type CellEditAttemptPaths,
   type CellEditLog,
+  type CellEditSummary,
 } from "./cell-edit-log.ts";
 import {
   buildFrameRegenerationPrompt,
@@ -64,6 +65,11 @@ type GenerationJob = JobBase & {
   approval?: { requestId: number; method: string; params: Record<string, unknown> };
   project?: SpriteProject;
 };
+type CellEditTerminal = {
+  status: "completed" | "failed" | "cancelled";
+  error?: string;
+  summary: CellEditSummary;
+};
 type CellEditJob = JobBase & {
   kind: "cellEdit";
   request: AiEditRequest;
@@ -85,7 +91,9 @@ type CellEditJob = JobBase & {
     resultConflict?: boolean;
     completionClaimed?: boolean;
   };
-  terminalDecision?: "finalizing" | "failed" | "cancelled";
+  terminalDecision?: CellEditTerminal;
+  terminalFinalization?: Promise<void>;
+  applicationTimer?: ReturnType<typeof setTimeout>;
   result?: AiEditReadyResult;
 };
 type Job = GenerationJob | CellEditJob;
@@ -95,6 +103,7 @@ export type ServerOptions = {
   codex: CodexClient;
   cellEditCodex?: CodexClient;
   staticRoot?: string;
+  cellEditApplicationTimeoutMs?: number;
 };
 
 function send(response: ServerResponse, status: number, body: unknown): void {
@@ -188,7 +197,13 @@ function parseExportOptions(value: unknown): ExportOptions {
   return options as ExportOptions;
 }
 
-export function createPixelForgeServer({ projectsRoot, codex, cellEditCodex, staticRoot }: ServerOptions) {
+export function createPixelForgeServer({
+  projectsRoot,
+  codex,
+  cellEditCodex,
+  staticRoot,
+  cellEditApplicationTimeoutMs = 60_000,
+}: ServerOptions) {
   const token = randomBytes(24).toString("base64url");
   const jobs = new Map<string, Job>();
   const runToJob = new Map<CodexClient, Map<string, string>>();
@@ -208,6 +223,10 @@ export function createPixelForgeServer({ projectsRoot, codex, cellEditCodex, sta
     if (projectLocks.get(projectId) === owner) projectLocks.delete(projectId);
   };
 
+  const isTerminal = (status: JobStatus): status is CellEditTerminal["status"] => (
+    status === "completed" || status === "failed" || status === "cancelled"
+  );
+
   const ignoreRun = (bridge: CodexClient, runId: string): void => {
     runToJob.get(bridge)?.delete(runId);
     earlyEvents.get(bridge)?.delete(runId);
@@ -223,46 +242,93 @@ export function createPixelForgeServer({ projectsRoot, codex, cellEditCodex, sta
     return true;
   };
 
+  const finalizeClaimedCellJob = async (job: CellEditJob, terminal: CellEditTerminal): Promise<void> => {
+    clearTimeout(job.applicationTimer);
+    try {
+      await writeCellEditSummary(job.log, terminal.summary);
+      job.status = terminal.status;
+      job.error = terminal.error;
+      if (terminal.status !== "completed") job.result = undefined;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      job.status = "failed";
+      job.result = undefined;
+      job.error = `최종 로그 기록에 실패했습니다. 부분 로그: ${job.log.relativeDir}. ${message}`;
+    } finally {
+      unlockProject(job.projectId, job.id);
+    }
+  };
+
+  const finalizeCellJob = (job: CellEditJob, terminal: CellEditTerminal): Promise<void> => {
+    if (!job.terminalFinalization) {
+      job.terminalDecision = terminal;
+      const runId = job.activeRun?.id;
+      if (runId) ignoreRun(bridgeForJob(job), runId);
+      job.activeRun = undefined;
+      if (runId && terminal.summary.outcome === "technical_error") {
+        void bridgeForJob(job).interrupt(runId).catch(() => undefined);
+      }
+      job.terminalFinalization = finalizeClaimedCellJob(job, terminal);
+    }
+    return job.terminalFinalization;
+  };
+
+  const applicationTerminal = (
+    job: CellEditJob,
+    application: "applied" | "failed" | "timeout",
+    error?: string,
+  ): CellEditTerminal => {
+    const status = application === "applied" ? "completed" : "failed";
+    return {
+      status,
+      error,
+      summary: {
+        jobId: job.id,
+        status,
+        outcome: job.result?.direct ? "direct" : "accepted",
+        attemptCount: job.attempts.length,
+        acceptedAttempt: job.result?.acceptedAttempt,
+        application,
+        error,
+        files: job.log.files,
+      },
+    };
+  };
+
+  const failCellJob = (job: CellEditJob, message: string): Promise<void> => finalizeCellJob(job, {
+    status: "failed",
+    error: message,
+    summary: {
+      jobId: job.id,
+      status: "failed",
+      outcome: "technical_error",
+      attemptCount: job.attempts.length,
+      error: message,
+      files: job.log.files,
+    },
+  });
+
   const interruptJob = async (job: Job): Promise<void> => {
     if (job.kind === "cellEdit") {
-      let interrupted = false;
       const runId = job.activeRun?.id ?? job.runId!;
       ignoreRun(bridgeForJob(job), runId);
       try {
         await bridgeForJob(job).interrupt(runId);
-        interrupted = true;
-        await writeCellEditSummary(job.log, {
+      } catch (error) {
+        const message = `Codex 편집 취소에 실패했습니다: ${error instanceof Error ? error.message : String(error)}`;
+        await failCellJob(job, message);
+        throw error;
+      }
+      await finalizeCellJob(job, {
+        status: "cancelled",
+        summary: {
           jobId: job.id,
           status: "cancelled",
           outcome: "cancelled",
           attemptCount: job.attempts.length,
           files: job.log.files,
-        });
-        job.activeRun = undefined;
-        job.status = "cancelled";
-      } catch (error) {
-        const detail = error instanceof Error ? error.message : String(error);
-        const message = interrupted ? `AI 편집 취소 로그 기록에 실패했습니다: ${detail}` : `Codex 편집 취소에 실패했습니다: ${detail}`;
-        job.terminalDecision = "failed";
-        job.error = message;
-        try {
-          await writeCellEditSummary(job.log, {
-            jobId: job.id,
-            status: "failed",
-            outcome: "technical_error",
-            attemptCount: job.attempts.length,
-            error: message,
-            files: job.log.files,
-          });
-        } catch {
-          job.error = `${message} 부분 로그: ${job.log.relativeDir}`;
-        }
-        job.activeRun = undefined;
-        job.status = "failed";
-        throw error;
-      } finally {
-        unlockProject(job.projectId, job.id);
-      }
+        },
+      });
       return;
     }
     try {
@@ -277,32 +343,6 @@ export function createPixelForgeServer({ projectsRoot, codex, cellEditCodex, sta
     }
   };
 
-  const failCellJob = (job: CellEditJob, message: string, partialLog = false): Promise<void> => {
-    if (job.terminalDecision || (job.status !== "running" && job.status !== "awaitingApproval")) return Promise.resolve();
-    job.terminalDecision = "failed";
-    const runId = job.activeRun?.id;
-    if (runId) ignoreRun(bridgeForJob(job), runId);
-    job.activeRun = undefined;
-    job.error = partialLog ? `${message} 부분 로그: ${job.log.relativeDir}` : message;
-    if (runId) void bridgeForJob(job).interrupt(runId).catch(() => undefined);
-    return (async () => {
-      try {
-        await writeCellEditSummary(job.log, {
-          jobId: job.id,
-          status: "failed",
-          outcome: "technical_error",
-          attemptCount: job.attempts.length,
-          error: job.error,
-          files: job.log.files,
-        });
-      } catch {
-        if (!job.error!.includes(`부분 로그: ${job.log.relativeDir}`)) job.error += ` 부분 로그: ${job.log.relativeDir}`;
-      }
-      job.status = "failed";
-      unlockProject(job.projectId, job.id);
-    })();
-  };
-
   const currentCellRun = (job: CellEditJob, activeRun: NonNullable<CellEditJob["activeRun"]>): boolean => (
     job.status === "running" && !job.terminalDecision && job.activeRun === activeRun
   );
@@ -310,52 +350,33 @@ export function createPixelForgeServer({ projectsRoot, codex, cellEditCodex, sta
   const enterFinalizing = async (
     job: CellEditJob,
     result: AiEditReadyResult,
-    outcome: "accepted" | "direct",
   ): Promise<void> => {
-    if (job.terminalDecision) return;
-    job.terminalDecision = "finalizing";
+    if (job.status !== "running" || job.terminalDecision) return;
     if (job.activeRun) ignoreRun(bridgeForJob(job), job.activeRun.id);
     job.activeRun = undefined;
-    try {
-      await writeCellEditSummary(job.log, {
-        jobId: job.id,
-        status: "finalizing",
-        outcome,
-        attemptCount: job.attempts.length,
-        acceptedAttempt: result.acceptedAttempt,
-        files: job.log.files,
-      });
-      job.result = result;
-      job.status = "finalizing";
-    } catch (error) {
-      job.terminalDecision = "failed";
-      job.error = `${error instanceof Error ? error.message : String(error)} 부분 로그: ${job.log.relativeDir}`;
-      job.status = "failed";
-      unlockProject(job.projectId, job.id);
-    }
+    job.result = result;
+    job.status = "finalizing";
+    job.applicationTimer = setTimeout(() => {
+      const message = "클라이언트 적용 확인 시간이 초과되었습니다.";
+      void finalizeCellJob(job, applicationTerminal(job, "timeout", message));
+    }, cellEditApplicationTimeoutMs);
+    job.applicationTimer.unref();
   };
 
   const finishQualityFailure = async (job: CellEditJob): Promise<void> => {
-    if (job.terminalDecision) return;
     const message = `${job.maxAttempts}회 판정이 모두 불합격했습니다.`;
-    job.terminalDecision = "failed";
-    if (job.activeRun) ignoreRun(bridgeForJob(job), job.activeRun.id);
-    job.activeRun = undefined;
-    try {
-      await writeCellEditSummary(job.log, {
+    await finalizeCellJob(job, {
+      status: "failed",
+      error: message,
+      summary: {
         jobId: job.id,
         status: "failed",
         outcome: "quality_failed",
         attemptCount: job.attempts.length,
         error: message,
         files: job.log.files,
-      });
-      job.error = message;
-    } catch (error) {
-      job.error = `${error instanceof Error ? error.message : String(error)} 부분 로그: ${job.log.relativeDir}`;
-    }
-    job.status = "failed";
-    unlockProject(job.projectId, job.id);
+      },
+    });
   };
 
   const startEditing = async (job: CellEditJob, owner?: NonNullable<CellEditJob["activeRun"]>): Promise<void> => {
@@ -433,7 +454,7 @@ export function createPixelForgeServer({ projectsRoot, codex, cellEditCodex, sta
             attempts: job.attempts,
             actionCount: application.actionCount,
             direct: true,
-          }, "direct");
+          });
           return;
         }
 
@@ -444,7 +465,7 @@ export function createPixelForgeServer({ projectsRoot, codex, cellEditCodex, sta
             cel: activeCelFrame(application.document, job.target),
           });
         } catch (error) {
-          await failCellJob(job, error instanceof Error ? error.message : String(error), true);
+          await failCellJob(job, error instanceof Error ? error.message : String(error));
           return;
         }
         if (!currentCellRun(job, activeRun)) return;
@@ -461,7 +482,7 @@ export function createPixelForgeServer({ projectsRoot, codex, cellEditCodex, sta
       try {
         await writeCellEditVerdict(job.log, job.attempt, verdict);
       } catch (error) {
-        await failCellJob(job, error instanceof Error ? error.message : String(error), true);
+        await failCellJob(job, error instanceof Error ? error.message : String(error));
         return;
       }
       if (!currentCellRun(job, activeRun)) return;
@@ -472,7 +493,7 @@ export function createPixelForgeServer({ projectsRoot, codex, cellEditCodex, sta
           actionCount: job.attempts.reduce((count, attempt) => count + attempt.result.actions.length, 0),
           direct: false,
           acceptedAttempt: job.attempt,
-        }, "accepted");
+        });
         return;
       }
 
@@ -797,7 +818,6 @@ export function createPixelForgeServer({ projectsRoot, codex, cellEditCodex, sta
         const jobId = randomUUID();
         if (!lockProject(projectId, jobId)) return send(response, 409, { error: "이미 Codex 작업 중인 프로젝트입니다." });
         let job: CellEditJob | undefined;
-        let initialWritten = false;
         try {
           const root = resolveInside(projectsRoot, projectId);
           const project = await loadProject(root);
@@ -831,7 +851,6 @@ export function createPixelForgeServer({ projectsRoot, codex, cellEditCodex, sta
           };
           jobs.set(jobId, job);
           await writeCellEditInitial(log, editRequest, { composite, cel: celFrame });
-          initialWritten = true;
           await startEditing(job);
           return send(response, 202, wireJob(job));
         } catch (error) {
@@ -839,9 +858,32 @@ export function createPixelForgeServer({ projectsRoot, codex, cellEditCodex, sta
             unlockProject(projectId, jobId);
             throw error;
           }
-          await failCellJob(job, error instanceof Error ? error.message : String(error), !initialWritten);
+          await failCellJob(job, error instanceof Error ? error.message : String(error));
           return send(response, 202, wireJob(job));
         }
+      }
+
+      const applicationMatch = url.pathname.match(/^\/api\/edits\/([0-9a-f-]{36})\/application$/i);
+      if (applicationMatch && request.method === "POST") {
+        const job = jobs.get(applicationMatch[1]);
+        if (!job || job.kind !== "cellEdit") return send(response, 404, { error: "작업을 찾을 수 없습니다." });
+        if (job.terminalFinalization || isTerminal(job.status)) {
+          await job.terminalFinalization;
+          return send(response, 200, wireJob(job));
+        }
+        if (job.status !== "finalizing") return send(response, 409, { error: "아직 적용 확인을 받을 수 없습니다." });
+        const input = await body(request) as { outcome?: unknown; error?: unknown };
+        let terminal: CellEditTerminal;
+        if (input.outcome === "applied") {
+          terminal = applicationTerminal(job, "applied");
+        } else if (input.outcome === "failed" && typeof input.error === "string") {
+          const message = `클라이언트 적용에 실패했습니다: ${input.error}`;
+          terminal = applicationTerminal(job, "failed", message);
+        } else {
+          return send(response, 400, { error: "적용 확인 요청이 올바르지 않습니다." });
+        }
+        await finalizeCellJob(job, terminal);
+        return send(response, 200, wireJob(job));
       }
 
       const jobMatch = url.pathname.match(/^\/api\/(generations|edits)\/([0-9a-f-]{36})$/i);
@@ -855,17 +897,19 @@ export function createPixelForgeServer({ projectsRoot, codex, cellEditCodex, sta
         const job = jobs.get(jobMatch[2]);
         const expectedKind = jobMatch[1] === "edits" ? "cellEdit" : "generation";
         if (!job?.runId || job.kind !== expectedKind) return send(response, 404, { error: "작업을 찾을 수 없습니다." });
-        if (job.status === "finalizing" || (job.kind === "cellEdit" && job.terminalDecision === "finalizing")) {
+        if (job.status === "finalizing") {
           return send(response, 409, { error: "이미 적용 준비가 시작되어 취소할 수 없습니다." });
         }
         if (job.kind === "cellEdit" && job.activeRun?.completionClaimed) {
           return send(response, 409, { error: "이미 완료 처리가 시작되어 취소할 수 없습니다." });
         }
+        if (job.kind === "cellEdit" && job.terminalDecision) {
+          return send(response, 409, { error: "이미 종료 중이거나 종료된 작업입니다." });
+        }
         if (job.status !== "running" && job.status !== "awaitingApproval") return send(response, 409, { error: "이미 종료 중이거나 종료된 작업입니다." });
         if (job.kind === "generation" && job.approval) bridgeForJob(job).respond(job.approval.requestId, { decision: "decline" });
         if (job.kind === "generation") job.approval = undefined;
         job.status = "cancelling";
-        if (job.kind === "cellEdit") job.terminalDecision = "cancelled";
         await interruptJob(job);
         return send(response, 200, wireJob(job));
       }

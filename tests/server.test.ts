@@ -167,10 +167,15 @@ function cellEditRequest(project: ReturnType<typeof threeFrameProject>): AiEditR
   };
 }
 
-async function startGenerationServer(root: string, codex: FakeCodex, cellEditCodex: FakeCodex = codex) {
+async function startGenerationServer(
+  root: string,
+  codex: FakeCodex,
+  cellEditCodex: FakeCodex = codex,
+  cellEditApplicationTimeoutMs?: number,
+) {
   const codexListeners = codex.listenerCount("event");
   const cellEditListeners = cellEditCodex.listenerCount("event");
-  const server = createPixelForgeServer({ projectsRoot: root, codex, cellEditCodex });
+  const server = createPixelForgeServer({ projectsRoot: root, codex, cellEditCodex, cellEditApplicationTimeoutMs });
   assert.equal(codex.listenerCount("event"), codexListeners + 1);
   if (cellEditCodex !== codex) assert.equal(cellEditCodex.listenerCount("event"), cellEditListeners + 1);
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -244,7 +249,7 @@ async function storedProjectBytes(projectRoot: string): Promise<Record<string, B
   ]));
 }
 
-async function cellEditFixture() {
+async function cellEditFixture(cellEditApplicationTimeoutMs?: number) {
   const root = await mkdtemp(join(tmpdir(), "pixelforge-cell-review-"));
   const project = threeFrameProject();
   const projectRoot = join(root, project.id);
@@ -253,7 +258,7 @@ async function cellEditFixture() {
   const beforeBytes = await storedProjectBytes(projectRoot);
   const request = cellEditRequest(project);
   const codex = new FakeCodex();
-  const { server, base, token } = await startGenerationServer(root, codex);
+  const { server, base, token } = await startGenerationServer(root, codex, codex, cellEditApplicationTimeoutMs);
   const headers = { "content-type": "application/json", "x-pixelforge-token": token };
   const startEdit = async () => {
     const response = await fetch(`${base}/api/edits`, {
@@ -282,6 +287,13 @@ async function cellEditFixture() {
     await rm(root, { recursive: true, force: true });
   };
   return { root, projectRoot, before, beforeBytes, request, codex, base, headers, startEdit, getEdit, waitForStatus, readLog, close };
+}
+
+async function readyCellEdit(fixture: Awaited<ReturnType<typeof cellEditFixture>>) {
+  const job = await fixture.startEdit();
+  await fixture.codex.completeResult(pixelEdit, "judging");
+  await fixture.codex.completeResult(passVerdict);
+  return fixture.waitForStatus(job.id, "finalizing");
 }
 
 test("선택 프레임 생성은 역할별 PNG를 제공하고 선택 프레임만 교체한다", async () => {
@@ -741,10 +753,6 @@ test("첫 픽셀 후보가 합격하면 한 번만 편집·판정하고 적용 �
     assert.equal(ready.result?.direct, false);
     assert.equal(ready.result?.acceptedAttempt, 1);
     assert.deepEqual(JSON.parse(await fixture.readLog(ready, "attempt-01-verdict.json").then((value) => value.toString("utf8"))), passVerdict);
-    const summary = JSON.parse(await fixture.readLog(ready, "summary.json").then((value) => value.toString("utf8")));
-    assert.equal(summary.outcome, "accepted");
-    assert.equal(summary.acceptedAttempt, 1);
-
     const { selection: _selection, ...editorSettings } = fixture.request.settings;
     const replay = runAiEditAttempts(
       { document: fixture.before.document, ...editorSettings },
@@ -837,7 +845,6 @@ test("최초 선택 전용 결과는 판정 없이 직접 적용 대기로 이�
     assert.equal(direct.result?.acceptedAttempt, undefined);
     assert.equal(direct.result?.attempts.length, 1);
     assert.equal(fixture.codex.judgments.length, 0);
-    assert.equal(JSON.parse(await fixture.readLog(direct, "summary.json").then((value) => value.toString("utf8"))).outcome, "direct");
     await assert.rejects(fixture.readLog(direct, "attempt-01-composite.png"), { code: "ENOENT" });
   } finally {
     await fixture.close();
@@ -905,7 +912,7 @@ test("초기 로그를 만들 수 없어도 Codex 호출 없이 추적 가능한
   }
 });
 
-test("판정 로그 쓰기 실패는 결과 반환을 차단하고 부분 로그를 보존한다", async () => {
+test("판정 로그 쓰기 실패는 결과 반환을 차단하고 terminal summary를 남긴다", async () => {
   const fixture = await cellEditFixture();
   try {
     const job = await fixture.startEdit();
@@ -913,7 +920,7 @@ test("판정 로그 쓰기 실패는 결과 반환을 차단하고 부분 로그
     await mkdir(join(fixture.projectRoot, job.logPath!, "attempt-01-verdict.json"));
     await fixture.codex.completeResult(passVerdict);
     const failed = await fixture.waitForStatus(job.id, "failed");
-    assert.match(failed.error ?? "", new RegExp(`부분 로그: ${job.logPath}`));
+    assert.doesNotMatch(failed.error ?? "", /부분 로그/);
     assert.equal(failed.result, undefined);
     assert.equal(fixture.codex.cellEdits.length, 1);
     assert.equal(fixture.codex.judgments.length, 1);
@@ -1274,6 +1281,133 @@ test("완료 처리가 판정 실행 반환을 기다리는 동안 전역 오류
     assert.equal(fixture.codex.cellEdits.length, 1);
     assert.equal(fixture.codex.judgments.length, 1);
     assert.equal(JSON.parse(await fixture.readLog(failed, "summary.json").then((value) => value.toString("utf8"))).outcome, "technical_error");
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("적용 확인 전에는 finalizing과 잠금을 유지하고 확인 뒤 완료한다", async () => {
+  const fixture = await cellEditFixture();
+  try {
+    const ready = await readyCellEdit(fixture);
+    assert.ok(ready.logPath);
+    await assert.rejects(fixture.readLog(ready, "summary.json"), { code: "ENOENT" });
+    assert.equal((await fetch(`${fixture.base}/api/edits`, {
+      method: "POST",
+      headers: fixture.headers,
+      body: JSON.stringify({ projectId: fixture.before.id, request: fixture.request }),
+    })).status, 409);
+
+    const confirmed = await fetch(`${fixture.base}/api/edits/${ready.id}/application`, {
+      method: "POST",
+      headers: fixture.headers,
+      body: JSON.stringify({ outcome: "applied" }),
+    }).then((response) => response.json()) as CellEditWire;
+    assert.equal(confirmed.status, "completed");
+    const summary = JSON.parse(await readFile(join(fixture.projectRoot, ready.logPath, "summary.json"), "utf8"));
+    assert.equal(summary.application, "applied");
+    assert.equal(summary.status, "completed");
+    assert.equal((await fixture.startEdit()).status, "running");
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("적용 확인 중복은 body와 무관하게 같은 완료와 한 번의 summary를 반환한다", async () => {
+  const fixture = await cellEditFixture();
+  try {
+    const ready = await readyCellEdit(fixture);
+    const post = (body: unknown) => fetch(`${fixture.base}/api/edits/${ready.id}/application`, {
+      method: "POST",
+      headers: fixture.headers,
+      body: JSON.stringify(body),
+    }).then((response) => response.json()) as Promise<CellEditWire>;
+    const first = await post({ outcome: "applied" });
+    assert.equal(first.status, "completed");
+    const duplicate = await post({ ignored: true });
+    assert.deepEqual(duplicate, first);
+    const summary = JSON.parse(await fixture.readLog(ready, "summary.json").then((value) => value.toString("utf8")));
+    assert.equal(summary.files.includes(`${ready.logPath}/summary.json`), false);
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("적용 성공과 실패 경쟁은 먼저 확정된 상태만 유지한다", async () => {
+  const fixture = await cellEditFixture();
+  try {
+    const ready = await readyCellEdit(fixture);
+    const post = (body: unknown) => fetch(`${fixture.base}/api/edits/${ready.id}/application`, {
+      method: "POST",
+      headers: fixture.headers,
+      body: JSON.stringify(body),
+    }).then((response) => response.json()) as Promise<CellEditWire>;
+    const [first, competing] = await Promise.all([
+      post({ outcome: "applied" }),
+      post({ outcome: "failed", error: "경쟁 실패" }),
+    ]);
+    const duplicate = await post({ outcome: "applied" });
+    assert.deepEqual(competing, first);
+    assert.deepEqual(duplicate, first);
+    const summary = JSON.parse(await fixture.readLog(ready, "summary.json").then((value) => value.toString("utf8")));
+    assert.equal(summary.status, first.status);
+    assert.equal(summary.application, first.status === "completed" ? "applied" : "failed");
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("클라이언트 적용 실패를 한 번만 failed로 확정한다", async () => {
+  const fixture = await cellEditFixture();
+  try {
+    const ready = await readyCellEdit(fixture);
+    const failed = await fetch(`${fixture.base}/api/edits/${ready.id}/application`, {
+      method: "POST",
+      headers: fixture.headers,
+      body: JSON.stringify({ outcome: "failed", error: "대상 변경" }),
+    }).then((response) => response.json()) as CellEditWire;
+    assert.equal(failed.status, "failed");
+    assert.match(failed.error ?? "", /대상 변경/);
+    assert.equal(failed.result, undefined);
+    const summary = JSON.parse(await fixture.readLog(ready, "summary.json").then((value) => value.toString("utf8")));
+    assert.equal(summary.application, "failed");
+    assert.equal((await fixture.startEdit()).status, "running");
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("적용 확인이 없으면 제한 시간 뒤 실패하고 잠금을 해제한다", async () => {
+  const fixture = await cellEditFixture(20);
+  try {
+    const ready = await readyCellEdit(fixture);
+    assert.ok(ready.logPath);
+    const failed = await fixture.waitForStatus(ready.id, "failed");
+    assert.match(failed.error ?? "", /적용 확인 시간이 초과/);
+    const summary = JSON.parse(await readFile(join(fixture.projectRoot, ready.logPath, "summary.json"), "utf8"));
+    assert.equal(summary.application, "timeout");
+    assert.equal((await fixture.startEdit()).status, "running");
+  } finally {
+    await fixture.close();
+  }
+});
+
+test("summary 기록 실패는 completed를 차단하고 부분 로그를 남긴다", async () => {
+  const fixture = await cellEditFixture();
+  try {
+    const ready = await readyCellEdit(fixture);
+    assert.ok(ready.logPath);
+    await mkdir(join(fixture.projectRoot, ready.logPath, "summary.json"));
+    const failed = await fetch(`${fixture.base}/api/edits/${ready.id}/application`, {
+      method: "POST",
+      headers: fixture.headers,
+      body: JSON.stringify({ outcome: "applied" }),
+    }).then((response) => response.json()) as CellEditWire;
+    assert.equal(failed.status, "failed");
+    assert.match(failed.error ?? "", /부분 로그/);
+    assert.equal(failed.result, undefined);
+    assert.ok((await readFile(join(fixture.projectRoot, ready.logPath, "request.json"))).length > 0);
+    assert.equal((await fixture.startEdit()).status, "running");
   } finally {
     await fixture.close();
   }
