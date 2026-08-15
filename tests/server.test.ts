@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { request as httpRequest } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
@@ -1329,6 +1330,49 @@ test("적용 확인 중복은 body와 무관하게 같은 완료와 한 번의 s
     const summary = JSON.parse(await fixture.readLog(ready, "summary.json").then((value) => value.toString("utf8")));
     assert.equal(summary.files.includes(`${ready.logPath}/summary.json`), false);
   } finally {
+    await fixture.close();
+  }
+});
+
+test("application body를 읽는 동안 확정되면 malformed body도 terminal wire를 반환한다", async () => {
+  const fixture = await cellEditFixture();
+  let pendingRequest: ReturnType<typeof httpRequest> | undefined;
+  try {
+    const ready = await readyCellEdit(fixture);
+    let finishBody: (() => void) | undefined;
+    const pendingResponse = new Promise<{ status: number; body: CellEditWire }>((resolve, reject) => {
+      pendingRequest = httpRequest(`${fixture.base}/api/edits/${ready.id}/application`, {
+        method: "POST",
+        headers: fixture.headers,
+      }, async (response) => {
+        try {
+          const chunks: Buffer[] = [];
+          for await (const chunk of response) chunks.push(Buffer.from(chunk));
+          resolve({
+            status: response.statusCode ?? 0,
+            body: JSON.parse(Buffer.concat(chunks).toString("utf8")) as CellEditWire,
+          });
+        } catch (error) {
+          reject(error);
+        }
+      });
+      pendingRequest.on("error", reject);
+      pendingRequest.write("{", () => { finishBody = () => pendingRequest!.end("malformed"); });
+    });
+    await waitUntil(() => finishBody !== undefined, "느린 application 요청이 시작되지 않았습니다.");
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    const terminal = await fetch(`${fixture.base}/api/edits/${ready.id}/application`, {
+      method: "POST",
+      headers: fixture.headers,
+      body: JSON.stringify({ outcome: "applied" }),
+    }).then((response) => response.json()) as CellEditWire;
+    finishBody!();
+    const pending = await pendingResponse;
+    assert.equal(pending.status, 200);
+    assert.deepEqual(pending.body, terminal);
+  } finally {
+    pendingRequest?.destroy();
     await fixture.close();
   }
 });

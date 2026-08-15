@@ -872,7 +872,20 @@ export function createPixelForgeServer({
           return send(response, 200, wireJob(job));
         }
         if (job.status !== "finalizing") return send(response, 409, { error: "아직 적용 확인을 받을 수 없습니다." });
-        const input = await body(request) as { outcome?: unknown; error?: unknown };
+        let input: { outcome?: unknown; error?: unknown };
+        try {
+          input = await body(request) as typeof input;
+        } catch (error) {
+          if (job.terminalFinalization || isTerminal(job.status)) {
+            await job.terminalFinalization;
+            return send(response, 200, wireJob(job));
+          }
+          throw error;
+        }
+        if (job.terminalFinalization || isTerminal(job.status)) {
+          await job.terminalFinalization;
+          return send(response, 200, wireJob(job));
+        }
         let terminal: CellEditTerminal;
         if (input.outcome === "applied") {
           terminal = applicationTerminal(job, "applied");
