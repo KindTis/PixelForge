@@ -214,8 +214,9 @@ export class CodexBridge extends EventEmitter {
   private async verifyCellEditRestrictions(): Promise<void> {
     try {
       const { config } = await this.request<{ config: unknown }>("config/read", {});
-      if (!isRecord(config) || !isRecord(config.features)
-        || CELL_EDIT_DISABLED_FEATURES.some((feature) => config.features[feature] !== false)
+      const features = isRecord(config) && isRecord(config.features) ? config.features : undefined;
+      if (!isRecord(config) || !features
+        || CELL_EDIT_DISABLED_FEATURES.some((feature) => features[feature] !== false)
         || config.developer_instructions !== ""
         || config.project_doc_max_bytes !== 0
         || config.web_search !== "disabled"
