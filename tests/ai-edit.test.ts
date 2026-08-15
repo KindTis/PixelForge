@@ -1,6 +1,14 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { AI_EDIT_OUTPUT_SCHEMA, EDITOR_TOOLS, parseAiEditResult, type AiEditRequest } from "../src/core/ai-edit.ts";
+import {
+  AI_EDIT_CRITERIA,
+  AI_EDIT_OUTPUT_SCHEMA,
+  EDITOR_TOOLS,
+  hasPixelActions,
+  parseAiEditResult,
+  parseAiEditVerdict,
+  type AiEditRequest,
+} from "../src/core/ai-edit.ts";
 import { createDocument, createProject } from "../src/core/document.ts";
 import { celKey } from "../src/core/types.ts";
 import { activeCelFrame, buildAiEditPrompt, validateAiEditRequest } from "../src/server/ai-edit.ts";
@@ -21,6 +29,82 @@ const validPoints = {
   lasso: [{ x: 0, y: 0 }, { x: 2, y: 0 }, { x: 0, y: 2 }],
   wand: [{ x: 0, y: 0 }],
 } as const;
+
+const passingCriteria = AI_EDIT_CRITERIA.map((id) => ({ id, passed: true, reason: "기준을 충족했습니다." }));
+
+test("AI 편집 판정은 다섯 기준과 pass/fail 수정 지시 불변식을 검증한다", () => {
+  assert.equal(parseAiEditVerdict({
+    verdict: "pass",
+    summary: "요청과 스타일을 충족했습니다.",
+    criteria: passingCriteria,
+    corrections: [],
+  }).verdict, "pass");
+
+  assert.throws(() => parseAiEditVerdict({
+    verdict: "pass",
+    summary: "모순",
+    criteria: [{ ...passingCriteria[0], passed: false }, ...passingCriteria.slice(1)],
+    corrections: [],
+  }), /모든 기준/);
+
+  assert.throws(() => parseAiEditVerdict({
+    verdict: "fail",
+    summary: "수정 필요",
+    criteria: [{ ...passingCriteria[0], passed: false }, ...passingCriteria.slice(1)],
+    corrections: [],
+  }), /수정 지시/);
+
+  assert.throws(() => parseAiEditVerdict({
+    verdict: "fail",
+    summary: "잘못된 참조",
+    criteria: [{ ...passingCriteria[0], passed: false }, ...passingCriteria.slice(1)],
+    corrections: [{ criterion: "preservation", region: "몸통", problem: "문제", requiredChange: "복원" }],
+  }), /통과한 기준/);
+
+  assert.throws(() => parseAiEditVerdict({
+    verdict: "pass",
+    summary: "중복 기준",
+    criteria: [passingCriteria[0], passingCriteria[0], ...passingCriteria.slice(2)],
+    corrections: [],
+  }), /다섯 기준/);
+  assert.throws(() => parseAiEditVerdict({
+    verdict: "pass",
+    summary: "누락 기준",
+    criteria: passingCriteria.slice(1),
+    corrections: [],
+  }), /다섯 기준/);
+  assert.throws(() => parseAiEditVerdict({
+    verdict: "pass",
+    summary: "빈 사유",
+    criteria: [{ ...passingCriteria[0], reason: "" }, ...passingCriteria.slice(1)],
+    corrections: [],
+  }), /reason/);
+  assert.throws(() => parseAiEditVerdict({
+    verdict: "pass",
+    summary: "추가 필드",
+    criteria: [{ ...passingCriteria[0], extra: true }, ...passingCriteria.slice(1)],
+    corrections: [],
+  }), /허용되지 않는 필드/);
+  assert.throws(() => parseAiEditVerdict({
+    verdict: "pass",
+    summary: "알 수 없는 기준",
+    criteria: [{ ...passingCriteria[0], id: "unknown" }, ...passingCriteria.slice(1)],
+    corrections: [],
+  }), /기준/);
+  assert.throws(() => parseAiEditVerdict({
+    verdict: "fail",
+    summary: "실패 기준 없음",
+    criteria: passingCriteria,
+    corrections: [],
+  }), /실패 기준/);
+});
+
+test("AI 편집 동작은 픽셀 변경 여부를 도구별로 분기한다", () => {
+  assert.equal(hasPixelActions([]), false);
+  assert.equal(hasPixelActions([{ tool: "eyedropper", points: [{ x: 0, y: 0 }] }]), false);
+  assert.equal(hasPixelActions([{ tool: "select", points: [{ x: 0, y: 0 }, { x: 1, y: 1 }] }]), false);
+  assert.equal(hasPixelActions([{ tool: "fill", points: [{ x: 0, y: 0 }] }]), true);
+});
 
 test("AI 편집 계약은 현재 편집기의 14개 도구와 빈 동작 결과를 허용한다", () => {
   assert.deepEqual(EDITOR_TOOLS, [

@@ -34,6 +34,27 @@ export type AiToolAction = {
 };
 export type AiEditResult = { summary: string; actions: AiToolAction[] };
 export type AiEditAttempt = { seed: number; result: AiEditResult };
+export const AI_EDIT_CRITERIA = [
+  "request_fulfillment",
+  "pose_and_geometry",
+  "replacement_integrity",
+  "preservation",
+  "pixel_art_consistency",
+] as const;
+export type AiEditCriterionId = typeof AI_EDIT_CRITERIA[number];
+export type AiEditVerdict = {
+  verdict: "pass" | "fail";
+  summary: string;
+  criteria: Array<{ id: AiEditCriterionId; passed: boolean; reason: string }>;
+  corrections: Array<{ criterion: AiEditCriterionId; region: string; problem: string; requiredChange: string }>;
+};
+export type AiEditReadyResult = {
+  summary: string;
+  attempts: AiEditAttempt[];
+  actionCount: number;
+  direct: boolean;
+  acceptedAttempt?: number;
+};
 
 const pointSchema = {
   type: "object",
@@ -81,11 +102,54 @@ export const AI_EDIT_OUTPUT_SCHEMA = {
   },
 } as const;
 
+export const AI_EDIT_VERDICT_OUTPUT_SCHEMA = {
+  type: "object",
+  additionalProperties: false,
+  required: ["verdict", "summary", "criteria", "corrections"],
+  properties: {
+    verdict: { type: "string", enum: ["pass", "fail"] },
+    summary: { type: "string" },
+    criteria: {
+      type: "array",
+      minItems: AI_EDIT_CRITERIA.length,
+      maxItems: AI_EDIT_CRITERIA.length,
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["id", "passed", "reason"],
+        properties: {
+          id: { type: "string", enum: AI_EDIT_CRITERIA },
+          passed: { type: "boolean" },
+          reason: { type: "string", minLength: 1 },
+        },
+      },
+    },
+    corrections: {
+      type: "array",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["criterion", "region", "problem", "requiredChange"],
+        properties: {
+          criterion: { type: "string", enum: AI_EDIT_CRITERIA },
+          region: { type: "string" },
+          problem: { type: "string" },
+          requiredChange: { type: "string" },
+        },
+      },
+    },
+  },
+} as const;
+
 const resultFields = new Set(["summary", "actions"]);
 const actionFields = new Set(["tool", "points", "color", "secondaryColor", "brushSize", "brushShape", "filled", "mirrorX", "mirrorY"]);
 const pointFields = new Set(["x", "y"]);
 const exactTwoTools = new Set<EditorTool>(["line", "curve", "rectangle", "ellipse", "polygon", "gradient", "select"]);
 const exactOneTools = new Set<EditorTool>(["fill", "eyedropper", "wand"]);
+const verdictFields = new Set(["verdict", "summary", "criteria", "corrections"]);
+const criterionFields = new Set(["id", "passed", "reason"]);
+const correctionFields = new Set(["criterion", "region", "problem", "requiredChange"]);
+const NON_PIXEL_TOOLS = new Set<EditorTool>(["eyedropper", "select", "lasso", "wand"]);
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -167,4 +231,69 @@ export function parseAiEditResult(value: unknown, width: number, height: number)
 
   if (coordinateCount > coordinateLimit) throw new Error(`전체 좌표 수는 ${coordinateLimit}개 이하여야 합니다.`);
   return { summary: value.summary, actions };
+}
+
+export function parseAiEditVerdict(value: unknown): AiEditVerdict {
+  if (!isObject(value)) throw new Error("AI 편집 판정 객체가 필요합니다.");
+  rejectExtraFields(value, verdictFields, "AI 편집 판정");
+  if (value.verdict !== "pass" && value.verdict !== "fail") throw new Error("AI 편집 판정의 verdict가 필요합니다.");
+  if (typeof value.summary !== "string") throw new Error("AI 편집 판정의 summary가 필요합니다.");
+  if (!Array.isArray(value.criteria) || value.criteria.length !== AI_EDIT_CRITERIA.length) {
+    throw new Error("판정 criteria에는 다섯 기준이 각각 한 번씩 필요합니다.");
+  }
+  if (!Array.isArray(value.corrections)) throw new Error("AI 편집 판정의 corrections 배열이 필요합니다.");
+
+  const criteria = value.criteria.map((rawCriterion): AiEditVerdict["criteria"][number] => {
+    if (!isObject(rawCriterion)) throw new Error("판정 기준 객체가 필요합니다.");
+    rejectExtraFields(rawCriterion, criterionFields, "판정 기준");
+    if (typeof rawCriterion.id !== "string" || !AI_EDIT_CRITERIA.includes(rawCriterion.id as AiEditCriterionId)) {
+      throw new Error("알 수 없는 판정 기준입니다.");
+    }
+    if (typeof rawCriterion.passed !== "boolean") throw new Error("판정 기준의 passed가 필요합니다.");
+    if (typeof rawCriterion.reason !== "string" || !rawCriterion.reason.trim()) throw new Error("판정 기준의 reason이 필요합니다.");
+    return { id: rawCriterion.id as AiEditCriterionId, passed: rawCriterion.passed, reason: rawCriterion.reason };
+  });
+  const ids = criteria.map(({ id }) => id);
+  if (new Set(ids).size !== AI_EDIT_CRITERIA.length || AI_EDIT_CRITERIA.some((id) => !ids.includes(id))) {
+    throw new Error("판정 criteria에는 다섯 기준이 각각 한 번씩 필요합니다.");
+  }
+
+  const corrections = value.corrections.map((rawCorrection): AiEditVerdict["corrections"][number] => {
+    if (!isObject(rawCorrection)) throw new Error("수정 지시 객체가 필요합니다.");
+    rejectExtraFields(rawCorrection, correctionFields, "수정 지시");
+    if (typeof rawCorrection.criterion !== "string" || !AI_EDIT_CRITERIA.includes(rawCorrection.criterion as AiEditCriterionId)) {
+      throw new Error("알 수 없는 수정 기준입니다.");
+    }
+    for (const key of ["region", "problem", "requiredChange"] as const) {
+      if (typeof rawCorrection[key] !== "string") throw new Error(`수정 지시의 ${key}가 필요합니다.`);
+    }
+    return {
+      criterion: rawCorrection.criterion as AiEditCriterionId,
+      region: rawCorrection.region as string,
+      problem: rawCorrection.problem as string,
+      requiredChange: rawCorrection.requiredChange as string,
+    };
+  });
+
+  const failed = new Set(criteria.filter(({ passed }) => !passed).map(({ id }) => id));
+  if (value.verdict === "pass") {
+    if (failed.size > 0 || corrections.length > 0) {
+      throw new Error("pass 판정은 모든 기준을 통과하고 수정 지시가 없어야 합니다.");
+    }
+  } else {
+    if (failed.size === 0) throw new Error("fail 판정에는 실패 기준이 필요합니다.");
+    for (const correction of corrections) {
+      if (!failed.has(correction.criterion)) throw new Error("수정 지시는 통과한 기준을 참조할 수 없습니다.");
+    }
+    for (const id of failed) {
+      if (!corrections.some(({ criterion }) => criterion === id)) {
+        throw new Error(`실패 기준 ${id}의 수정 지시가 필요합니다.`);
+      }
+    }
+  }
+  return { verdict: value.verdict, summary: value.summary, criteria, corrections };
+}
+
+export function hasPixelActions(actions: readonly AiToolAction[]): boolean {
+  return actions.some(({ tool }) => !NON_PIXEL_TOOLS.has(tool));
 }
