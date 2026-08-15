@@ -39,8 +39,10 @@ export type GenerationRequest = {
 export type CellEditRunRequest = {
   cwd: string;
   prompt: string;
-  compositePath: string;
-  celPath: string;
+  originalCompositePath: string;
+  originalCelPath: string;
+  candidateCompositePath: string;
+  candidateCelPath: string;
   outputSchema: unknown;
 };
 
@@ -67,12 +69,39 @@ type Pending = {
 
 type Skill = { name: string; path: string; enabled: boolean };
 const FORBIDDEN_CELL_EDIT_ITEMS = new Set(["commandExecution", "fileChange", "mcpToolCall", "dynamicToolCall", "collabAgentToolCall", "subAgentActivity", "webSearch", "sleep", "imageGeneration"]);
+const CELL_EDIT_UNAVAILABLE = "설치된 Codex App Server에서 현재 셀 편집을 사용할 수 없습니다.";
+const CELL_EDIT_DISABLED_FEATURES = [
+  "shell_tool", "unified_exec", "apps", "browser_use", "browser_use_external", "browser_use_full_cdp_access",
+  "computer_use", "hooks", "image_generation", "memories", "multi_agent", "plugins", "plugin_sharing",
+  "remote_plugin", "skill_mcp_dependency_install", "skill_search", "tool_suggest", "view_image", "workspace_dependencies",
+] as const;
 
-function defaultProcessFactory(): JsonlProcess {
+export const CELL_EDIT_APP_SERVER_ARGS = [
+  "--strict-config",
+  ...CELL_EDIT_DISABLED_FEATURES.flatMap((feature) => ["--disable", feature]),
+  "-c", 'developer_instructions=""',
+  "-c", "project_doc_max_bytes=0",
+  "-c", 'web_search="disabled"',
+  "-c", "tools.web_search=false",
+  "-c", "tools.view_image=false",
+  "-c", "mcp_servers={}",
+] as const;
+
+export const CELL_EDIT_MODEL_SETTINGS = {
+  model: "gpt-5.6-sol",
+  reasoningEffort: "app-server-default",
+} as const;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+export function createCodexProcess(extraArgs: readonly string[] = []): JsonlProcess {
+  const appServerArgs = ["app-server", "--listen", "stdio://", ...extraArgs];
   const command = process.platform === "win32" ? (process.env.ComSpec ?? "cmd.exe") : "codex";
   const args = process.platform === "win32"
-    ? ["/d", "/s", "/c", "codex app-server --listen stdio://"]
-    : ["app-server", "--listen", "stdio://"];
+    ? ["/d", "/s", "/c", ["codex", ...appServerArgs].join(" ")]
+    : appServerArgs;
   return spawn(command, args, {
     stdio: ["pipe", "pipe", "pipe"],
     windowsHide: true,
@@ -86,7 +115,7 @@ export class CodexBridge extends EventEmitter {
   private readonly pending = new Map<number, Pending>();
   private readonly runs = new Map<string, GenerationRun>();
 
-  constructor(private readonly processFactory: () => JsonlProcess = defaultProcessFactory) {
+  constructor(private readonly processFactory: () => JsonlProcess = createCodexProcess) {
     super();
   }
 
@@ -142,21 +171,33 @@ export class CodexBridge extends EventEmitter {
   }
 
   async startCellEdit(request: CellEditRunRequest): Promise<GenerationRun> {
+    return this.startCellImageRun(request, "편집 에이전트 역할입니다. 제공된 원본과 현재 후보를 기존 픽셀 도구 동작으로 수정하고 JSON만 반환하세요.");
+  }
+
+  async startCellEditJudgment(request: CellEditRunRequest): Promise<GenerationRun> {
+    return this.startCellImageRun(request, "독립 판정 에이전트 역할입니다. 제공된 원본과 후보만 고정 기준으로 비교하고 판정 JSON만 반환하세요.");
+  }
+
+  private async startCellImageRun(request: CellEditRunRequest, developerInstructions: string): Promise<GenerationRun> {
     await this.requireChatGptAccount();
+    await this.verifyCellEditRestrictions();
     try {
       const thread = await this.request<{ thread: { id: string } }>("thread/start", {
-        cwd: request.cwd,
-        approvalPolicy: "never",
-        sandbox: "read-only",
-        serviceName: "pixelforge",
-        developerInstructions: "제공된 텍스트와 두 이미지만 읽고 JSON 최종 응답만 작성하세요. 도구, 명령, 파일 쓰기, 스킬을 사용하지 마세요.",
+        developerInstructions,
+        dynamicTools: [],
       });
       const turn = await this.request<{ turn: { id: string } }>("turn/start", {
         threadId: thread.thread.id,
+        model: CELL_EDIT_MODEL_SETTINGS.model,
+        cwd: request.cwd,
+        approvalPolicy: "never",
+        sandboxPolicy: { type: "readOnly", networkAccess: false },
         input: [
           { type: "text", text: request.prompt, text_elements: [] },
-          { type: "localImage", path: request.compositePath },
-          { type: "localImage", path: request.celPath },
+          { type: "localImage", path: request.originalCompositePath },
+          { type: "localImage", path: request.originalCelPath },
+          { type: "localImage", path: request.candidateCompositePath },
+          { type: "localImage", path: request.candidateCelPath },
         ],
         outputSchema: request.outputSchema,
       });
@@ -165,8 +206,45 @@ export class CodexBridge extends EventEmitter {
       return run;
     } catch (error) {
       const code = error instanceof Error && "code" in error ? error.code : undefined;
-      if (code === -32601 || code === -32602) throw new Error("설치된 Codex App Server에서 현재 셀 편집을 사용할 수 없습니다.");
+      if (code === -32601 || code === -32602) throw new Error(CELL_EDIT_UNAVAILABLE);
       throw error;
+    }
+  }
+
+  private async verifyCellEditRestrictions(): Promise<void> {
+    try {
+      const { config } = await this.request<{ config: unknown }>("config/read", {});
+      if (!isRecord(config) || !isRecord(config.features)
+        || CELL_EDIT_DISABLED_FEATURES.some((feature) => config.features[feature] !== false)
+        || config.developer_instructions !== ""
+        || config.project_doc_max_bytes !== 0
+        || config.web_search !== "disabled"
+        || !isRecord(config.tools)
+        || config.tools.web_search !== false
+        || config.tools.view_image !== false
+        || !isRecord(config.mcp_servers)
+        || Object.keys(config.mcp_servers).length > 0) throw new Error(CELL_EDIT_UNAVAILABLE);
+
+      let cursor: string | undefined;
+      do {
+        const page = await this.request<{ data: unknown; nextCursor: unknown }>("mcpServerStatus/list", {
+          detail: "toolsAndAuthOnly",
+          ...(cursor ? { cursor } : {}),
+        });
+        const nextCursor = page.nextCursor;
+        if (!Array.isArray(page.data) || page.data.length > 0
+          || (nextCursor !== null && (typeof nextCursor !== "string" || !nextCursor))) {
+          throw new Error(CELL_EDIT_UNAVAILABLE);
+        }
+        cursor = typeof nextCursor === "string" ? nextCursor : undefined;
+      } while (cursor);
+
+      const installed = await this.request<{ apps: unknown }>("app/installed", { forceRefresh: true });
+      if (!Array.isArray(installed.apps) || installed.apps.some((app) => !isRecord(app) || app.callable === true)) {
+        throw new Error(CELL_EDIT_UNAVAILABLE);
+      }
+    } catch {
+      throw new Error(CELL_EDIT_UNAVAILABLE);
     }
   }
 

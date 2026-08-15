@@ -21,7 +21,7 @@ import { decodePng, encodePng } from "./png.ts";
 import { exportProject, type ExportOptions, type ExportTarget } from "./exporters/index.ts";
 import { activeCelFrame, buildAiEditPrompt, validateAiEditRequest } from "./ai-edit.ts";
 
-type CodexClient = Pick<CodexBridge, "getAccount" | "login" | "startGeneration" | "startCellEdit" | "interrupt" | "respond"> & {
+type CodexClient = Pick<CodexBridge, "getAccount" | "login" | "startGeneration" | "startCellEdit" | "startCellEditJudgment" | "interrupt" | "respond"> & {
   on(event: "event", listener: (event: CodexEvent) => void): unknown;
 };
 
@@ -59,6 +59,7 @@ type Job = GenerationJob | CellEditJob;
 export type ServerOptions = {
   projectsRoot: string;
   codex: CodexClient;
+  cellEditCodex?: CodexClient;
   staticRoot?: string;
 };
 
@@ -144,12 +145,14 @@ function parseExportOptions(value: unknown): ExportOptions {
   return options as ExportOptions;
 }
 
-export function createPixelForgeServer({ projectsRoot, codex, staticRoot }: ServerOptions) {
+export function createPixelForgeServer({ projectsRoot, codex, cellEditCodex, staticRoot }: ServerOptions) {
   const token = randomBytes(24).toString("base64url");
   const jobs = new Map<string, Job>();
-  const runToJob = new Map<string, string>();
-  const earlyEvents = new Map<string, CodexEvent[]>();
+  const runToJob = new Map<CodexClient, Map<string, string>>();
+  const earlyEvents = new Map<CodexClient, Map<string, CodexEvent[]>>();
   const projectLocks = new Map<string, string>();
+
+  const bridgeForJob = (job: Job): CodexClient => job.kind === "generation" ? codex : cellEditCodex!;
 
   const lockProject = (projectId: string, owner: string): boolean => {
     if (projectLocks.has(projectId)) return false;
@@ -174,7 +177,7 @@ export function createPixelForgeServer({ projectsRoot, codex, staticRoot }: Serv
 
   const interruptJob = async (job: Job): Promise<void> => {
     try {
-      await codex.interrupt(job.runId!);
+      await bridgeForJob(job).interrupt(job.runId!);
       if (job.kind === "cellEdit") await cleanupCellJob(job);
       job.status = "cancelled";
     } catch (error) {
@@ -192,12 +195,12 @@ export function createPixelForgeServer({ projectsRoot, codex, staticRoot }: Serv
     job.status = "failed";
     job.error = message;
     unlockProject(job.projectId, job.id);
-    if (job.runId) void codex.interrupt(job.runId).catch(() => undefined).finally(() => cleanupCellJob(job));
+    if (job.runId) void bridgeForJob(job).interrupt(job.runId).catch(() => undefined).finally(() => cleanupCellJob(job));
     else void cleanupCellJob(job);
   };
 
-  const finish = async (runId: string, status: string): Promise<void> => {
-    const jobId = runToJob.get(runId);
+  const finish = async (bridge: CodexClient, runId: string, status: string): Promise<void> => {
+    const jobId = runToJob.get(bridge)?.get(runId);
     if (!jobId) return;
     const job = jobs.get(jobId);
     if (!job || (job.status !== "running" && job.status !== "awaitingApproval")) return;
@@ -248,9 +251,10 @@ export function createPixelForgeServer({ projectsRoot, codex, staticRoot }: Serv
     }
   };
 
-  const handleCodexEvent = (event: CodexEvent): void => {
+  const handleCodexEvent = (bridge: CodexClient, event: CodexEvent): void => {
     if (event.type === "error") {
       for (const job of jobs.values()) if (job.status === "running" || job.status === "awaitingApproval" || job.status === "cancelling") {
+        if (bridgeForJob(job) !== bridge) continue;
         job.status = "failed";
         if (job.kind === "generation") job.approval = undefined;
         job.error = event.message;
@@ -261,18 +265,20 @@ export function createPixelForgeServer({ projectsRoot, codex, staticRoot }: Serv
     }
     const runId = "runId" in event ? event.runId : undefined;
     if (!runId) {
-      if (event.type === "approval") codex.respond(event.requestId, { decision: "decline" });
+      if (event.type === "approval") bridge.respond(event.requestId, { decision: "decline" });
       return;
     }
-    const jobId = runToJob.get(runId);
+    const jobId = runToJob.get(bridge)?.get(runId);
     const job = jobId ? jobs.get(jobId) : undefined;
     if (!job) {
-      const queued = earlyEvents.get(runId) ?? [];
+      const bridgeEvents = earlyEvents.get(bridge) ?? new Map<string, CodexEvent[]>();
+      earlyEvents.set(bridge, bridgeEvents);
+      const queued = bridgeEvents.get(runId) ?? [];
       queued.push(event);
-      earlyEvents.set(runId, queued);
+      bridgeEvents.set(runId, queued);
       return;
     }
-    if (event.type === "completed") void finish(runId, event.status);
+    if (event.type === "completed") void finish(bridge, runId, event.status);
     else if (event.type === "message") {
       if (event.text.trim()) job.messages.push(event.text);
     } else if (event.type === "result") {
@@ -284,23 +290,27 @@ export function createPixelForgeServer({ projectsRoot, codex, staticRoot }: Serv
     } else if (event.type === "approval") {
       const approval = { requestId: event.requestId, method: event.method, params: event.params };
       if (job.kind === "cellEdit") {
-        codex.respond(event.requestId, { decision: "decline" });
+        bridge.respond(event.requestId, { decision: "decline" });
         failCellJob(job, "AI 편집 작업이 도구 실행 승인을 요청했습니다.");
       } else if (!applyApproval(job, approval)) {
-        codex.respond(event.requestId, { decision: "decline" });
+        bridge.respond(event.requestId, { decision: "decline" });
       }
     }
   };
 
-  const connectRun = (job: Job, runId: string): void => {
+  const connectRun = (job: Job, bridge: CodexClient, runId: string): void => {
     job.runId = runId;
-    runToJob.set(runId, job.id);
-    const queued = earlyEvents.get(runId) ?? [];
-    earlyEvents.delete(runId);
-    for (const event of queued) handleCodexEvent(event);
+    const bridgeRuns = runToJob.get(bridge) ?? new Map<string, string>();
+    runToJob.set(bridge, bridgeRuns);
+    bridgeRuns.set(runId, job.id);
+    const bridgeEvents = earlyEvents.get(bridge);
+    const queued = bridgeEvents?.get(runId) ?? [];
+    bridgeEvents?.delete(runId);
+    for (const event of queued) handleCodexEvent(bridge, event);
   };
 
-  codex.on("event", handleCodexEvent);
+  codex.on("event", (event) => handleCodexEvent(codex, event));
+  if (cellEditCodex && cellEditCodex !== codex) cellEditCodex.on("event", (event) => handleCodexEvent(cellEditCodex, event));
 
   return createServer(async (request, response) => {
     try {
@@ -472,7 +482,7 @@ export function createPixelForgeServer({ projectsRoot, codex, staticRoot }: Serv
           const job: GenerationJob = { id: jobId, kind: "generation", projectId, request: jobRequest, frameId, outputPath, relativeOutputPath, status: "running", messages: [] };
           jobs.set(jobId, job);
           const run = await codex.startGeneration({ cwd: root, prompt });
-          connectRun(job, run.id);
+          connectRun(job, codex, run.id);
           return send(response, 202, wireJob(job));
         } catch (error) {
           jobs.delete(jobId);
@@ -482,6 +492,7 @@ export function createPixelForgeServer({ projectsRoot, codex, staticRoot }: Serv
       }
 
       if (request.method === "POST" && url.pathname === "/api/edits") {
+        if (!cellEditCodex) throw new Error("설치된 Codex App Server에서 현재 셀 편집을 사용할 수 없습니다.");
         const input = await body(request) as { projectId?: unknown; request?: unknown };
         const projectId = safeProjectId(String(input.projectId ?? ""));
         const jobId = randomUUID();
@@ -514,14 +525,16 @@ export function createPixelForgeServer({ projectsRoot, codex, staticRoot }: Serv
             messages: [],
           };
           jobs.set(jobId, job);
-          const run = await codex.startCellEdit({
-            cwd: root,
-            prompt: buildAiEditPrompt(project, editRequest),
-            compositePath,
-            celPath,
+          const run = await cellEditCodex.startCellEdit({
+            cwd: tempDir,
+            prompt: buildAiEditPrompt(project, editRequest, { attempt: 1 }),
+            originalCompositePath: compositePath,
+            originalCelPath: celPath,
+            candidateCompositePath: compositePath,
+            candidateCelPath: celPath,
             outputSchema: AI_EDIT_OUTPUT_SCHEMA,
           });
-          connectRun(job, run.id);
+          connectRun(job, cellEditCodex, run.id);
           return send(response, 202, wireJob(job));
         } catch (error) {
           jobs.delete(jobId);
@@ -544,7 +557,7 @@ export function createPixelForgeServer({ projectsRoot, codex, staticRoot }: Serv
         if (!job?.runId || job.kind !== expectedKind) return send(response, 404, { error: "작업을 찾을 수 없습니다." });
         if (job.status === "finalizing") return send(response, 409, { error: "이미 적용 준비가 시작되어 취소할 수 없습니다." });
         if (job.status !== "running" && job.status !== "awaitingApproval") return send(response, 409, { error: "이미 종료 중이거나 종료된 작업입니다." });
-        if (job.kind === "generation" && job.approval) codex.respond(job.approval.requestId, { decision: "decline" });
+        if (job.kind === "generation" && job.approval) bridgeForJob(job).respond(job.approval.requestId, { decision: "decline" });
         if (job.kind === "generation") job.approval = undefined;
         job.status = "cancelling";
         await interruptJob(job);
@@ -559,10 +572,10 @@ export function createPixelForgeServer({ projectsRoot, codex, staticRoot }: Serv
         job.approval = undefined;
         if (input.accept === true) {
           job.status = "running";
-          codex.respond(approval.requestId, { decision: "accept" });
+          bridgeForJob(job).respond(approval.requestId, { decision: "accept" });
         } else {
           job.status = "cancelling";
-          codex.respond(approval.requestId, { decision: "decline" });
+          bridgeForJob(job).respond(approval.requestId, { decision: "decline" });
           await interruptJob(job);
         }
         return send(response, 200, { status: job.status });

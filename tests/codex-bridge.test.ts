@@ -1,8 +1,41 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import test from "node:test";
-import { AI_EDIT_OUTPUT_SCHEMA } from "../src/core/ai-edit.ts";
-import { CodexBridge, type JsonlProcess, type RpcMessage } from "../src/server/codex-bridge.ts";
+import { AI_EDIT_OUTPUT_SCHEMA, AI_EDIT_VERDICT_OUTPUT_SCHEMA } from "../src/core/ai-edit.ts";
+import {
+  CELL_EDIT_APP_SERVER_ARGS,
+  CELL_EDIT_MODEL_SETTINGS,
+  CodexBridge,
+  type CellEditRunRequest,
+  type JsonlProcess,
+  type RpcMessage,
+} from "../src/server/codex-bridge.ts";
+
+const disabledCellEditFeatures = [
+  "shell_tool", "unified_exec", "apps", "browser_use", "browser_use_external", "browser_use_full_cdp_access",
+  "computer_use", "hooks", "image_generation", "memories", "multi_agent", "plugins", "plugin_sharing",
+  "remote_plugin", "skill_mcp_dependency_install", "skill_search", "tool_suggest", "view_image", "workspace_dependencies",
+] as const;
+
+type RestrictedConfig = {
+  features: Record<string, boolean>;
+  developer_instructions: string;
+  project_doc_max_bytes: number;
+  web_search: string;
+  tools: { web_search: boolean; view_image: boolean };
+  mcp_servers: Record<string, unknown>;
+};
+
+function restrictedConfig(): RestrictedConfig {
+  return {
+    features: Object.fromEntries(disabledCellEditFeatures.map((feature) => [feature, false])),
+    developer_instructions: "",
+    project_doc_max_bytes: 0,
+    web_search: "disabled",
+    tools: { web_search: false, view_image: false },
+    mcp_servers: {},
+  };
+}
 
 class FakeProcess extends EventEmitter implements JsonlProcess {
   readonly stdout = new EventEmitter();
@@ -10,17 +43,29 @@ class FakeProcess extends EventEmitter implements JsonlProcess {
   readonly messages: RpcMessage[] = [];
   responder?: (message: RpcMessage) => RpcMessage | undefined;
   killed = false;
+  private threadNumber = 0;
+  private turnNumber = 0;
   readonly stdin = {
     write: (chunk: string) => {
       for (const line of chunk.trim().split("\n")) {
         const message = JSON.parse(line) as RpcMessage;
         this.messages.push(message);
-        const response = this.responder?.(message);
+        const response = this.responder?.(message) ?? this.defaultResponse(message);
         if (response) queueMicrotask(() => this.respond(response));
       }
       return true;
     },
   };
+
+  private defaultResponse(message: RpcMessage): RpcMessage | undefined {
+    if (message.method === "account/read") return { id: message.id, result: { account: { type: "chatgpt" }, requiresOpenaiAuth: true } };
+    if (message.method === "config/read") return { id: message.id, result: { config: restrictedConfig() } };
+    if (message.method === "mcpServerStatus/list") return { id: message.id, result: { data: [], nextCursor: null } };
+    if (message.method === "app/installed") return { id: message.id, result: { apps: [] } };
+    if (message.method === "thread/start") return { id: message.id, result: { thread: { id: `thread-${++this.threadNumber}` } } };
+    if (message.method === "turn/start") return { id: message.id, result: { turn: { id: `turn-${++this.turnNumber}` } } };
+    return undefined;
+  }
 
   respond(message: RpcMessage, split = false) {
     const line = `${JSON.stringify(message)}\n`;
@@ -52,6 +97,16 @@ async function startedBridge(process: FakeProcess): Promise<CodexBridge> {
   await starting;
   return bridge;
 }
+
+const cellEditRequest: CellEditRunRequest = {
+  cwd: "C:/project/tmp/run",
+  prompt: "현재 셀을 편집하세요.",
+  originalCompositePath: "C:/project/tmp/run/original-composite.png",
+  originalCelPath: "C:/project/tmp/run/original-cel.png",
+  candidateCompositePath: "C:/project/tmp/run/candidate-composite.png",
+  candidateCelPath: "C:/project/tmp/run/candidate-cel.png",
+  outputSchema: AI_EDIT_OUTPUT_SCHEMA,
+};
 
 test("분할된 JSONL 초기화 응답을 조립하고 initialized를 보낸다", async () => {
   const process = new FakeProcess();
@@ -155,44 +210,162 @@ test("알림을 UI 이벤트로 정규화한다", async () => {
   ]);
 });
 
-test("셀 편집은 도구 없이 읽기 전용 스레드와 구조화 턴을 시작한다", async () => {
+test("셀 편집은 제한 설정을 검사한 뒤 도구 없는 읽기 전용 구조화 턴을 시작한다", async () => {
   const process = new FakeProcess();
   const bridge = await startedBridge(process);
-  process.responder = (message) => {
-    if (message.method === "account/read") return { id: message.id, result: { account: { type: "chatgpt" }, requiresOpenaiAuth: true } };
-    if (message.method === "thread/start") return { id: message.id, result: { thread: { id: "thread-edit" } } };
-    if (message.method === "turn/start") return { id: message.id, result: { turn: { id: "turn-edit" } } };
-    return undefined;
-  };
+  const run = await bridge.startCellEdit(cellEditRequest);
 
-  const run = await bridge.startCellEdit({
-    cwd: "C:/project",
-    prompt: "현재 셀을 편집하세요.",
-    compositePath: "C:/project/tmp/composite.png",
-    celPath: "C:/project/tmp/cel.png",
-    outputSchema: AI_EDIT_OUTPUT_SCHEMA,
-  });
-
-  assert.deepEqual(run, { id: "turn-edit", threadId: "thread-edit", turnId: "turn-edit" });
+  assert.deepEqual(run, { id: "turn-1", threadId: "thread-1", turnId: "turn-1" });
+  assert.deepEqual(process.messages.map(({ method }) => method).filter(Boolean), [
+    "initialize", "initialized", "account/read", "config/read", "mcpServerStatus/list", "app/installed", "thread/start", "turn/start",
+  ]);
+  assert.deepEqual(CELL_EDIT_APP_SERVER_ARGS, [
+    "--strict-config",
+    "--disable", "shell_tool",
+    "--disable", "unified_exec",
+    "--disable", "apps",
+    "--disable", "browser_use",
+    "--disable", "browser_use_external",
+    "--disable", "browser_use_full_cdp_access",
+    "--disable", "computer_use",
+    "--disable", "hooks",
+    "--disable", "image_generation",
+    "--disable", "memories",
+    "--disable", "multi_agent",
+    "--disable", "plugins",
+    "--disable", "plugin_sharing",
+    "--disable", "remote_plugin",
+    "--disable", "skill_mcp_dependency_install",
+    "--disable", "skill_search",
+    "--disable", "tool_suggest",
+    "--disable", "view_image",
+    "--disable", "workspace_dependencies",
+    "-c", 'developer_instructions=""',
+    "-c", "project_doc_max_bytes=0",
+    "-c", 'web_search="disabled"',
+    "-c", "tools.web_search=false",
+    "-c", "tools.view_image=false",
+    "-c", "mcp_servers={}",
+  ]);
+  assert.deepEqual(process.messages.find(({ method }) => method === "config/read")?.params, {});
+  assert.deepEqual(process.messages.find(({ method }) => method === "mcpServerStatus/list")?.params, { detail: "toolsAndAuthOnly" });
+  assert.deepEqual(process.messages.find(({ method }) => method === "app/installed")?.params, { forceRefresh: true });
   const thread = process.messages.find((message) => message.method === "thread/start")!;
   assert.deepEqual(thread.params, {
-    cwd: "C:/project",
-    approvalPolicy: "never",
-    sandbox: "read-only",
-    serviceName: "pixelforge",
-    developerInstructions: "제공된 텍스트와 두 이미지만 읽고 JSON 최종 응답만 작성하세요. 도구, 명령, 파일 쓰기, 스킬을 사용하지 마세요.",
+    developerInstructions: "편집 에이전트 역할입니다. 제공된 원본과 현재 후보를 기존 픽셀 도구 동작으로 수정하고 JSON만 반환하세요.",
+    dynamicTools: [],
   });
   const turn = process.messages.find((message) => message.method === "turn/start")!;
   assert.deepEqual(turn.params, {
-    threadId: "thread-edit",
+    threadId: "thread-1",
+    model: CELL_EDIT_MODEL_SETTINGS.model,
+    cwd: cellEditRequest.cwd,
+    approvalPolicy: "never",
+    sandboxPolicy: { type: "readOnly", networkAccess: false },
     input: [
       { type: "text", text: "현재 셀을 편집하세요.", text_elements: [] },
-      { type: "localImage", path: "C:/project/tmp/composite.png" },
-      { type: "localImage", path: "C:/project/tmp/cel.png" },
+      { type: "localImage", path: cellEditRequest.originalCompositePath },
+      { type: "localImage", path: cellEditRequest.originalCelPath },
+      { type: "localImage", path: cellEditRequest.candidateCompositePath },
+      { type: "localImage", path: cellEditRequest.candidateCelPath },
     ],
     outputSchema: AI_EDIT_OUTPUT_SCHEMA,
   });
-  assert.equal(process.messages.some((message) => message.method === "skills/list"), false);
+  assert.equal("effort" in turn.params!, false);
+});
+
+test("셀 편집과 독립 판정은 새 스레드에서 같은 모델의 기본 추론 설정을 사용한다", async () => {
+  const process = new FakeProcess();
+  const bridge = await startedBridge(process);
+
+  const edit = await bridge.startCellEdit(cellEditRequest);
+  const judgment = await bridge.startCellEditJudgment({ ...cellEditRequest, outputSchema: AI_EDIT_VERDICT_OUTPUT_SCHEMA });
+  assert.notEqual(edit.threadId, judgment.threadId);
+
+  const threads = process.messages.filter(({ method }) => method === "thread/start");
+  assert.equal(threads.length, 2);
+  assert.notEqual(threads[0].params?.developerInstructions, threads[1].params?.developerInstructions);
+  assert.deepEqual(threads[0].params?.dynamicTools, []);
+
+  const turns = process.messages.filter(({ method }) => method === "turn/start");
+  assert.equal(turns[0].params?.model, "gpt-5.6-sol");
+  assert.equal(turns[1].params?.model, "gpt-5.6-sol");
+  assert.equal("effort" in turns[0].params!, false);
+  assert.equal("effort" in turns[1].params!, false);
+  assert.equal(turns[0].params?.cwd, cellEditRequest.cwd);
+  assert.equal(turns[0].params?.approvalPolicy, "never");
+  assert.deepEqual(turns[0].params?.sandboxPolicy, { type: "readOnly", networkAccess: false });
+  assert.deepEqual((turns[1].params?.input as unknown[]).slice(1), [
+    { type: "localImage", path: cellEditRequest.originalCompositePath },
+    { type: "localImage", path: cellEditRequest.originalCelPath },
+    { type: "localImage", path: cellEditRequest.candidateCompositePath },
+    { type: "localImage", path: cellEditRequest.candidateCelPath },
+  ]);
+});
+
+test("셀 편집은 MCP 상태의 모든 빈 페이지를 검사한다", async () => {
+  const process = new FakeProcess();
+  const bridge = await startedBridge(process);
+  process.responder = (message) => message.method === "mcpServerStatus/list"
+    ? { id: message.id, result: message.params?.cursor ? { data: [], nextCursor: null } : { data: [], nextCursor: "next" } }
+    : undefined;
+
+  await bridge.startCellEdit(cellEditRequest);
+  const pages = process.messages.filter(({ method }) => method === "mcpServerStatus/list");
+  assert.deepEqual(pages.map(({ params }) => params), [
+    { detail: "toolsAndAuthOnly" },
+    { detail: "toolsAndAuthOnly", cursor: "next" },
+  ]);
+});
+
+test("셀 편집 사전 검사가 불완전하거나 제한 설정이 다르면 thread 시작 전에 거부한다", async () => {
+  const configCase = (name: string, mutate: (config: RestrictedConfig) => void) => ({
+    name,
+    responder(message: RpcMessage): RpcMessage | undefined {
+      if (message.method !== "config/read") return undefined;
+      const config = restrictedConfig();
+      mutate(config);
+      return { id: message.id, result: { config } };
+    },
+  });
+  const cases = [
+    ...disabledCellEditFeatures.map((feature) => configCase(`${feature} 활성`, (config) => { config.features[feature] = true; })),
+    configCase("개발자 지시 허용", (config) => { config.developer_instructions = "추가 지시"; }),
+    configCase("프로젝트 지시 허용", (config) => { config.project_doc_max_bytes = 1; }),
+    configCase("웹 검색 활성", (config) => { config.web_search = "live"; }),
+    configCase("도구 웹 검색 활성", (config) => { config.tools.web_search = true; }),
+    configCase("이미지 보기 활성", (config) => { config.tools.view_image = true; }),
+    configCase("설정 MCP 존재", (config) => { config.mcp_servers.example = {}; }),
+    {
+      name: "설정 응답 누락",
+      responder: (message: RpcMessage) => message.method === "config/read" ? { id: message.id, result: { config: {} } } : undefined,
+    },
+    {
+      name: "실행 중 MCP 존재",
+      responder: (message: RpcMessage) => message.method === "mcpServerStatus/list"
+        ? { id: message.id, result: { data: [{ name: "example" }], nextCursor: null } }
+        : undefined,
+    },
+    {
+      name: "호출 가능한 앱 존재",
+      responder: (message: RpcMessage) => message.method === "app/installed"
+        ? { id: message.id, result: { apps: [{ id: "example", callable: true }] } }
+        : undefined,
+    },
+    ...["config/read", "mcpServerStatus/list", "app/installed"].flatMap((method) => [-32601, -32602].map((code) => ({
+      name: `${method} ${code}`,
+      responder: (message: RpcMessage) => message.method === method ? { id: message.id, error: { code, message: "unsupported" } } : undefined,
+    }))),
+  ];
+
+  for (const failure of cases) {
+    const process = new FakeProcess();
+    const bridge = await startedBridge(process);
+    process.responder = failure.responder;
+    await assert.rejects(bridge.startCellEdit(cellEditRequest), /설치된 Codex App Server에서 현재 셀 편집을 사용할 수 없습니다/, failure.name);
+    assert.equal(process.messages.some(({ method }) => method === "thread/start"), false, failure.name);
+    bridge.close();
+  }
 });
 
 test("셀 편집 최종 메시지와 금지 도구 시작을 별도 이벤트로 정규화한다", async () => {
@@ -230,7 +403,7 @@ test("셀 편집 구조화 시작 계약을 지원하지 않는 App Server는 �
         return undefined;
       };
 
-      await assert.rejects(bridge.startCellEdit({ cwd: "C:/project", prompt: "편집", compositePath: "a.png", celPath: "b.png", outputSchema: {} }), /설치된 Codex App Server에서 현재 셀 편집을 사용할 수 없습니다/);
+      await assert.rejects(bridge.startCellEdit({ ...cellEditRequest, cwd: "C:/project", prompt: "편집", outputSchema: {} }), /설치된 Codex App Server에서 현재 셀 편집을 사용할 수 없습니다/);
       assert.equal(process.messages.some((message) => message.method === "skills/list"), false);
       bridge.close();
     }
@@ -243,5 +416,5 @@ test("셀 편집 구조화 시작 계약을 지원하지 않는 App Server는 �
     : message.method === "thread/start"
       ? { id: message.id, error: { code: -32000, message: "인증 실패" } }
       : undefined;
-  await assert.rejects(bridge.startCellEdit({ cwd: "C:/project", prompt: "편집", compositePath: "a.png", celPath: "b.png", outputSchema: {} }), /인증 실패/);
+  await assert.rejects(bridge.startCellEdit({ ...cellEditRequest, cwd: "C:/project", prompt: "편집", outputSchema: {} }), /인증 실패/);
 });

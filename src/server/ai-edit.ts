@@ -1,4 +1,4 @@
-import { EDITOR_TOOLS, type AiEditRequest, type AiEditSettings, type AiEditTarget, type EditorTool } from "../core/ai-edit.ts";
+import { AI_EDIT_CRITERIA, EDITOR_TOOLS, type AiEditRequest, type AiEditSettings, type AiEditTarget, type AiEditVerdict, type EditorTool } from "../core/ai-edit.ts";
 import { celKey, type Cel, type PixelBuffer, type RGBA, type SpriteDocument, type SpriteProject } from "../core/types.ts";
 
 const requestFields = new Set(["prompt", "target", "settings"]);
@@ -112,7 +112,7 @@ export function validateAiEditRequest(project: SpriteProject, value: unknown): A
   return { prompt: value.prompt.trim(), target: { ...target }, settings };
 }
 
-export function buildAiEditPrompt(project: SpriteProject, value: AiEditRequest): string {
+export function buildAiEditPrompt(project: SpriteProject, value: AiEditRequest, context: { attempt: number; previousVerdict?: AiEditVerdict }): string {
   const request = validateAiEditRequest(project, value);
   const frameIndex = project.document.frames.findIndex(({ id }) => id === request.target.frameId);
   const layer = project.document.layers.find(({ id }) => id === request.target.layerId)!;
@@ -122,14 +122,35 @@ export function buildAiEditPrompt(project: SpriteProject, value: AiEditRequest):
     `대상 프레임: F${frameIndex + 1} (${request.target.frameId})`,
     `활성 레이어: ${layer.name} (${layer.id})`,
     `활성 셀 ID: ${request.target.celId}`,
+    `편집 시도: ${context.attempt}/6`,
     `현재 편집기 settings: ${JSON.stringify(request.settings)}`,
     `사용 가능한 도구: ${EDITOR_TOOLS.join(", ")}`,
     "points 좌표 수: pencil, eraser, spray는 1개 이상; line, curve, rectangle, ellipse, polygon, gradient, select는 정확히 2개; fill, eyedropper, wand는 정확히 1개; lasso는 서로 다른 좌표 3개 이상이며 첫 좌표를 끝에 반복하지 마세요.",
     "모든 좌표는 문서 좌상단 (0, 0)을 기준으로 한 정수 좌표입니다.",
-    "첫 번째 이미지는 현재 프레임의 합성 결과이고, 두 번째 이미지는 같은 문서 좌표에 정렬한 활성 셀입니다.",
-    "기존 도구의 제스처로 현재 셀 하나만 편집할 actions를 작성하세요.",
+    "첫 번째와 두 번째 이미지는 변경 전 원본의 합성 결과와 문서 좌표에 정렬한 활성 셀입니다.",
+    "세 번째와 네 번째 이미지는 현재 후보의 합성 결과와 문서 좌표에 정렬한 활성 셀입니다.",
+    "원본을 기준으로 요청 범위 밖 픽셀을 유지하면서 기존 도구의 제스처로 직전 후보의 현재 셀 하나만 수정할 actions를 작성하세요.",
+    ...(context.previousVerdict ? ["직전 판정 피드백:", JSON.stringify(context.previousVerdict)] : []),
     "대상이 불확실하면 이유를 summary에 쓰고 빈 actions를 반환하세요.",
     "파일 쓰기, 명령 실행, 이미지 생성, 도구 또는 스킬 호출을 하지 마세요.",
     "출력 스키마에 맞는 JSON 최종 응답만 작성하세요.",
+  ].join("\n");
+}
+
+export function buildAiEditVerdictPrompt(request: AiEditRequest): string {
+  return [
+    `사용자 지시: ${request.prompt.trim()}`,
+    "첫 번째와 두 번째 이미지는 원본의 합성 결과와 활성 셀입니다.",
+    "세 번째와 네 번째 이미지는 후보의 합성 결과와 활성 셀입니다.",
+    "원본과 후보만 비교하여 다음 다섯 기준을 각각 판정하세요:",
+    `${AI_EDIT_CRITERIA[0]}: 사용자 지시를 빠짐없이 충족했는지 판정합니다.`,
+    `${AI_EDIT_CRITERIA[1]}: 요청한 자세 변경의 방향·관절·실루엣이 정확한지 판정합니다.`,
+    `${AI_EDIT_CRITERIA[2]}: 교체 요청은 기존 대상의 잔재 없이 교체되었는지 판정합니다. 요청이 투명화이거나 교체가 아닌 경우에는 그 사실을 reason에 명시하고 통과 처리합니다.`,
+    `${AI_EDIT_CRITERIA[3]}: 요청 범위 밖의 형태·색상·투명도·픽셀이 원본대로 보존되었는지 판정합니다.`,
+    `${AI_EDIT_CRITERIA[4]}: 후보가 원본의 픽셀 아트 해상도·팔레트·가장자리 표현과 일치하는지 판정합니다.`,
+    "pass는 다섯 기준이 모두 passed=true이고 corrections가 비어 있을 때만 가능합니다.",
+    "fail은 하나 이상의 기준이 passed=false이고 각 실패 기준에 구체적인 corrections가 있을 때만 가능합니다.",
+    "요청한 자세 변경은 정확성과 범위를 함께 확인하고, 범위 밖 요소는 원본과 같아야 합니다.",
+    "출력 스키마에 맞는 판정 JSON 최종 응답만 작성하세요.",
   ].join("\n");
 }

@@ -25,6 +25,7 @@ class FakeCodex extends EventEmitter {
   approvalDuringStart = false;
   interruptWait?: Promise<void>;
   interruptError?: Error;
+  cellEditError?: Error;
   cellEditEventsDuringStart: CodexEvent[] = [];
   private runNumber = 0;
 
@@ -47,12 +48,17 @@ class FakeCodex extends EventEmitter {
 
   async startCellEdit(request: CellEditRunRequest) {
     this.lastCellEdit = request;
+    if (this.cellEditError) throw this.cellEditError;
     const runId = `run-${++this.runNumber}`;
     const threadId = `thread-${this.runNumber}`;
     this.lastRunId = runId;
     for (const event of this.cellEditEventsDuringStart) this.event({ ...event, runId } as CodexEvent);
     this.cellEditEventsDuringStart = [];
     return { id: runId, threadId, turnId: runId };
+  }
+
+  async startCellEditJudgment(request: CellEditRunRequest) {
+    return this.startCellEdit(request);
   }
 
   async interrupt(runId: string) { this.interrupts.push(runId); await this.interruptWait; if (this.interruptError) throw this.interruptError; }
@@ -125,8 +131,12 @@ function cellEditRequest(project: ReturnType<typeof threeFrameProject>): AiEditR
   };
 }
 
-async function startGenerationServer(root: string, codex: FakeCodex) {
-  const server = createPixelForgeServer({ projectsRoot: root, codex });
+async function startGenerationServer(root: string, codex: FakeCodex, cellEditCodex: FakeCodex = codex) {
+  const codexListeners = codex.listenerCount("event");
+  const cellEditListeners = cellEditCodex.listenerCount("event");
+  const server = createPixelForgeServer({ projectsRoot: root, codex, cellEditCodex });
+  assert.equal(codex.listenerCount("event"), codexListeners + 1);
+  if (cellEditCodex !== codex) assert.equal(cellEditCodex.listenerCount("event"), cellEditListeners + 1);
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
   const session = await fetch(`${base}/api/session`).then((response) => response.json()) as { token: string };
@@ -581,8 +591,8 @@ test("셀 편집 작업은 두 참조 PNG와 검증된 결과만 반환하고 �
     assert.equal(started.kind, "cellEdit");
     assert.deepEqual(started.target, request.target);
     assert.deepEqual(codex.lastCellEdit?.outputSchema, AI_EDIT_OUTPUT_SCHEMA);
-    assert.deepEqual(Array.from(decodePng(await readFile(codex.lastCellEdit!.compositePath)).data), Array.from(compositeFrame(before.document, request.target.frameId).data));
-    assert.deepEqual(Array.from(decodePng(await readFile(codex.lastCellEdit!.celPath)).data), Array.from(activeCelFrame(before.document, request.target).data));
+    assert.deepEqual(Array.from(decodePng(await readFile(codex.lastCellEdit!.originalCompositePath)).data), Array.from(compositeFrame(before.document, request.target.frameId).data));
+    assert.deepEqual(Array.from(decodePng(await readFile(codex.lastCellEdit!.originalCelPath)).data), Array.from(activeCelFrame(before.document, request.target).data));
     assert.equal(JSON.stringify(await loadProject(projectRoot)), beforeJson);
 
     const result = { summary: "배경을 채웠습니다.", actions: [{ tool: "fill", points: [{ x: 0, y: 0 }], color: [255, 0, 0, 255] }] };
@@ -598,9 +608,111 @@ test("셀 편집 작업은 두 참조 PNG와 검증된 결과만 반환하고 �
     assert.equal("compositePath" in completed, false);
     assert.equal("celPath" in completed, false);
     assert.equal(JSON.stringify(await loadProject(projectRoot)), beforeJson);
-    await assert.rejects(readFile(codex.lastCellEdit!.compositePath), (error: NodeJS.ErrnoException) => error.code === "ENOENT");
-    await assert.rejects(readFile(codex.lastCellEdit!.celPath), (error: NodeJS.ErrnoException) => error.code === "ENOENT");
+    await assert.rejects(readFile(codex.lastCellEdit!.originalCompositePath), (error: NodeJS.ErrnoException) => error.code === "ENOENT");
+    await assert.rejects(readFile(codex.lastCellEdit!.originalCelPath), (error: NodeJS.ErrnoException) => error.code === "ENOENT");
     assert.equal((await fetch(`${base}/api/generations/${started.id}`)).status, 404);
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("셀 편집 bridge가 없으면 요청 본문보다 먼저 기능 불가로 거부한다", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pixelforge-cell-edit-missing-bridge-"));
+  const codex = new FakeCodex();
+  const server = createPixelForgeServer({ projectsRoot: root, codex });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  const { token } = await fetch(`${base}/api/session`).then((response) => response.json()) as { token: string };
+
+  try {
+    const response = await fetch(`${base}/api/edits`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-pixelforge-token": token },
+      body: "{}",
+    });
+    assert.equal(response.status, 400);
+    assert.equal(((await response.json()) as { error: string }).error, "설치된 Codex App Server에서 현재 셀 편집을 사용할 수 없습니다.");
+    assert.equal(codex.lastCellEdit, undefined);
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("셀 편집 bridge 기능 불가는 일반 생성 bridge를 막지 않는다", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pixelforge-cell-edit-unavailable-"));
+  const project = threeFrameProject();
+  await createProject(join(root, project.id), project);
+  const codex = new FakeCodex();
+  const cellEditCodex = new FakeCodex();
+  cellEditCodex.cellEditError = new Error("설치된 Codex App Server에서 현재 셀 편집을 사용할 수 없습니다.");
+  const { server, base, token } = await startGenerationServer(root, codex, cellEditCodex);
+
+  try {
+    const edit = await fetch(`${base}/api/edits`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-pixelforge-token": token },
+      body: JSON.stringify({ projectId: project.id, request: cellEditRequest(project) }),
+    });
+    assert.equal(edit.status, 400);
+    assert.equal(((await edit.json()) as { error: string }).error, "설치된 Codex App Server에서 현재 셀 편집을 사용할 수 없습니다.");
+    assert.equal(codex.lastCellEdit, undefined);
+
+    const generation = await fetch(`${base}/api/generations`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-pixelforge-token": token },
+      body: JSON.stringify({ projectId: project.id, request: { prompt: "일반 생성", frameCount: 1, columns: 1, cellWidth: 2, cellHeight: 1, durationMs: 100 } }),
+    });
+    assert.equal(generation.status, 202);
+    assert.match(codex.lastPrompt, /일반 생성/);
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("분리된 bridge의 동일 run ID 이벤트와 중단은 각 작업에만 적용된다", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pixelforge-cell-edit-bridge-routing-"));
+  const generationProject = threeFrameProject();
+  const editProject = threeFrameProject();
+  await createProject(join(root, generationProject.id), generationProject);
+  await createProject(join(root, editProject.id), editProject);
+  const codex = new FakeCodex();
+  const cellEditCodex = new FakeCodex();
+  const { server, base, token } = await startGenerationServer(root, codex, cellEditCodex);
+
+  try {
+    const generation = await (await fetch(`${base}/api/generations`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-pixelforge-token": token },
+      body: JSON.stringify({ projectId: generationProject.id, request: { prompt: "충돌 검사", frameCount: 1, columns: 1, cellWidth: 2, cellHeight: 1, durationMs: 100 } }),
+    })).json() as { id: string };
+    const edit = await (await fetch(`${base}/api/edits`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-pixelforge-token": token },
+      body: JSON.stringify({ projectId: editProject.id, request: cellEditRequest(editProject) }),
+    })).json() as { id: string };
+    assert.equal(codex.lastRunId, "run-1");
+    assert.equal(cellEditCodex.lastRunId, "run-1");
+
+    codex.event({ type: "result", runId: "run-1", text: JSON.stringify({ summary: "잘못된 bridge 결과", actions: [] }) });
+    codex.event({ type: "error", message: "일반 생성 연결 종료" });
+    assert.equal((await waitForJob(base, generation.id)).status, "failed");
+    assert.equal(((await fetch(`${base}/api/edits/${edit.id}`).then((response) => response.json())) as { status: string }).status, "running");
+
+    cellEditCodex.event({ type: "result", runId: "run-1", text: JSON.stringify({ summary: "올바른 편집 결과", actions: [] }) });
+    cellEditCodex.event({ type: "completed", runId: "run-1", status: "completed" });
+    assert.equal((await waitForJob(base, edit.id, "edits")).status, "completed");
+
+    const cancellable = await (await fetch(`${base}/api/edits`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-pixelforge-token": token },
+      body: JSON.stringify({ projectId: editProject.id, request: cellEditRequest(editProject) }),
+    })).json() as { id: string };
+    assert.equal((await fetch(`${base}/api/edits/${cancellable.id}`, { method: "DELETE", headers: { "x-pixelforge-token": token } })).status, 200);
+    assert.deepEqual(cellEditCodex.interrupts, ["run-2"]);
+    assert.deepEqual(codex.interrupts, []);
   } finally {
     await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
     await rm(root, { recursive: true, force: true });

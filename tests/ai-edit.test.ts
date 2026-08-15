@@ -8,10 +8,11 @@ import {
   parseAiEditResult,
   parseAiEditVerdict,
   type AiEditRequest,
+  type AiEditVerdict,
 } from "../src/core/ai-edit.ts";
 import { createDocument, createProject } from "../src/core/document.ts";
 import { celKey } from "../src/core/types.ts";
-import { activeCelFrame, buildAiEditPrompt, validateAiEditRequest } from "../src/server/ai-edit.ts";
+import { activeCelFrame, buildAiEditPrompt, buildAiEditVerdictPrompt, validateAiEditRequest } from "../src/server/ai-edit.ts";
 
 const validPoints = {
   pencil: [{ x: 0, y: 0 }],
@@ -31,6 +32,12 @@ const validPoints = {
 } as const;
 
 const passingCriteria = AI_EDIT_CRITERIA.map((id) => ({ id, passed: true, reason: "기준을 충족했습니다." }));
+const failingVerdict: AiEditVerdict = {
+  verdict: "fail",
+  summary: "요청 범위를 벗어난 픽셀이 있습니다.",
+  criteria: passingCriteria.map((criterion) => criterion.id === "preservation" ? { ...criterion, passed: false } : criterion),
+  corrections: [{ criterion: "preservation", region: "배경", problem: "원본 픽셀이 변경됨", requiredChange: "요청 범위 밖 픽셀을 원본대로 복원" }],
+};
 
 test("AI 편집 판정은 다섯 기준과 pass/fail 수정 지시 불변식을 검증한다", () => {
   assert.equal(parseAiEditVerdict({
@@ -247,7 +254,7 @@ test("저장 프로젝트의 AI 편집 요청은 대상과 모든 편집 설정�
 
 test("AI 편집 프롬프트는 대상·설정·도구 계약과 금지 동작을 명시한다", () => {
   const { project, request, frame, layer, cel } = editFixture();
-  const prompt = buildAiEditPrompt(project, request);
+  const prompt = buildAiEditPrompt(project, request, { attempt: 1 });
   assert.match(prompt, /배경을 정리해 줘/);
   assert.match(prompt, /4 × 3/);
   assert.match(prompt, new RegExp(`F1.*${frame.id}`));
@@ -265,14 +272,32 @@ test("AI 편집 프롬프트는 대상·설정·도구 계약과 금지 동작�
   assert.match(prompt, /lasso.*서로 다른 좌표 3개 이상.*반복하지/);
   assert.match(prompt, /좌상단 \(0, 0\)/);
   assert.match(prompt, /불확실.*빈 actions/s);
-  assert.match(prompt, /첫 번째 이미지.*합성/s);
-  assert.match(prompt, /두 번째 이미지.*활성 셀/s);
+  assert.match(prompt, /첫 번째와 두 번째 이미지.*원본/s);
+  assert.match(prompt, /세 번째와 네 번째 이미지.*후보/s);
   assert.match(prompt, /파일 쓰기.*명령 실행.*이미지 생성/s);
 });
 
 test("AI 편집 프롬프트는 특정 의상 교체 전략을 강제하지 않는다", () => {
   const { project, request } = editFixture();
-  const prompt = buildAiEditPrompt(project, request);
+  const prompt = buildAiEditPrompt(project, request, { attempt: 1 });
 
   assert.doesNotMatch(prompt, /골반 회전|새 의상|정면 의상|주름과 명암/);
+});
+
+test("재편집은 구조화된 직전 판정만 받고 독립 판정은 고정 기준만 사용한다", () => {
+  const { project, request } = editFixture();
+  const retryPrompt = buildAiEditPrompt(project, request, {
+    attempt: 2,
+    previousVerdict: failingVerdict,
+  });
+  assert.match(retryPrompt, /편집 시도: 2\/6/);
+  assert.match(retryPrompt, /직전 판정 피드백:/);
+  assert.match(retryPrompt, /requiredChange/);
+  assert.doesNotMatch(retryPrompt, /대화 기록|추론 기록|치마/);
+
+  const verdictPrompt = buildAiEditVerdictPrompt(request);
+  for (const criterion of AI_EDIT_CRITERIA) assert.match(verdictPrompt, new RegExp(criterion));
+  assert.match(verdictPrompt, /첫 번째와 두 번째 이미지는 원본/);
+  assert.match(verdictPrompt, /세 번째와 네 번째 이미지는 후보/);
+  assert.doesNotMatch(verdictPrompt, /동작 선택 이유|자기평가/);
 });
