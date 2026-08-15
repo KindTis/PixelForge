@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { AiEditReadyResult, AiEditRequest } from "../src/core/ai-edit.ts";
 import { createDocument, createProject } from "../src/core/document.ts";
-import { api, cellEditApplicationDisposition, cellEditCompletionNotice, cellEditPayload, codexJobStatusTitle, completedFrameIndex, decodeProject, encodeProject, failedCodexJob, generationPayload, isRetryablePollingError, pollingErrorCodexJob, type CellEditJob, type GenerationJob, type WireProject } from "../src/client/api.ts";
+import { api, cellEditApplicationDisposition, cellEditApplicationRequestTimeout, cellEditCompletionNotice, cellEditPayload, cellEditProjectMatches, codexJobStatusTitle, completedFrameIndex, decodeProject, encodeProject, failedCodexJob, generationPayload, isRetryablePollingError, pollingErrorCodexJob, type CellEditJob, type GenerationJob, type WireProject } from "../src/client/api.ts";
 
 test("프로젝트 픽셀을 JSON 배열로 보내고 Uint8ClampedArray로 복원한다", () => {
   const project = createProject("저장", createDocument({ width: 1, height: 1 }));
@@ -109,6 +109,17 @@ test("현재 셀 편집 작업의 모든 상태 제목에 셀 문맥을 표시�
   ] as const) {
     assert.equal(cellEditApplicationDisposition({ ...judging, status }, deadline, now), expected);
   }
+});
+
+test("적용 확인 요청은 남은 제한 시간과 현재 프로젝트를 순수 판정한다", () => {
+  assert.equal(cellEditApplicationRequestTimeout(0, 900), undefined);
+  assert.equal(cellEditApplicationRequestTimeout(1_000, 900), 100);
+  assert.equal(cellEditApplicationRequestTimeout(1_000, 1_000), 0);
+  assert.equal(cellEditApplicationRequestTimeout(1_000, 1_100), 0);
+
+  assert.equal(cellEditProjectMatches("project", "project"), true);
+  assert.equal(cellEditProjectMatches("other", "project"), false);
+  assert.equal(cellEditProjectMatches(undefined, "project"), false);
 });
 
 test("선택 재생성 완료는 시작한 프레임과 일치하는 결과만 선택한다", () => {

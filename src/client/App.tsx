@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import type { SpriteProject } from "../core/types.ts";
-import { api, cellEditApplicationDisposition, cellEditCompletionNotice, cellEditPayload, codexJobStatusTitle, completedFrameIndex, decodeProject, encodeProject, failedCodexJob, generationPayload, isRetryablePollingError, pollingErrorCodexJob, type CellEditJob, type CodexJob, type GenerationJob, type Session } from "./api.ts";
+import { api, cellEditApplicationDisposition, cellEditApplicationRequestTimeout, cellEditCompletionNotice, cellEditPayload, cellEditProjectMatches, codexJobStatusTitle, completedFrameIndex, decodeProject, encodeProject, failedCodexJob, generationPayload, isRetryablePollingError, pollingErrorCodexJob, type CellEditJob, type CodexJob, type GenerationJob, type Session } from "./api.ts";
 import { EditorWorkspace, type EditorWorkspaceHandle } from "./editor/EditorWorkspace.tsx";
 import { ExportDialog, type ExportResult, type ExportTarget } from "./ExportDialog.tsx";
 
@@ -171,11 +171,16 @@ export function App() {
 
     try {
       for (;;) {
+        if (!cellEditProjectMatches(latestProject.current?.id, projectId)) return;
         let next: CodexJob;
         try {
           const collection = started.kind === "generation" ? "generations" : "edits";
-          next = await api<CodexJob>(`/api/${collection}/${started.id}`);
+          const requestTimeout = cellEditApplicationRequestTimeout(applicationDeadline, Date.now());
+          next = await api<CodexJob>(`/api/${collection}/${started.id}`, undefined, requestTimeout === undefined
+            ? undefined
+            : { signal: AbortSignal.timeout(requestTimeout) });
         } catch (reason) {
+          if (!cellEditProjectMatches(latestProject.current?.id, projectId)) return;
           if (!isRetryablePollingError(reason)) throw reason;
           const message = reason instanceof Error ? reason.message : String(reason);
           setJob((current) => pollingErrorCodexJob(current, started.id, message));
@@ -192,10 +197,13 @@ export function App() {
           await new Promise((resolve) => window.setTimeout(resolve, 500));
           continue;
         }
-        if (latestProject.current?.id !== projectId) return;
+        if (!cellEditProjectMatches(latestProject.current?.id, projectId)) return;
         if (next.kind !== started.kind) throw new Error("작업 종류가 요청과 일치하지 않습니다.");
         if (next.kind === "cellEdit" && cellEditCancelRequested.current) {
-          if (next.status === "running" || next.status === "awaitingApproval") await cancelCellEdit(next.id);
+          if (next.status === "running" || next.status === "awaitingApproval") {
+            await cancelCellEdit(next.id);
+            if (!cellEditProjectMatches(latestProject.current?.id, projectId)) return;
+          }
           else if (next.status === "finalizing" || next.status === "completed" || next.status === "failed" || next.status === "cancelled") cellEditCancelRequested.current = false;
         }
 
@@ -212,15 +220,19 @@ export function App() {
             }
           }
           try {
+            const requestTimeout = cellEditApplicationRequestTimeout(applicationDeadline, Date.now());
             next = await api<CellEditJob>(`/api/edits/${next.id}/application`, session!.token, {
               method: "POST",
               body: JSON.stringify(applicationError
                 ? { outcome: "failed", error: applicationError }
                 : { outcome: "applied" }),
+              signal: requestTimeout === undefined ? undefined : AbortSignal.timeout(requestTimeout),
             });
           } catch (reason) {
+            if (!cellEditProjectMatches(latestProject.current?.id, projectId)) return;
             if (!isRetryablePollingError(reason)) throw reason;
           }
+          if (!cellEditProjectMatches(latestProject.current?.id, projectId)) return;
         }
 
         setJob(next);
@@ -267,11 +279,11 @@ export function App() {
         await new Promise((resolve) => window.setTimeout(resolve, 500));
       }
     } finally {
-      if (!applicationCompleted) {
+      if (!applicationCompleted && cellEditProjectMatches(latestProject.current?.id, projectId)) {
         applied?.rollback();
-        cellEditApplicationPending.current = false;
         if (applied) setDirty(false);
       }
+      cellEditApplicationPending.current = false;
     }
   };
 

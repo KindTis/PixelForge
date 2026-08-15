@@ -117,6 +117,14 @@ export function cellEditApplicationDisposition(
   return "pending";
 }
 
+export function cellEditApplicationRequestTimeout(deadline: number, now: number): number | undefined {
+  return deadline > 0 ? Math.max(0, deadline - now) : undefined;
+}
+
+export function cellEditProjectMatches(currentProjectId: string | undefined, projectId: string): boolean {
+  return currentProjectId === projectId;
+}
+
 export function completedFrameIndex(project: SpriteProject | undefined, requestedFrameId?: string, responseFrameId?: string): number {
   if (!project) throw new Error("완료된 생성 결과가 없습니다.");
   if (requestedFrameId === undefined) return 0;
