@@ -103,6 +103,7 @@ export async function writeCellEditVerdict(log: CellEditLog, attempt: number, ve
 
 export async function writeCellEditSummary(log: CellEditLog, summary: CellEditSummary): Promise<void> {
   const path = pathFor(log, "summary.json");
-  await writeFile(path.absolute, `${JSON.stringify(summary, null, 2)}\n`, "utf8");
+  const recordedSummary = { ...summary, jobId: log.jobId, files: [...log.files] };
+  await writeFile(path.absolute, `${JSON.stringify(recordedSummary, null, 2)}\n`, "utf8");
   log.files.push(path.relative);
 }

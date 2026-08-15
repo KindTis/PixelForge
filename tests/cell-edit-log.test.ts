@@ -76,17 +76,21 @@ test("단계별 셀 편집 로그가 PNG·JSON과 슬래시 상대 경로를 영
     deepStrictEqual(decodePng(await readFile(paths.compositeAbsolute)).data, candidate.composite.data);
     deepStrictEqual(decodePng(await readFile(paths.celAbsolute)).data, candidate.cel.data);
     await writeCellEditVerdict(log, 1, verdict);
+    const filesBeforeSummary = [...log.files];
     const summary: CellEditSummary = {
-      jobId,
+      jobId: "spoofed-job",
       status: "completed",
       outcome: "accepted",
       attemptCount: 1,
       acceptedAttempt: 1,
       application: "applied",
-      files: [...log.files, `${log.relativeDir}/attempt-01-verdict.json`],
+      files: ["fake/file.png", `${log.relativeDir}/attempt-01-verdict.png`],
     };
     await writeCellEditSummary(log, summary);
-    deepStrictEqual(JSON.parse(await readFile(join(log.absoluteDir, "summary.json"), "utf8")), summary);
+    const recordedSummary = JSON.parse(await readFile(join(log.absoluteDir, "summary.json"), "utf8"));
+    deepStrictEqual(recordedSummary, { ...summary, jobId, files: filesBeforeSummary });
+    strictEqual(new Set(recordedSummary.files).size, recordedSummary.files.length);
+    deepStrictEqual(log.files, [...filesBeforeSummary, `${log.relativeDir}/summary.json`]);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
