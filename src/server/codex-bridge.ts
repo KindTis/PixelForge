@@ -77,15 +77,17 @@ const CELL_EDIT_DISABLED_FEATURES = [
 ] as const;
 
 export const CELL_EDIT_APP_SERVER_ARGS = [
-  "--strict-config",
   ...CELL_EDIT_DISABLED_FEATURES.flatMap((feature) => ["--disable", feature]),
   "-c", 'developer_instructions=""',
   "-c", "project_doc_max_bytes=0",
   "-c", 'web_search="disabled"',
   "-c", "tools.web_search=false",
-  "-c", "tools.view_image=false",
-  "-c", "mcp_servers={}",
 ] as const;
+
+export function cellEditAppServerArgs(mcpServerNames: readonly string[]): string[] {
+  if (mcpServerNames.some((name) => !/^[A-Za-z0-9_-]+$/.test(name))) throw new Error(CELL_EDIT_UNAVAILABLE);
+  return [...CELL_EDIT_APP_SERVER_ARGS, ...mcpServerNames.flatMap((name) => ["-c", `mcp_servers.${name}.enabled=false`])];
+}
 
 export const CELL_EDIT_MODEL_SETTINGS = {
   model: "gpt-5.6-sol",
@@ -147,6 +149,12 @@ export class CodexBridge extends EventEmitter {
       useHostedLoginSuccessPage: true,
       appBrand: "chatgpt",
     });
+  }
+
+  async configuredMcpServerNames(): Promise<string[]> {
+    const { config } = await this.request<{ config: unknown }>("config/read", {});
+    if (!isRecord(config) || !isRecord(config.mcp_servers)) throw new Error(CELL_EDIT_UNAVAILABLE);
+    return Object.keys(config.mcp_servers);
   }
 
   async startGeneration(request: GenerationRequest): Promise<GenerationRun> {
@@ -215,16 +223,20 @@ export class CodexBridge extends EventEmitter {
     try {
       const { config } = await this.request<{ config: unknown }>("config/read", {});
       const features = isRecord(config) && isRecord(config.features) ? config.features : undefined;
+      const mcpServers = isRecord(config) && isRecord(config.mcp_servers) ? config.mcp_servers : undefined;
       if (!isRecord(config) || !features
         || CELL_EDIT_DISABLED_FEATURES.some((feature) => features[feature] !== false)
         || config.developer_instructions !== ""
         || config.project_doc_max_bytes !== 0
         || config.web_search !== "disabled"
         || !isRecord(config.tools)
-        || config.tools.web_search !== false
-        || config.tools.view_image !== false
-        || !isRecord(config.mcp_servers)
-        || Object.keys(config.mcp_servers).length > 0) throw new Error(CELL_EDIT_UNAVAILABLE);
+        || (config.tools.web_search !== false && config.tools.web_search !== null)
+        || (config.tools.view_image !== undefined && config.tools.view_image !== false)
+        || !mcpServers
+        || Object.values(mcpServers).some((server) => !isRecord(server) || server.enabled !== false)) {
+        throw new Error(CELL_EDIT_UNAVAILABLE);
+      }
+      const disabledMcpNames = new Set(Object.keys(mcpServers));
 
       const seenCursors = new Set<string>();
       let cursor: string | undefined;
@@ -234,7 +246,12 @@ export class CodexBridge extends EventEmitter {
           ...(cursor ? { cursor } : {}),
         });
         const nextCursor = page.nextCursor;
-        if (!Array.isArray(page.data) || page.data.length > 0
+        if (!Array.isArray(page.data) || page.data.some((server) => !isRecord(server)
+          || typeof server.name !== "string" || !disabledMcpNames.has(server.name)
+          || server.serverInfo !== null
+          || !isRecord(server.tools) || Object.keys(server.tools).length > 0
+          || !Array.isArray(server.resources) || server.resources.length > 0
+          || !Array.isArray(server.resourceTemplates) || server.resourceTemplates.length > 0)
           || (nextCursor !== null && (typeof nextCursor !== "string" || !nextCursor))) {
           throw new Error(CELL_EDIT_UNAVAILABLE);
         }

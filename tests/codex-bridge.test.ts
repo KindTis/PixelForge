@@ -6,6 +6,7 @@ import {
   CELL_EDIT_APP_SERVER_ARGS,
   CELL_EDIT_MODEL_SETTINGS,
   CodexBridge,
+  cellEditAppServerArgs,
   type CellEditRunRequest,
   type JsonlProcess,
   type RpcMessage,
@@ -22,7 +23,7 @@ type RestrictedConfig = {
   developer_instructions: string;
   project_doc_max_bytes: number;
   web_search: string;
-  tools: { web_search: boolean; view_image: boolean };
+  tools: { web_search: boolean | null; view_image: boolean };
   mcp_servers: Record<string, unknown>;
 };
 
@@ -220,7 +221,6 @@ test("셀 편집은 제한 설정을 검사한 뒤 도구 없는 읽기 전용 �
     "initialize", "initialized", "account/read", "config/read", "mcpServerStatus/list", "app/installed", "thread/start", "turn/start",
   ]);
   assert.deepEqual(CELL_EDIT_APP_SERVER_ARGS, [
-    "--strict-config",
     "--disable", "shell_tool",
     "--disable", "unified_exec",
     "--disable", "apps",
@@ -245,8 +245,6 @@ test("셀 편집은 제한 설정을 검사한 뒤 도구 없는 읽기 전용 �
     "-c", "project_doc_max_bytes=0",
     "-c", 'web_search="disabled"',
     "-c", "tools.web_search=false",
-    "-c", "tools.view_image=false",
-    "-c", "mcp_servers={}",
   ]);
   assert.deepEqual(process.messages.find(({ method }) => method === "config/read")?.params, {});
   assert.deepEqual(process.messages.find(({ method }) => method === "mcpServerStatus/list")?.params, { detail: "toolsAndAuthOnly" });
@@ -273,6 +271,62 @@ test("셀 편집은 제한 설정을 검사한 뒤 도구 없는 읽기 전용 �
     outputSchema: AI_EDIT_OUTPUT_SCHEMA,
   });
   assert.equal("effort" in turn.params!, false);
+});
+
+test("안정판 Codex 설정에 tools.view_image가 없어도 비활성 기능을 검사해 셀 편집을 시작한다", async () => {
+  const process = new FakeProcess();
+  const bridge = await startedBridge(process);
+  process.responder = (message) => {
+    if (message.method !== "config/read") return undefined;
+    const config = restrictedConfig();
+    delete (config.tools as Partial<RestrictedConfig["tools"]>).view_image;
+    return { id: message.id, result: { config } };
+  };
+
+  await bridge.startCellEdit(cellEditRequest);
+
+  assert.equal(process.messages.some(({ method }) => method === "thread/start"), true);
+});
+
+test("안정판 Codex의 비활성 MCP 상태와 null 웹 검색 설정으로 셀 편집을 시작한다", async () => {
+  const process = new FakeProcess();
+  const bridge = await startedBridge(process);
+  process.responder = (message) => {
+    if (message.method === "config/read") {
+      const config = restrictedConfig();
+      config.tools.web_search = null;
+      config.mcp_servers.example = { enabled: false };
+      return { id: message.id, result: { config } };
+    }
+    if (message.method === "mcpServerStatus/list") return {
+      id: message.id,
+      result: {
+        data: [{ name: "example", serverInfo: null, tools: {}, resources: [], resourceTemplates: [], authStatus: "unsupported" }],
+        nextCursor: null,
+      },
+    };
+    return undefined;
+  };
+
+  await bridge.startCellEdit(cellEditRequest);
+
+  assert.equal(process.messages.some(({ method }) => method === "thread/start"), true);
+});
+
+test("설정된 MCP를 제한 프로세스에서 비활성화하고 안전하지 않은 이름은 거부한다", async () => {
+  const process = new FakeProcess();
+  const bridge = await startedBridge(process);
+  process.responder = (message) => message.method === "config/read"
+    ? { id: message.id, result: { config: { mcp_servers: { notion: {}, node_repl: {} } } } }
+    : undefined;
+
+  const names = await bridge.configuredMcpServerNames();
+
+  assert.deepEqual(cellEditAppServerArgs(names).slice(-4), [
+    "-c", "mcp_servers.notion.enabled=false",
+    "-c", "mcp_servers.node_repl.enabled=false",
+  ]);
+  assert.throws(() => cellEditAppServerArgs(["unsafe.name"]), /셀 편집을 사용할 수 없습니다/);
 });
 
 test("셀 편집과 독립 판정은 새 스레드에서 같은 모델의 기본 추론 설정을 사용한다", async () => {
@@ -351,7 +405,7 @@ test("셀 편집 사전 검사가 불완전하거나 제한 설정이 다르면 
     configCase("웹 검색 활성", (config) => { config.web_search = "live"; }),
     configCase("도구 웹 검색 활성", (config) => { config.tools.web_search = true; }),
     configCase("이미지 보기 활성", (config) => { config.tools.view_image = true; }),
-    configCase("설정 MCP 존재", (config) => { config.mcp_servers.example = {}; }),
+    configCase("활성 MCP 설정 존재", (config) => { config.mcp_servers.example = { enabled: true }; }),
     {
       name: "설정 응답 누락",
       responder: (message: RpcMessage) => message.method === "config/read" ? { id: message.id, result: { config: {} } } : undefined,
@@ -359,7 +413,7 @@ test("셀 편집 사전 검사가 불완전하거나 제한 설정이 다르면 
     {
       name: "실행 중 MCP 존재",
       responder: (message: RpcMessage) => message.method === "mcpServerStatus/list"
-        ? { id: message.id, result: { data: [{ name: "example" }], nextCursor: null } }
+        ? { id: message.id, result: { data: [{ name: "example", serverInfo: { name: "example" }, tools: { tool: {} }, resources: [], resourceTemplates: [], authStatus: "unsupported" }], nextCursor: null } }
         : undefined,
     },
     {

@@ -1,14 +1,16 @@
 import { resolve } from "node:path";
-import { CELL_EDIT_APP_SERVER_ARGS, CodexBridge, createCodexProcess } from "./codex-bridge.ts";
+import { CodexBridge, cellEditAppServerArgs, createCodexProcess } from "./codex-bridge.ts";
 import { createPixelForgeServer } from "./app.ts";
 
 const codex = new CodexBridge();
 await codex.start().catch((error) => console.error(`Codex 연결 실패: ${error instanceof Error ? error.message : String(error)}`));
-const restrictedCodex = new CodexBridge(() => createCodexProcess(CELL_EDIT_APP_SERVER_ARGS));
-const cellEditCodex = await restrictedCodex.start().then(() => restrictedCodex, () => {
-  restrictedCodex.close();
-  return undefined;
-});
+const cellEditCodex = await codex.configuredMcpServerNames().then(async (mcpServerNames) => {
+  const restrictedCodex = new CodexBridge(() => createCodexProcess(cellEditAppServerArgs(mcpServerNames)));
+  return restrictedCodex.start().then(() => restrictedCodex, () => {
+    restrictedCodex.close();
+    return undefined;
+  });
+}, () => undefined);
 
 const server = createPixelForgeServer({
   projectsRoot: resolve("projects"),
