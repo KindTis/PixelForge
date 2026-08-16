@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, type FormEvent } from "react";
 import type { SpriteProject } from "../core/types.ts";
 import { api, cellEditApplicationDisposition, cellEditApplicationRequestTimeout, cellEditCompletionNotice, cellEditPayload, codexJobStatusTitle, completedFrameIndex, decodeProject, encodeProject, failedCodexJob, generationPayload, isRetryablePollingError, pollingErrorCodexJob, projectJobOwnershipMatches, projectLifetimeMatches, releaseProjectJobOwnership, type CellEditJob, type CodexJob, type GenerationJob, type ProjectJobOwnership, type ProjectLifetime, type Session } from "./api.ts";
 import { EditorWorkspace, type EditorWorkspaceHandle } from "./editor/EditorWorkspace.tsx";
-import { ExportDialog, type ExportResult, type ExportTarget } from "./ExportDialog.tsx";
+import { ExportDialog, type ExportResponse, type ExportResult, type ExportTarget } from "./ExportDialog.tsx";
 
 type ProjectSummary = { id: string; name: string };
 const CELL_EDIT_UNAVAILABLE = "설치된 Codex App Server에서 현재 셀 편집을 사용할 수 없습니다.";
@@ -538,21 +538,29 @@ export function App() {
     setReference(undefined);
   };
 
-  const runExport = async (target: ExportTarget, settings: SpriteProject["exportSettings"]): Promise<ExportResult> => {
+  const runExport = async (
+    target: ExportTarget,
+    settings: SpriteProject["exportSettings"],
+  ): Promise<ExportResult | undefined> => {
     if (!session || !project) throw new Error("프로젝트를 먼저 여세요.");
     const lifetime = projectLifetime.current;
     if (!lifetime) throw new Error("프로젝트를 먼저 여세요.");
     const exporting = project;
     const current = () => latestProject.current === exporting && projectLifetimeMatches(projectLifetime.current, lifetime);
-    const next = { ...project, exportSettings: settings };
-    await api(`/api/projects/${project.id}`, session.token, { method: "PUT", body: JSON.stringify(encodeProject(next)) });
-    if (!current()) throw new Error("프로젝트가 변경되어 내보내기를 중단했습니다.");
-    const result = await api<ExportResult>("/api/exports", session.token, { method: "POST", body: JSON.stringify({ projectId: project.id, target, options: settings }) });
-    if (current()) {
-      setCurrentProject(next);
-      setDirty(false);
-    }
-    return result;
+    const response = await api<ExportResponse>("/api/exports", session.token, {
+      method: "POST",
+      body: JSON.stringify({
+        projectId: project.id,
+        project: encodeProject(project),
+        target,
+        options: settings,
+      }),
+    });
+    if (response.status === "cancelled") return undefined;
+    if (!current()) throw new Error("프로젝트가 변경되어 내보내기 결과를 반영하지 않았습니다.");
+    setCurrentProject({ ...project, exportSettings: settings });
+    setDirty(false);
+    return response;
   };
 
   if (!session) return <main className="loading-screen"><span className="brand-mark">PF</span><p>{error || "작업실을 여는 중…"}</p></main>;
