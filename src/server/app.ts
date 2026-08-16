@@ -1,7 +1,7 @@
 import { randomBytes, randomUUID } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { copyFile, mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
-import { extname, join, resolve } from "node:path";
+import { extname, isAbsolute, join, resolve } from "node:path";
 import {
   AI_EDIT_OUTPUT_SCHEMA,
   AI_EDIT_VERDICT_OUTPUT_SCHEMA,
@@ -42,6 +42,7 @@ import { createProject, loadProject, resolveInside, saveProject } from "./projec
 import { decodePng, encodePng } from "./png.ts";
 import { exportProject, type ExportOptions, type ExportTarget } from "./exporters/index.ts";
 import { activeCelFrame, buildAiEditPrompt, buildAiEditVerdictPrompt, validateAiEditRequest } from "./ai-edit.ts";
+import { windowsExportDialogs, type ExportDialogs } from "./windows-export-dialogs.ts";
 
 type CodexClient = Pick<CodexBridge, "getAccount" | "login" | "startGeneration" | "startCellEdit" | "startCellEditJudgment" | "interrupt" | "respond"> & {
   on(event: "event", listener: (event: CodexEvent) => void): unknown;
@@ -107,6 +108,7 @@ export type ServerOptions = {
   staticRoot?: string;
   cellEditApplicationTimeoutMs?: number;
   cellEditLogWriteBarrier?: (kind: "initial" | "attempt" | "verdict" | "summary") => Promise<void>;
+  exportDialogs?: ExportDialogs;
 };
 
 function send(response: ServerResponse, status: number, body: unknown): void {
@@ -200,6 +202,15 @@ function parseExportOptions(value: unknown): ExportOptions {
   return options as ExportOptions;
 }
 
+async function directoryHasEntries(path: string): Promise<boolean> {
+  try {
+    return (await readdir(path)).length > 0;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    throw error;
+  }
+}
+
 export function createPixelForgeServer({
   projectsRoot,
   codex,
@@ -207,6 +218,7 @@ export function createPixelForgeServer({
   staticRoot,
   cellEditApplicationTimeoutMs = 60_000,
   cellEditLogWriteBarrier,
+  exportDialogs = windowsExportDialogs,
 }: ServerOptions) {
   const token = randomBytes(24).toString("base64url");
   const jobs = new Map<string, Job>();
@@ -214,6 +226,7 @@ export function createPixelForgeServer({
   const earlyEvents = new Map<CodexClient, Map<string, CodexEvent[]>>();
   const ignoredRuns = new Map<CodexClient, Set<string>>();
   const projectLocks = new Map<string, string>();
+  const exportDialogControllers = new Set<AbortController>();
   const runDirectories = new Set<string>();
   let closing = false;
 
@@ -843,21 +856,48 @@ export function createPixelForgeServer({
       }
 
       if (request.method === "POST" && url.pathname === "/api/exports") {
-        const input = await body(request) as { projectId?: unknown; target?: unknown; options?: unknown };
+        const input = await body(request) as { projectId?: unknown; project?: unknown; target?: unknown; options?: unknown };
         const projectId = safeProjectId(String(input.projectId ?? ""));
         const target = String(input.target ?? "") as ExportTarget;
         if (!(["common", "godot", "unity"] as string[]).includes(target)) throw new Error("지원하지 않는 내보내기 대상입니다.");
         const operationId = randomUUID();
         if (!lockProject(projectId, operationId)) return send(response, 409, { error: "프로젝트가 다른 작업에서 사용 중입니다." });
+
+        const controller = new AbortController();
+        const abortDisconnectedDialog = () => {
+          if (!response.writableEnded) controller.abort(new Error("내보내기 요청 연결이 종료되었습니다."));
+        };
+        exportDialogControllers.add(controller);
+        response.once("close", abortDisconnectedDialog);
+
         try {
           const root = resolveInside(projectsRoot, projectId);
-          const project = await loadProject(root);
+          await loadProject(root);
+          const project = projectFromWire(input.project);
+          if (project.id !== projectId) throw new Error("내보낼 프로젝트가 현재 프로젝트와 다릅니다.");
           const options = parseExportOptions(input.options);
-          const result = await exportProject(target, project.document, options, resolveInside(root, "exports"));
+          const selectedFolder = await exportDialogs.selectFolder(controller.signal);
+          if (!selectedFolder) return send(response, 200, { status: "cancelled" });
+          if (!isAbsolute(selectedFolder)) throw new Error("선택한 내보내기 경로가 절대 경로가 아닙니다.");
+
+          const outputRoot = resolve(selectedFolder);
+          const outputPath = resolve(outputRoot, target);
+          if (await directoryHasEntries(outputPath)
+            && !(await exportDialogs.confirmReplace(outputPath, controller.signal))) {
+            return send(response, 200, { status: "cancelled" });
+          }
+
           project.exportSettings = options;
-          await saveProject(root, project);
-          return send(response, 201, result);
+          const result = await exportProject(target, project.document, options, outputRoot, {
+            commit: () => saveProject(root, project),
+          });
+          return send(response, 201, { status: "completed", ...result });
+        } catch (error) {
+          if (controller.signal.aborted && response.destroyed) return;
+          throw error;
         } finally {
+          response.off("close", abortDisconnectedDialog);
+          exportDialogControllers.delete(controller);
           unlockProject(projectId, operationId);
         }
       }
@@ -1080,6 +1120,9 @@ export function createPixelForgeServer({
   const beginServerClose = () => {
     if (closing) return;
     closing = true;
+    for (const controller of exportDialogControllers) {
+      controller.abort(new Error("서버가 종료되어 내보내기 대화상자를 닫았습니다."));
+    }
     for (const job of jobs.values()) {
       if (job.kind === "cellEdit" && !isTerminal(job.status) && !job.terminalDecision) {
         void failCellJob(job, "서버가 종료되어 셀 편집을 중단했습니다.");

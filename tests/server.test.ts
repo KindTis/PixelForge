@@ -24,6 +24,7 @@ import { createPixelForgeServer } from "../src/server/app.ts";
 import { activeCelFrame } from "../src/server/ai-edit.ts";
 import { decodePng, encodePng } from "../src/server/png.ts";
 import { createProject, loadProject, saveProject } from "../src/server/project-store.ts";
+import type { ExportDialogs } from "../src/server/windows-export-dialogs.ts";
 
 class FakeCodex extends EventEmitter {
   lastPrompt = "";
@@ -174,10 +175,11 @@ async function startGenerationServer(
   codex: FakeCodex,
   cellEditCodex: FakeCodex = codex,
   cellEditApplicationTimeoutMs?: number,
+  exportDialogs?: ExportDialogs,
 ) {
   const codexListeners = codex.listenerCount("event");
   const cellEditListeners = cellEditCodex.listenerCount("event");
-  const server = createPixelForgeServer({ projectsRoot: root, codex, cellEditCodex, cellEditApplicationTimeoutMs });
+  const server = createPixelForgeServer({ projectsRoot: root, codex, cellEditCodex, cellEditApplicationTimeoutMs, exportDialogs });
   assert.equal(codex.listenerCount("event"), codexListeners + 1);
   if (cellEditCodex !== codex) assert.equal(cellEditCodex.listenerCount("event"), cellEditListeners + 1);
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
@@ -214,6 +216,24 @@ async function waitUntil(condition: () => boolean, message: string): Promise<voi
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   throw new Error(message);
+}
+
+const exportOptions = {
+  columns: 2,
+  padding: 0,
+  margin: 0,
+  trim: false,
+  pixelsPerUnit: 100,
+  pivot: { x: 0.5, y: 0.5 },
+};
+
+function requestExport(base: string, token: string, project: unknown, signal?: AbortSignal) {
+  return fetch(`${base}/api/exports`, {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-pixelforge-token": token },
+    body: JSON.stringify({ projectId: (project as { id: string }).id, project, target: "common", options: exportOptions }),
+    signal,
+  });
 }
 
 const passingCriteria = AI_EDIT_CRITERIA.map((id) => ({ id, passed: true, reason: "충족" }));
@@ -530,7 +550,12 @@ test("로컬 API는 세션 토큰으로 프로젝트 생성과 Codex 결과 가�
   await mkdir(staticRoot);
   await writeFile(join(staticRoot, "index.html"), "<!doctype html><title>PixelForge Smoke</title>");
   const codex = new FakeCodex();
-  const server = createPixelForgeServer({ projectsRoot: root, codex, staticRoot });
+  const selectedExportRoot = join(root, "selected-export");
+  const exportDialogs: ExportDialogs = {
+    selectFolder: async () => selectedExportRoot,
+    confirmReplace: async () => true,
+  };
+  const server = createPixelForgeServer({ projectsRoot: root, codex, staticRoot, exportDialogs });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
 
@@ -584,14 +609,17 @@ test("로컬 API는 세션 토큰으로 프로젝트 생성과 Codex 결과 가�
       headers: { "content-type": "application/json", "x-pixelforge-token": session.token },
       body: JSON.stringify({
         projectId: project.id,
+        project,
         target: "common",
-        options: { columns: 2, padding: 0, margin: 0, trim: false, pixelsPerUnit: 100, pivot: { x: 0.5, y: 0.5 } },
+        options: exportOptions,
       }),
     });
     assert.equal(exportResponse.status, 201);
-    const exported = await exportResponse.json() as { outputPath: string; files: string[] };
+    const exported = await exportResponse.json() as { status: string; outputPath: string; files: string[] };
+    assert.equal(exported.status, "completed");
+    assert.equal(exported.outputPath, join(selectedExportRoot, "common"));
     assert.deepEqual(exported.files, ["spritesheet.png", "spritesheet.json"]);
-    assert.equal(JSON.parse(await readFile(join(root, project.id, "exports", "common", "spritesheet.json"), "utf8")).meta.app, "PixelForge");
+    assert.equal(JSON.parse(await readFile(join(selectedExportRoot, "common", "spritesheet.json"), "utf8")).meta.app, "PixelForge");
 
     const generationResponse = await fetch(`${base}/api/generations`, {
       method: "POST",
@@ -721,6 +749,227 @@ test("로컬 API는 세션 토큰으로 프로젝트 생성과 Codex 결과 가�
     assert.equal(disconnected.error, "Codex 연결 종료");
   } finally {
     await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("내보내기 폴더 취소와 교체 거절은 아무것도 저장하지 않고 성공만 선택 경로에 반영한다", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pixelforge-export-api-"));
+  const destination = join(root, "chosen");
+  let selection: string | undefined;
+  let replace = false;
+  const confirmedPaths: string[] = [];
+  const exportDialogs: ExportDialogs = {
+    selectFolder: async () => selection,
+    confirmReplace: async (outputPath) => {
+      confirmedPaths.push(outputPath);
+      return replace;
+    },
+  };
+  const fixture = await startGenerationServer(root, new FakeCodex(), undefined, undefined, exportDialogs);
+
+  try {
+    const created = await fetch(`${fixture.base}/api/projects`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-pixelforge-token": fixture.token },
+      body: JSON.stringify({ name: "기사", width: 1, height: 1 }),
+    }).then((response) => response.json()) as { id: string; exportSettings: { columns: number } };
+    const manifestPath = join(root, created.id, "pixelforge.json");
+    const originalManifest = await readFile(manifestPath, "utf8");
+
+    const cancelled = await requestExport(fixture.base, fixture.token, created);
+    assert.equal(cancelled.status, 200);
+    assert.deepEqual(await cancelled.json(), { status: "cancelled" });
+    assert.equal(await readFile(manifestPath, "utf8"), originalManifest);
+    assert.equal(await readdir(root).then((entries) => entries.includes("chosen")), false);
+
+    selection = destination;
+    await mkdir(join(destination, "common"), { recursive: true });
+    await writeFile(join(destination, "common", "old.txt"), "보존");
+    await writeFile(join(destination, "keep.txt"), "형제 보존");
+
+    const declined = await requestExport(fixture.base, fixture.token, created);
+    assert.equal(declined.status, 200);
+    assert.deepEqual(await declined.json(), { status: "cancelled" });
+    assert.deepEqual(confirmedPaths, [join(destination, "common")]);
+    assert.equal(await readFile(join(destination, "common", "old.txt"), "utf8"), "보존");
+    assert.equal(await readFile(manifestPath, "utf8"), originalManifest);
+
+    replace = true;
+    const completed = await requestExport(fixture.base, fixture.token, created);
+    assert.equal(completed.status, 201);
+    assert.deepEqual(await completed.json(), {
+      status: "completed",
+      outputPath: join(destination, "common"),
+      files: ["spritesheet.png", "spritesheet.json"],
+    });
+    await assert.rejects(readFile(join(destination, "common", "old.txt"), "utf8"), /ENOENT/);
+    assert.equal(await readFile(join(destination, "keep.txt"), "utf8"), "형제 보존");
+    const savedSource = await readFile(manifestPath, "utf8");
+    const saved = JSON.parse(savedSource) as { exportSettings: { columns: number } };
+    assert.equal(saved.exportSettings.columns, 2);
+    assert.equal(savedSource.includes(destination), false);
+  } finally {
+    await new Promise<void>((resolve, reject) => fixture.server.close((error) => error ? reject(error) : resolve()));
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("내보내기 폴더의 대상이 없거나 비어 있으면 교체 확인을 생략한다", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pixelforge-export-empty-"));
+  const withoutTarget = join(root, "without-target");
+  const withEmptyTarget = join(root, "with-empty-target");
+  let selection = withoutTarget;
+  let confirmations = 0;
+  const exportDialogs: ExportDialogs = {
+    selectFolder: async () => selection,
+    confirmReplace: async () => {
+      confirmations += 1;
+      return true;
+    },
+  };
+  const fixture = await startGenerationServer(root, new FakeCodex(), undefined, undefined, exportDialogs);
+
+  try {
+    const project = await fetch(`${fixture.base}/api/projects`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-pixelforge-token": fixture.token },
+      body: JSON.stringify({ name: "기사", width: 1, height: 1 }),
+    }).then((response) => response.json()) as { id: string };
+    await mkdir(withoutTarget);
+    const withoutTargetResponse = await requestExport(fixture.base, fixture.token, project);
+    assert.equal(withoutTargetResponse.status, 201);
+    assert.equal(((await withoutTargetResponse.json()) as { outputPath: string }).outputPath, join(withoutTarget, "common"));
+
+    selection = withEmptyTarget;
+    await mkdir(join(withEmptyTarget, "common"), { recursive: true });
+    const emptyTargetResponse = await requestExport(fixture.base, fixture.token, project);
+    assert.equal(emptyTargetResponse.status, 201);
+    assert.equal(((await emptyTargetResponse.json()) as { outputPath: string }).outputPath, join(withEmptyTarget, "common"));
+    assert.equal(confirmations, 0);
+  } finally {
+    await new Promise<void>((resolve, reject) => fixture.server.close((error) => error ? reject(error) : resolve()));
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("폴더 선택 중인 프로젝트는 중복 내보내기를 거부한다", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pixelforge-export-lock-"));
+  let releaseSelection!: (value: string | undefined) => void;
+  let pickerStarted = false;
+  const exportDialogs: ExportDialogs = {
+    selectFolder: async () => {
+      pickerStarted = true;
+      return await new Promise<string | undefined>((resolve) => { releaseSelection = resolve; });
+    },
+    confirmReplace: async () => true,
+  };
+  const fixture = await startGenerationServer(root, new FakeCodex(), undefined, undefined, exportDialogs);
+
+  try {
+    const project = await fetch(`${fixture.base}/api/projects`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-pixelforge-token": fixture.token },
+      body: JSON.stringify({ name: "기사", width: 1, height: 1 }),
+    }).then((response) => response.json()) as { id: string };
+    const first = requestExport(fixture.base, fixture.token, project);
+    await waitUntil(() => pickerStarted, "폴더 선택이 시작되지 않았습니다.");
+
+    const duplicate = await requestExport(fixture.base, fixture.token, project);
+    assert.equal(duplicate.status, 409);
+    assert.deepEqual(await duplicate.json(), { error: "프로젝트가 다른 작업에서 사용 중입니다." });
+
+    releaseSelection(undefined);
+    const cancelled = await first;
+    assert.equal(cancelled.status, 200);
+    assert.deepEqual(await cancelled.json(), { status: "cancelled" });
+  } finally {
+    await new Promise<void>((resolve, reject) => fixture.server.close((error) => error ? reject(error) : resolve()));
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("내보내기 폴더 요청의 HTTP 연결 종료는 대화상자를 중단하고 잠금을 해제한다", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pixelforge-export-disconnect-"));
+  let pickerStarted = false;
+  let aborted = false;
+  let selectionCalls = 0;
+  const exportDialogs: ExportDialogs = {
+    selectFolder: (signal) => {
+      selectionCalls += 1;
+      if (selectionCalls > 1) return Promise.resolve(undefined);
+      pickerStarted = true;
+      return new Promise((_resolve, reject) => {
+        signal.addEventListener("abort", () => {
+          aborted = true;
+          reject(signal.reason);
+        }, { once: true });
+      });
+    },
+    confirmReplace: async () => true,
+  };
+  const fixture = await startGenerationServer(root, new FakeCodex(), undefined, undefined, exportDialogs);
+
+  try {
+    const project = await fetch(`${fixture.base}/api/projects`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-pixelforge-token": fixture.token },
+      body: JSON.stringify({ name: "기사", width: 1, height: 1 }),
+    }).then((response) => response.json()) as { id: string };
+    const controller = new AbortController();
+    const disconnected = requestExport(fixture.base, fixture.token, project, controller.signal);
+    await waitUntil(() => pickerStarted, "폴더 선택이 시작되지 않았습니다.");
+    controller.abort();
+    await assert.rejects(disconnected, /abort/i);
+    await waitUntil(() => aborted, "연결 종료가 대화상자에 전달되지 않았습니다.");
+
+    let retry: Response | undefined;
+    for (let count = 0; count < 50; count += 1) {
+      retry = await requestExport(fixture.base, fixture.token, project);
+      if (retry.status !== 409) break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(retry?.status, 200);
+    assert.deepEqual(await retry?.json(), { status: "cancelled" });
+  } finally {
+    await new Promise<void>((resolve, reject) => fixture.server.close((error) => error ? reject(error) : resolve()));
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("서버 종료는 열린 Windows 대화상자 요청을 중단한다", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pixelforge-export-close-"));
+  let aborted = false;
+  let pickerStarted = false;
+  const exportDialogs: ExportDialogs = {
+    selectFolder: (signal) => new Promise((_resolve, reject) => {
+      pickerStarted = true;
+      signal.addEventListener("abort", () => {
+        aborted = true;
+        reject(signal.reason);
+      }, { once: true });
+    }),
+    confirmReplace: async () => true,
+  };
+  const fixture = await startGenerationServer(root, new FakeCodex(), undefined, undefined, exportDialogs);
+
+  try {
+    const project = await fetch(`${fixture.base}/api/projects`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-pixelforge-token": fixture.token },
+      body: JSON.stringify({ name: "기사", width: 1, height: 1 }),
+    }).then((response) => response.json()) as { id: string };
+    const pendingRequest = requestExport(fixture.base, fixture.token, project);
+    await waitUntil(() => pickerStarted, "폴더 선택이 시작되지 않았습니다.");
+    const closing = new Promise<void>((resolve, reject) => {
+      fixture.server.close((error) => error ? reject(error) : resolve());
+    });
+    await Promise.allSettled([pendingRequest, closing]);
+    assert.equal(aborted, true);
+  } finally {
+    if (fixture.server.listening) {
+      await new Promise<void>((resolve, reject) => fixture.server.close((error) => error ? reject(error) : resolve()));
+    }
     await rm(root, { recursive: true, force: true });
   }
 });
