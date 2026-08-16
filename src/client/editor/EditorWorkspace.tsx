@@ -1,6 +1,6 @@
 import { forwardRef, useEffect, useImperativeHandle, useRef, useState, type PointerEvent as ReactPointerEvent, type ReactNode, type WheelEvent } from "react";
 import type { AiEditReadyResult, AiEditRequest, AiEditTarget } from "../../core/ai-edit.ts";
-import { History, type EditCommand, type PixelChange } from "../../core/commands.ts";
+import { applyCommand, History, type EditCommand, type PixelChange } from "../../core/commands.ts";
 import { compositeFrame } from "../../core/render.ts";
 import { convertDocumentToIndexed, indexedToRgba, nearestPaletteColor, quantizeToPalette, replaceColor, sameColor } from "../../core/palette.ts";
 import { extractSelection, flipSelection, moveSelection, pasteSelection, rectangleMask, rotateSelection, scaleSelectionNearest, type SelectionContent } from "../../core/selection.ts";
@@ -243,16 +243,21 @@ export const EditorWorkspace = forwardRef<EditorWorkspaceHandle, {
     };
   };
 
-  useEffect(() => {
+  const render = (document = project.document) => {
     const element = canvas.current;
     if (!element) return;
-    const render = () => new CanvasRenderer(element).render(project.document, view(), {
+    new CanvasRenderer(element).render(document, view(), {
       selection: image && cel ? selectionOverlay(selection, image, cel, project.document) : undefined,
       mirrorX,
       mirrorY,
     });
+  };
+
+  useEffect(() => {
+    const element = canvas.current;
+    if (!element) return;
     render();
-    const observer = new ResizeObserver(render);
+    const observer = new ResizeObserver(() => render());
     observer.observe(element);
     return () => observer.disconnect();
   }, [project, frameIndex, zoom, grid, onion, tilePreview, panOffset, selection, mirrorX, mirrorY]);
@@ -293,7 +298,8 @@ export const EditorWorkspace = forwardRef<EditorWorkspaceHandle, {
     }
     const current = point(event);
     setCoordinate(current);
-    if (!readOnly) controller.current?.pointerMove(current);
+    const result = readOnly ? undefined : controller.current?.pointerMove(current);
+    if (result?.command && !activeLayer?.locked) render(applyCommand(project.document, result.command));
   };
 
   const pointerUp = (event: ReactPointerEvent<HTMLCanvasElement>) => {
@@ -475,7 +481,7 @@ export const EditorWorkspace = forwardRef<EditorWorkspaceHandle, {
           <div><label><input type="checkbox" checked={onion} onChange={(event) => setOnion(event.target.checked)} /> 어니언</label><label><input type="checkbox" checked={tilePreview} onChange={(event) => setTilePreview(event.target.checked)} /> 타일</label><label><input type="checkbox" checked={grid} onChange={(event) => setGrid(event.target.checked)} /> 격자</label><button type="button" onClick={() => setZoom((value) => Math.max(1, value - 1))}>−</button><b>{zoom}×</b><button type="button" onClick={() => setZoom((value) => Math.min(32, value + 1))}>+</button></div>
         </div>
         <div className="editor-canvas-wrap">
-          <canvas ref={canvas} className="editor-canvas" aria-label="픽셀을 그리는 캔버스" onPointerDown={pointerDown} onPointerMove={pointerMove} onPointerUp={pointerUp} onPointerCancel={() => { controller.current = undefined; panDrag.current = undefined; }} onWheel={(event: WheelEvent<HTMLCanvasElement>) => { event.preventDefault(); setZoom((value) => Math.max(1, Math.min(32, value + (event.deltaY < 0 ? 1 : -1)))); }} />
+          <canvas ref={canvas} className="editor-canvas" aria-label="픽셀을 그리는 캔버스" onPointerDown={pointerDown} onPointerMove={pointerMove} onPointerUp={pointerUp} onPointerCancel={() => { controller.current = undefined; panDrag.current = undefined; render(); }} onWheel={(event: WheelEvent<HTMLCanvasElement>) => { event.preventDefault(); setZoom((value) => Math.max(1, Math.min(32, value + (event.deltaY < 0 ? 1 : -1)))); }} />
         </div>
         <div className="playback">
           <button type="button" disabled={readOnly} onClick={() => onFrameIndex(0)} aria-label="처음 프레임">|◀</button>

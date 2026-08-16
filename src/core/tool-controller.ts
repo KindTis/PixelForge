@@ -59,21 +59,26 @@ export class ToolController {
     this.path = [this.start];
   }
 
-  pointerMove(point: Point): void {
-    if (!this.last) return;
+  pointerMove(point: Point): ToolResult {
+    if (!this.last) return {};
     const current = { x: Math.round(point.x), y: Math.round(point.y) };
     this.path.push(...line(this.last, current));
     this.last = current;
+    return this.result(current);
   }
 
   pointerUp(point: Point): ToolResult {
     if (!this.start) return {};
     const end = { x: Math.round(point.x), y: Math.round(point.y) };
-    const start = this.start;
-    this.pointerMove(end);
+    const result = this.pointerMove(end);
     this.start = undefined;
     this.last = undefined;
+    return result;
+  }
 
+  private result(end: Point): ToolResult {
+    if (!this.start) return {};
+    const start = this.start;
     if (this.settings.tool === "eyedropper") {
       if (end.x < 0 || end.y < 0 || end.x >= this.image.width || end.y >= this.image.height) return {};
       const offset = (end.y * this.image.width + end.x) * 4;

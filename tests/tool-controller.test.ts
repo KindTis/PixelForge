@@ -19,6 +19,24 @@ test("연필 드래그는 끊김 없는 한 픽셀 명령을 반환한다", () =
   ]);
 });
 
+test("직선 드래그는 놓기 전에 프리뷰 명령을 반환한다", () => {
+  const controller = new ToolController({ tool: "line", celId: "cel", color: [255, 0, 0, 255], brushSize: 1 }, blank);
+  controller.pointerDown({ x: 0, y: 0 });
+  const preview = controller.pointerMove({ x: 3, y: 3 });
+  assert.deepEqual(preview, {
+    command: {
+      type: "setPixels",
+      celId: "cel",
+      pixels: [
+        { x: 0, y: 0, rgba: [255, 0, 0, 255] },
+        { x: 1, y: 1, rgba: [255, 0, 0, 255] },
+        { x: 2, y: 2, rgba: [255, 0, 0, 255] },
+        { x: 3, y: 3, rgba: [255, 0, 0, 255] },
+      ],
+    },
+  });
+});
+
 test("채우기, 스포이드와 선택 도구가 각 결과를 반환한다", () => {
   const fill = new ToolController({ tool: "fill", celId: "cel", color: [1, 2, 3, 255], brushSize: 1 }, blank);
   fill.pointerDown({ x: 0, y: 0 });
