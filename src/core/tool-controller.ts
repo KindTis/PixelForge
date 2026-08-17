@@ -74,20 +74,70 @@ function stamp(points: Point[], settings: Pick<ToolSettings, "brushSize" | "brus
     : stampBrush(centers, settings.brushSize, settings.brushShape);
 }
 
-// ponytail: 포인터 이동마다 정확한 합집합을 직접 계산한다. 지연이 실측되면 설정별 상대 오프셋을 캐시한다.
-function reachableSprayCenters(center: Point, radius: number): Point[] {
+type SprayReachability = { minX: number; minYByX: Int32Array; maxYByX: Int32Array };
+
+// ponytail: 중심 객체×브러시 픽셀을 만들지 않고 열별 구간으로 압축한다. 더 빠른 캐시는 실측될 때만 검토한다.
+function reachableSprayColumns(center: Point, radius: number): SprayReachability {
   const extent = Math.ceil(radius + 0.5);
-  const points: Point[] = [];
+  const width = extent * 2 + 1;
+  const minYByX = new Int32Array(width).fill(2 ** 31 - 1);
+  const maxYByX = new Int32Array(width).fill(-(2 ** 31));
   for (let y = -extent; y <= extent; y += 1) {
     for (let x = -extent; x <= extent; x += 1) {
       const nearestX = Math.max(0, Math.abs(x) - 0.5);
       const nearestY = Math.max(0, Math.abs(y) - 0.5);
       if (nearestX * nearestX + nearestY * nearestY <= radius * radius) {
-        points.push({ x: center.x + x, y: center.y + y });
+        const column = x + extent;
+        minYByX[column] = Math.min(minYByX[column], center.y + y);
+        maxYByX[column] = Math.max(maxYByX[column], center.y + y);
       }
     }
   }
-  return points;
+  return { minX: center.x - extent, minYByX, maxYByX };
+}
+
+function reachableSprayColumn(
+  reachability: SprayReachability,
+  x: number,
+  minY: number,
+  maxY: number,
+): boolean {
+  const column = x - reachability.minX;
+  if (column < 0 || column >= reachability.minYByX.length) return false;
+  return reachability.minYByX[column] <= maxY && reachability.maxYByX[column] >= minY;
+}
+
+function sprayStampContains(
+  x: number,
+  y: number,
+  settings: Pick<ToolSettings, "brushSize" | "brushShape" | "customBrush">,
+  reachability: SprayReachability,
+): boolean {
+  if (settings.customBrush?.length) {
+    for (const offset of settings.customBrush) {
+      if (reachableSprayColumn(reachability, x - offset.x, y - offset.y, y - offset.y)) return true;
+    }
+    return false;
+  }
+
+  const diameter = Math.max(1, Math.round(settings.brushSize));
+  const before = Math.floor((diameter - 1) / 2);
+  const after = diameter - before - 1;
+  if (settings.brushShape !== "circle") {
+    for (let offsetX = -before; offsetX <= after; offsetX += 1) {
+      if (reachableSprayColumn(reachability, x - offsetX, y - after, y + before)) return true;
+    }
+    return false;
+  }
+
+  const radiusSquared = ((diameter - 1) / 2) ** 2;
+  for (let offsetX = -before; offsetX <= after; offsetX += 1) {
+    const remaining = radiusSquared - offsetX ** 2;
+    if (remaining < 0) continue;
+    const offsetY = Math.floor(Math.sqrt(remaining));
+    if (reachableSprayColumn(reachability, x - offsetX, y - offsetY, y + offsetY)) return true;
+  }
+  return false;
 }
 
 export function toolCursorOverlay(
@@ -113,15 +163,36 @@ export function toolCursorOverlay(
 
   if (!STAMP_TOOLS.has(settings.tool)) return { pixels: [] };
   const radius = Math.max(1, settings.brushSize * 2);
-  const centers = settings.tool === "spray" ? reachableSprayCenters(localPoint, radius) : [localPoint];
-  const localPixels = mirror(stamp(centers, settings), image.width, image.height, Boolean(settings.mirrorX), Boolean(settings.mirrorY));
-  const pixels = unique(localPixels)
-    .filter((candidate) => {
-      if (!inImage(candidate)) return false;
-      if (settings.selection && !settings.selection[candidate.y * image.width + candidate.x]) return false;
-      return inDocument({ x: candidate.x + bounds.celX, y: candidate.y + bounds.celY });
-    })
-    .map(({ x, y }) => ({ x: x + bounds.celX, y: y + bounds.celY }));
+  const minX = Math.max(0, -bounds.celX);
+  const maxX = Math.min(image.width, bounds.documentWidth - bounds.celX);
+  const minY = Math.max(0, -bounds.celY);
+  const maxY = Math.min(image.height, bounds.documentHeight - bounds.celY);
+  const pixels: Point[] = [];
+  if (minX < maxX && minY < maxY) {
+    if (settings.tool === "spray") {
+      const reachability = reachableSprayColumns(localPoint, radius);
+      const stamped = (x: number, y: number) => sprayStampContains(x, y, settings, reachability);
+      for (let y = minY; y < maxY; y += 1) {
+        for (let x = minX; x < maxX; x += 1) {
+          if (settings.selection && !settings.selection[y * image.width + x]) continue;
+          if (!stamped(x, y)
+            && (!settings.mirrorX || !stamped(image.width - x - 1, y))
+            && (!settings.mirrorY || !stamped(x, image.height - y - 1))
+            && (!(settings.mirrorX && settings.mirrorY) || !stamped(image.width - x - 1, image.height - y - 1))) continue;
+          pixels.push({ x: x + bounds.celX, y: y + bounds.celY });
+        }
+      }
+    } else {
+      const localPixels = mirror(stamp([localPoint], settings), image.width, image.height, Boolean(settings.mirrorX), Boolean(settings.mirrorY));
+      pixels.push(...unique(localPixels)
+        .filter((candidate) => {
+          if (!inImage(candidate)) return false;
+          if (settings.selection && !settings.selection[candidate.y * image.width + candidate.x]) return false;
+          return inDocument({ x: candidate.x + bounds.celX, y: candidate.y + bounds.celY });
+        })
+        .map(({ x, y }) => ({ x: x + bounds.celX, y: y + bounds.celY })));
+    }
+  }
 
   return {
     pixels,

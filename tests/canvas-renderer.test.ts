@@ -59,12 +59,15 @@ test("문서 밖은 작업 영역 배경으로 가리고 문서 경계를 그린
 test("도구 커서 외곽선과 셀 대칭축을 확대·이동 좌표에 그린다", () => {
   const strokeRects: Array<{ args: number[]; style: string; width: number }> = [];
   const segments: number[][] = [];
+  const transforms: number[][] = [];
+  let saves = 0;
+  let restores = 0;
   let start: number[] = [];
   const context = {
     strokeStyle: "",
     lineWidth: 1,
-    setTransform() {}, clearRect() {}, fillRect() {}, drawImage() {}, putImageData() {},
-    setLineDash() {}, save() {}, restore() {}, beginPath() {}, stroke() {},
+    setTransform(...args: number[]) { transforms.push(args); }, clearRect() {}, fillRect() {}, drawImage() {}, putImageData() {},
+    setLineDash() {}, save() { saves += 1; }, restore() { restores += 1; }, beginPath() {}, stroke() {},
     moveTo(x: number, y: number) { start = [x, y]; },
     lineTo(x: number, y: number) { segments.push([...start, x, y]); },
     strokeRect(this: { strokeStyle: string; lineWidth: number }, ...args: number[]) {
@@ -79,7 +82,7 @@ test("도구 커서 외곽선과 셀 대칭축을 확대·이동 좌표에 그�
   const previousDocument = globalThis.document;
   const previousImageData = globalThis.ImageData;
   Object.assign(globalThis, {
-    window: { devicePixelRatio: 1 },
+    window: { devicePixelRatio: 2 },
     document: { createElement: () => ({ width: 0, height: 0, getContext: () => context }) },
     ImageData: class {},
   });
@@ -105,6 +108,11 @@ test("도구 커서 외곽선과 셀 대칭축을 확대·이동 좌표에 그�
       { args: [18.5, 36.5, 7, 7], style: "#fff", width: 1 },
     ]);
     assert.deepEqual(segments, [[26, 20, 26, 52], [10, 32, 42, 32]]);
+    assert.deepEqual(transforms, [[2, 0, 0, 2, 0, 0]]);
+    assert.equal(canvas.width, 160);
+    assert.equal(canvas.height, 160);
+    assert.equal(saves, 2);
+    assert.equal(restores, 2);
   } finally {
     Object.assign(globalThis, {
       window: previousWindow,

@@ -156,3 +156,25 @@ test("도장 중심이 문서 밖이어도 편집 가능한 교집합과 셀 축
   assert.equal(overlay.mirrorAxisX, 2);
   assert.equal(overlay.mirrorAxisY, 1);
 });
+
+test("최대 스프레이는 최종 버퍼 크기에 가까운 작업량으로 범위를 계산한다", () => {
+  const image = { width: 2, height: 2, data: new Uint8ClampedArray(2 * 2 * 4) };
+  const settings: ToolCursorSettings = { tool: "spray", brushSize: 32, brushShape: "square" };
+  const bounds = { documentWidth: 2, documentHeight: 2, celX: 0, celY: 0 };
+  const originalFlatMap = Array.prototype.flatMap as (...args: any[]) => any;
+  let callbackCalls = 0;
+  Array.prototype.flatMap = function (this: unknown[], callback: (...args: any[]) => unknown, ...args: any[]) {
+    return originalFlatMap.call(this, (value: unknown, index: number, array: unknown[]) => {
+      callbackCalls += 1;
+      return callback(value, index, array);
+    }, ...args);
+  } as typeof Array.prototype.flatMap;
+
+  try {
+    const overlay = toolCursorOverlay({ x: 0, y: 0 }, settings, image, bounds);
+    assert.deepEqual(overlay.pixels.map(({ x, y }) => `${x},${y}`).sort(), ["0,0", "0,1", "1,0", "1,1"]);
+    assert.ok(callbackCalls <= image.width * image.height * 4, `flatMap callback count: ${callbackCalls}`);
+  } finally {
+    Array.prototype.flatMap = originalFlatMap as typeof Array.prototype.flatMap;
+  }
+});
