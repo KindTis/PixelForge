@@ -268,6 +268,32 @@ test("조밀한 사용자 브러시의 역판정은 활성 픽셀 membership를 
   assert.ok(membershipReads < 100_000, `custom membership reads: ${membershipReads}`);
 });
 
+test("같은 조밀 customBrush 참조는 후속 커서 호출에서 다시 인덱싱하지 않는다", () => {
+  const image = { width: 128, height: 128, data: new Uint8ClampedArray(1) };
+  const offsets = Array.from({ length: 128 * 128 }, (_, index) => ({
+    x: index % 128 - 64,
+    y: Math.floor(index / 128) - 64,
+  }));
+  let numericReads = 0;
+  const customBrush = new Proxy(offsets, {
+    get(target, property, receiver) {
+      if (typeof property === "string" && /^\d+$/.test(property)) numericReads += 1;
+      return Reflect.get(target, property, receiver);
+    },
+  });
+  const settings: ToolCursorSettings = { tool: "spray", brushSize: 1, brushShape: "square", customBrush };
+  const bounds = { documentWidth: 128, documentHeight: 128, celX: 0, celY: 0 };
+
+  const first = toolCursorOverlay({ x: 64, y: 64 }, settings, image, bounds);
+  const firstReads = numericReads;
+  numericReads = 0;
+  const second = toolCursorOverlay({ x: 64, y: 64 }, settings, image, bounds);
+
+  assert.ok(firstReads >= offsets.length);
+  assert.equal(numericReads, 0, `second-call customBrush reads: ${numericReads}`);
+  assert.deepEqual(second.pixels, first.pixels);
+});
+
 function referenceSprayCursor(
   point: { x: number; y: number },
   settings: ToolCursorSettings,

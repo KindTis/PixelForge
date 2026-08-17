@@ -76,15 +76,45 @@ function stamp(points: Point[], settings: Pick<ToolSettings, "brushSize" | "brus
 
 type SprayReachability = { minX: number; minYByX: Int32Array; maxYByX: Int32Array };
 type Bounds = { minX: number; maxX: number; minY: number; maxY: number };
+type CustomBrushMembership = { minX: number; minY: number; width: number; cells: Uint8Array };
+type CustomBrushCache = { bounds: Bounds; integerOffsets: boolean; membership?: CustomBrushMembership };
+
+// ponytail: EditorWorkspace가 immutable snapshot을 참조 교체하므로 WeakMap 캐시는 GC 가능하고 호출 간 재계산만 줄인다.
+const customBrushCache = new WeakMap<Point[], CustomBrushCache>();
+
+function customBrushMetadata(customBrush: Point[]): CustomBrushCache {
+  const cached = customBrushCache.get(customBrush);
+  if (cached) return cached;
+  let integerOffsets = true;
+  const bounds = customBrush.reduce((current, point) => {
+    integerOffsets = integerOffsets && Number.isInteger(point.x) && Number.isInteger(point.y);
+    return {
+      minX: Math.min(current.minX, point.x),
+      maxX: Math.max(current.maxX, point.x),
+      minY: Math.min(current.minY, point.y),
+      maxY: Math.max(current.maxY, point.y),
+    };
+  }, { minX: Infinity, maxX: -Infinity, minY: Infinity, maxY: -Infinity });
+  const metadata = { bounds, integerOffsets };
+  customBrushCache.set(customBrush, metadata);
+  return metadata;
+}
+
+function customBrushMembership(customBrush: Point[], metadata: CustomBrushCache): CustomBrushMembership {
+  if (metadata.membership) return metadata.membership;
+  const minX = metadata.bounds.minX;
+  const minY = metadata.bounds.minY;
+  const width = metadata.bounds.maxX - minX + 1;
+  const height = metadata.bounds.maxY - minY + 1;
+  const cells = new Uint8Array(width * height);
+  for (const offset of customBrush) cells[(offset.y - minY) * width + offset.x - minX] = 1;
+  metadata.membership = { minX, minY, width, cells };
+  return metadata.membership;
+}
 
 function stampBounds(settings: Pick<ToolSettings, "brushSize" | "brushShape" | "customBrush">): Bounds {
   if (settings.customBrush?.length) {
-    return settings.customBrush.reduce((bounds, point) => ({
-      minX: Math.min(bounds.minX, point.x),
-      maxX: Math.max(bounds.maxX, point.x),
-      minY: Math.min(bounds.minY, point.y),
-      maxY: Math.max(bounds.maxY, point.y),
-    }), { minX: Infinity, maxX: -Infinity, minY: Infinity, maxY: -Infinity });
+    return customBrushMetadata(settings.customBrush).bounds;
   }
   const diameter = Math.max(1, Math.round(settings.brushSize));
   const before = Math.floor((diameter - 1) / 2);
@@ -139,6 +169,10 @@ function shouldScatterCustomBrush(
   mirrorX: boolean,
   mirrorY: boolean,
 ): boolean {
+  const metadata = customBrushMetadata(customBrush);
+  const brushWidth = metadata.bounds.maxX - metadata.bounds.minX + 1;
+  const brushHeight = metadata.bounds.maxY - metadata.bounds.minY + 1;
+  if (!metadata.integerOffsets || brushWidth * brushHeight > customBrush.length * 2) return true;
   const scanArea = mirrorRegions(footprint, image.width, image.height, mirrorX, mirrorY)
     .reduce((total, region) => total + clippedBoundsArea(region, clipMinX, clipMaxX, clipMinY, clipMaxY), 0);
   const reachableCenters = reachableSprayCenterCount(reachability);
@@ -184,15 +218,20 @@ function sprayStampContains(
   y: number,
   settings: Pick<ToolSettings, "brushSize" | "brushShape" | "customBrush">,
   reachability: SprayReachability,
-  customOffsetKeys?: Set<string>,
+  customMembership?: CustomBrushMembership,
 ): boolean {
-  if (customOffsetKeys) {
+  if (customMembership) {
     for (let column = 0; column < reachability.minYByX.length; column += 1) {
       const centerX = reachability.minX + column;
       const minY = reachability.minYByX[column];
       const maxY = reachability.maxYByX[column];
       for (let centerY = minY; centerY <= maxY; centerY += 1) {
-        if (customOffsetKeys.has(`${x - centerX},${y - centerY}`)) return true;
+        const offsetX = x - centerX - customMembership.minX;
+        const offsetY = y - centerY - customMembership.minY;
+        if (offsetX >= 0 && offsetY >= 0
+          && offsetX < customMembership.width
+          && offsetY * customMembership.width + offsetX < customMembership.cells.length
+          && customMembership.cells[offsetY * customMembership.width + offsetX]) return true;
       }
     }
     return false;
@@ -288,12 +327,10 @@ export function toolCursorOverlay(
         }
       }
     } else {
-      let customOffsetKeys: Set<string> | undefined;
-      if (customBrush?.length) {
-        customOffsetKeys = new Set<string>();
-        for (const offset of customBrush) customOffsetKeys.add(`${offset.x},${offset.y}`);
-      }
-      const stamped = (x: number, y: number) => sprayStampContains(x, y, settings, reachability, customOffsetKeys);
+      const customMembership = customBrush.length
+        ? customBrushMembership(customBrush, customBrushMetadata(customBrush))
+        : undefined;
+      const stamped = (x: number, y: number) => sprayStampContains(x, y, settings, reachability, customMembership);
       for (const region of mirrorRegions(footprint, image.width, image.height, mirrorX, mirrorY)) {
         const regionMinX = Math.max(clipMinX, Math.ceil(region.minX));
         const regionMaxX = Math.min(clipMaxX, Math.floor(region.maxX) + 1);
