@@ -220,14 +220,16 @@ export const EditorWorkspace = forwardRef<EditorWorkspaceHandle, {
     onChange({ ...project, document });
   };
 
-  const execute = (command: EditCommand) => {
-    if (readOnly) return;
+  const execute = (command: EditCommand): SpriteDocument | undefined => {
+    if (readOnly || activeLayer?.locked) return undefined;
     try {
       const palette = project.document.palette.map((entry) => entry.color);
       const constrained = project.document.colorMode === "indexed"
         ? { ...command, pixels: command.pixels.map((pixel) => ({ ...pixel, rgba: nearestPaletteColor(pixel.rgba, palette) })) }
         : command;
-      emit(history.current.execute(constrained));
+      const document = history.current.execute(constrained);
+      emit(document);
+      return document;
     } catch (error) { onError(error instanceof Error ? error.message : String(error)); }
   };
 
@@ -366,7 +368,7 @@ export const EditorWorkspace = forwardRef<EditorWorkspaceHandle, {
       render();
       return;
     }
-    if (readOnly || !cel || !image || event.button !== 0) return;
+    if (readOnly || activeLayer?.locked || !cel || !image || event.button !== 0) return;
     event.currentTarget.setPointerCapture(event.pointerId);
     controller.current = new ToolController({ tool, celId: cel.id, color, secondaryColor, brushSize, brushShape, customBrush, filled, mirrorX, mirrorY, selection }, image);
     controller.current.pointerDown(celPoint(current));
@@ -390,7 +392,7 @@ export const EditorWorkspace = forwardRef<EditorWorkspaceHandle, {
       render();
       return;
     }
-    if (readOnly) {
+    if (readOnly || activeLayer?.locked) {
       controller.current = undefined;
       render();
       return;
@@ -399,8 +401,7 @@ export const EditorWorkspace = forwardRef<EditorWorkspaceHandle, {
     controller.current = undefined;
     if (result?.color) setColor(result.color);
     if (result?.selection) setSelection(result.selection);
-    if (result?.command) execute(result.command);
-    render();
+    render(result?.command ? execute(result.command) : undefined);
   };
 
   const pointerCancel = () => {
