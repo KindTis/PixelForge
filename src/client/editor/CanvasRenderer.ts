@@ -1,4 +1,5 @@
 import { compositeFrame } from "../../core/render.ts";
+import type { Point } from "../../core/raster.ts";
 import type { PixelBuffer, SpriteDocument } from "../../core/types.ts";
 
 export type CanvasView = {
@@ -13,8 +14,9 @@ export type CanvasView = {
 
 export type CanvasOverlay = {
   selection?: Uint8Array;
-  mirrorX?: boolean;
-  mirrorY?: boolean;
+  cursor?: readonly Point[];
+  mirrorAxisX?: number;
+  mirrorAxisY?: number;
 };
 
 export class CanvasRenderer {
@@ -72,17 +74,44 @@ export class CanvasRenderer {
       }
       context.restore();
     }
-    context.strokeStyle = "#ffad3d";
-    context.setLineDash([5, 5]);
-    if (overlay.mirrorX) {
-      const x = view.panX + sprite.width * view.zoom / 2;
-      context.beginPath(); context.moveTo(x, view.panY); context.lineTo(x, view.panY + sprite.height * view.zoom); context.stroke();
+    if (overlay.cursor?.length) {
+      context.save();
+      context.setLineDash([]);
+      for (const [lineWidth, strokeStyle] of [[3, "rgba(0,0,0,.9)"], [1, "#fff"]] as const) {
+        context.lineWidth = lineWidth;
+        context.strokeStyle = strokeStyle;
+        for (const { x, y } of overlay.cursor) {
+          context.strokeRect(
+            view.panX + x * view.zoom + 0.5,
+            view.panY + y * view.zoom + 0.5,
+            Math.max(1, view.zoom - 1),
+            Math.max(1, view.zoom - 1),
+          );
+        }
+      }
+      context.restore();
     }
-    if (overlay.mirrorY) {
-      const y = view.panY + sprite.height * view.zoom / 2;
-      context.beginPath(); context.moveTo(view.panX, y); context.lineTo(view.panX + sprite.width * view.zoom, y); context.stroke();
+    if (overlay.mirrorAxisX !== undefined || overlay.mirrorAxisY !== undefined) {
+      context.save();
+      context.strokeStyle = "#ffad3d";
+      context.lineWidth = 1;
+      context.setLineDash([5, 5]);
+      if (overlay.mirrorAxisX !== undefined) {
+        const x = view.panX + overlay.mirrorAxisX * view.zoom;
+        context.beginPath();
+        context.moveTo(x, view.panY);
+        context.lineTo(x, view.panY + sprite.height * view.zoom);
+        context.stroke();
+      }
+      if (overlay.mirrorAxisY !== undefined) {
+        const y = view.panY + overlay.mirrorAxisY * view.zoom;
+        context.beginPath();
+        context.moveTo(view.panX, y);
+        context.lineTo(view.panX + sprite.width * view.zoom, y);
+        context.stroke();
+      }
+      context.restore();
     }
-    context.setLineDash([]);
   }
 
   private drawBuffer(context: CanvasRenderingContext2D, buffer: PixelBuffer, view: CanvasView, alpha: number, tint?: string): void {

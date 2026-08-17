@@ -22,7 +22,13 @@ import {
 } from "../../core/timeline.ts";
 import { celKey, type BlendMode, type RGBA, type SpriteDocument, type SpriteProject } from "../../core/types.ts";
 import { runAiEditAttempts, type AiEditorSettings } from "../../core/ai-edit-runner.ts";
-import { screenToPixel, ToolController, type EditorTool } from "../../core/tool-controller.ts";
+import {
+  screenToPixel,
+  toolCursorOverlay,
+  ToolController,
+  type EditorTool,
+  type ToolCursorOverlay,
+} from "../../core/tool-controller.ts";
 import { CanvasRenderer } from "./CanvasRenderer.ts";
 import { selectionOverlay, selectionReplayMask, selectionRuns } from "./ai-edit.ts";
 import { ResizeDialog, type ResizeRequest } from "./ResizeDialog.tsx";
@@ -96,6 +102,7 @@ export const EditorWorkspace = forwardRef<EditorWorkspaceHandle, {
   const controller = useRef<ToolController | undefined>(undefined);
   const clipboard = useRef<SelectionContent | undefined>(undefined);
   const panDrag = useRef<{ x: number; y: number; panX: number; panY: number } | undefined>(undefined);
+  const pointer = useRef<{ clientX: number; clientY: number; inside: boolean } | undefined>(undefined);
   const [activeLayerId, setActiveLayerId] = useState(project.document.layers[0].id);
   const [tool, setTool] = useState<EditorTool>("pencil");
   const [color, setColor] = useState<RGBA>([20, 22, 26, 255]);
@@ -114,6 +121,7 @@ export const EditorWorkspace = forwardRef<EditorWorkspaceHandle, {
   const [panOffset, setPanOffset] = useState({ x: 0, y: 0 });
   const [playing, setPlaying] = useState(false);
   const [coordinate, setCoordinate] = useState({ x: 0, y: 0 });
+  const [cursorVisible, setCursorVisible] = useState(false);
   const [tagName, setTagName] = useState("");
   const [tagDirection, setTagDirection] = useState<"forward" | "reverse" | "pingPong">("forward");
   const [resizeOpen, setResizeOpen] = useState(false);
@@ -258,13 +266,40 @@ export const EditorWorkspace = forwardRef<EditorWorkspaceHandle, {
     };
   };
 
+  const currentToolCursor = (): ToolCursorOverlay => {
+    const element = canvas.current;
+    const current = pointer.current;
+    if (!element || !current || (!current.inside && !controller.current)
+      || readOnly || activeLayer?.locked || !cel || !image || panDrag.current) {
+      return { pixels: [] };
+    }
+    const point = screenToPixel(current.clientX, current.clientY, element.getBoundingClientRect(), view());
+    return toolCursorOverlay(point, {
+      tool,
+      brushSize,
+      brushShape,
+      customBrush,
+      mirrorX,
+      mirrorY,
+      selection,
+    }, image, {
+      documentWidth: project.document.width,
+      documentHeight: project.document.height,
+      celX: cel.x,
+      celY: cel.y,
+    });
+  };
+
   const render = (document = project.document) => {
     const element = canvas.current;
     if (!element) return;
+    const toolCursor = currentToolCursor();
+    setCursorVisible(toolCursor.pixels.length > 0);
     new CanvasRenderer(element).render(document, view(), {
       selection: image && cel ? selectionOverlay(selection, image, cel, project.document) : undefined,
-      mirrorX,
-      mirrorY,
+      cursor: toolCursor.pixels,
+      mirrorAxisX: toolCursor.mirrorAxisX,
+      mirrorAxisY: toolCursor.mirrorAxisY,
     });
   };
 
@@ -275,7 +310,11 @@ export const EditorWorkspace = forwardRef<EditorWorkspaceHandle, {
     const observer = new ResizeObserver(() => render());
     observer.observe(element);
     return () => observer.disconnect();
-  }, [project, frameIndex, zoom, grid, onion, tilePreview, panOffset, selection, mirrorX, mirrorY]);
+  }, [
+    project, frameIndex, activeLayerId, zoom, grid, onion, tilePreview, panOffset,
+    selection, tool, brushSize, brushShape, customBrush, mirrorX, mirrorY,
+    readOnly, activeLayer?.locked,
+  ]);
 
   useEffect(() => {
     if (!playing || project.document.frames.length < 2) return;
@@ -291,45 +330,85 @@ export const EditorWorkspace = forwardRef<EditorWorkspaceHandle, {
     }
   }, [readOnly]);
 
-  const documentPoint = (event: ReactPointerEvent<HTMLCanvasElement>) => screenToPixel(event.clientX, event.clientY, event.currentTarget.getBoundingClientRect(), view());
-  const celPoint = (event: ReactPointerEvent<HTMLCanvasElement>) => {
-    const point = documentPoint(event);
-    return { x: point.x - (cel?.x ?? 0), y: point.y - (cel?.y ?? 0) };
+  const documentPoint = (event: ReactPointerEvent<HTMLCanvasElement>) => screenToPixel(
+    event.clientX,
+    event.clientY,
+    event.currentTarget.getBoundingClientRect(),
+    view(),
+  );
+  const celPoint = (point: { x: number; y: number }) => ({
+    x: point.x - (cel?.x ?? 0),
+    y: point.y - (cel?.y ?? 0),
+  });
+  const rememberPointer = (event: ReactPointerEvent<HTMLCanvasElement>, inside = pointer.current?.inside ?? true) => {
+    pointer.current = { clientX: event.clientX, clientY: event.clientY, inside };
+    const current = documentPoint(event);
+    setCoordinate(current);
+    return current;
+  };
+
+  const pointerEnter = (event: ReactPointerEvent<HTMLCanvasElement>) => {
+    rememberPointer(event, true);
+    render();
+  };
+
+  const pointerLeave = (event: ReactPointerEvent<HTMLCanvasElement>) => {
+    rememberPointer(event, false);
+    if (!controller.current) render();
   };
 
   const pointerDown = (event: ReactPointerEvent<HTMLCanvasElement>) => {
+    const current = rememberPointer(event);
     if (event.button === 1) {
       event.preventDefault();
       event.currentTarget.setPointerCapture(event.pointerId);
       panDrag.current = { x: event.clientX, y: event.clientY, panX: panOffset.x, panY: panOffset.y };
+      render();
       return;
     }
-    if (readOnly) return;
-    if (!cel || !image || event.button !== 0) return;
+    if (readOnly || !cel || !image || event.button !== 0) return;
     event.currentTarget.setPointerCapture(event.pointerId);
     controller.current = new ToolController({ tool, celId: cel.id, color, secondaryColor, brushSize, brushShape, customBrush, filled, mirrorX, mirrorY, selection }, image);
-    controller.current.pointerDown(celPoint(event));
+    controller.current.pointerDown(celPoint(current));
   };
 
   const pointerMove = (event: ReactPointerEvent<HTMLCanvasElement>) => {
+    const current = rememberPointer(event);
     if (panDrag.current) {
+      setCursorVisible(false);
       setPanOffset({ x: panDrag.current.panX + event.clientX - panDrag.current.x, y: panDrag.current.panY + event.clientY - panDrag.current.y });
       return;
     }
-    const current = documentPoint(event);
-    setCoordinate(current);
-    const result = readOnly ? undefined : controller.current?.pointerMove({ x: current.x - (cel?.x ?? 0), y: current.y - (cel?.y ?? 0) });
-    if (result?.command && !activeLayer?.locked) render(applyCommand(project.document, result.command));
+    const result = readOnly ? undefined : controller.current?.pointerMove(celPoint(current));
+    render(result?.command && !activeLayer?.locked ? applyCommand(project.document, result.command) : project.document);
   };
 
   const pointerUp = (event: ReactPointerEvent<HTMLCanvasElement>) => {
-    if (panDrag.current) { panDrag.current = undefined; return; }
-    if (readOnly) { controller.current = undefined; return; }
-    const result = controller.current?.pointerUp(celPoint(event));
+    const current = rememberPointer(event);
+    if (panDrag.current) {
+      panDrag.current = undefined;
+      render();
+      return;
+    }
+    if (readOnly) {
+      controller.current = undefined;
+      render();
+      return;
+    }
+    const result = controller.current?.pointerUp(celPoint(current));
     controller.current = undefined;
     if (result?.color) setColor(result.color);
     if (result?.selection) setSelection(result.selection);
     if (result?.command) execute(result.command);
+    render();
+  };
+
+  const pointerCancel = () => {
+    controller.current = undefined;
+    panDrag.current = undefined;
+    pointer.current = undefined;
+    setCursorVisible(false);
+    render();
   };
 
   const applyBuffer = (next: Uint8ClampedArray) => {
@@ -501,7 +580,21 @@ export const EditorWorkspace = forwardRef<EditorWorkspaceHandle, {
           <div><label><input type="checkbox" checked={onion} onChange={(event) => setOnion(event.target.checked)} /> 어니언</label><label><input type="checkbox" checked={tilePreview} onChange={(event) => setTilePreview(event.target.checked)} /> 타일</label><label><input type="checkbox" checked={grid} onChange={(event) => setGrid(event.target.checked)} /> 격자</label><button type="button" disabled={readOnly} onClick={() => setResizeOpen(true)}>크기 변경</button><button type="button" onClick={() => setZoom((value) => Math.max(1, value - 1))}>−</button><b>{zoom}×</b><button type="button" onClick={() => setZoom((value) => Math.min(32, value + 1))}>+</button></div>
         </div>
         <div className="editor-canvas-wrap">
-          <canvas ref={canvas} className="editor-canvas" aria-label="픽셀을 그리는 캔버스" onPointerDown={pointerDown} onPointerMove={pointerMove} onPointerUp={pointerUp} onPointerCancel={() => { controller.current = undefined; panDrag.current = undefined; render(); }} onWheel={(event: WheelEvent<HTMLCanvasElement>) => { event.preventDefault(); setZoom((value) => Math.max(1, Math.min(32, value + (event.deltaY < 0 ? 1 : -1)))); }} />
+          <canvas
+            ref={canvas}
+            className={`editor-canvas${cursorVisible ? " tool-cursor-visible" : ""}`}
+            aria-label="픽셀을 그리는 캔버스"
+            onPointerEnter={pointerEnter}
+            onPointerLeave={pointerLeave}
+            onPointerDown={pointerDown}
+            onPointerMove={pointerMove}
+            onPointerUp={pointerUp}
+            onPointerCancel={pointerCancel}
+            onWheel={(event: WheelEvent<HTMLCanvasElement>) => {
+              event.preventDefault();
+              setZoom((value) => Math.max(1, Math.min(32, value + (event.deltaY < 0 ? 1 : -1))));
+            }}
+          />
         </div>
         <div className="playback">
           <button type="button" disabled={readOnly} onClick={() => onFrameIndex(0)} aria-label="처음 프레임">|◀</button>
