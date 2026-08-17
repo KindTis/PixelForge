@@ -294,6 +294,34 @@ test("같은 조밀 customBrush 참조는 후속 커서 호출에서 다시 인�
   assert.deepEqual(second.pixels, first.pixels);
 });
 
+test("큰 clip의 sparse integer customBrush는 bounded inverse를 선택한다", () => {
+  const image = { width: 4096, height: 4096, data: new Uint8ClampedArray(1) };
+  const offsets = [
+    { x: 0, y: 0 },
+    ...Array.from({ length: 2047 }, (_, index) => ({ x: index * 2 + 1000, y: index % 128 + 1000 })),
+  ];
+  let numericReads = 0;
+  const customBrush = new Proxy(offsets, {
+    get(target, property, receiver) {
+      if (typeof property === "string" && /^\d+$/.test(property)) numericReads += 1;
+      return Reflect.get(target, property, receiver);
+    },
+  });
+  const selection = new Uint8Array([1]);
+  const settings: ToolCursorSettings = { tool: "spray", brushSize: 32, brushShape: "square", customBrush, selection };
+  const bounds = { documentWidth: 1, documentHeight: 1, celX: 0, celY: 0 };
+
+  const first = toolCursorOverlay({ x: 0, y: 0 }, settings, image, bounds);
+  const firstReads = numericReads;
+  numericReads = 0;
+  const second = toolCursorOverlay({ x: 0, y: 0 }, settings, image, bounds);
+
+  assert.ok(firstReads >= offsets.length);
+  assert.equal(numericReads, 0, `second-call customBrush reads: ${numericReads}`);
+  assert.deepEqual(first.pixels, [{ x: 0, y: 0 }]);
+  assert.deepEqual(second.pixels, first.pixels);
+});
+
 function referenceSprayCursor(
   point: { x: number; y: number },
   settings: ToolCursorSettings,

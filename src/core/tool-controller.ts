@@ -76,8 +76,10 @@ function stamp(points: Point[], settings: Pick<ToolSettings, "brushSize" | "brus
 
 type SprayReachability = { minX: number; minYByX: Int32Array; maxYByX: Int32Array };
 type Bounds = { minX: number; maxX: number; minY: number; maxY: number };
-type CustomBrushMembership = { minX: number; minY: number; width: number; cells: Uint8Array };
-type CustomBrushCache = { bounds: Bounds; integerOffsets: boolean; membership?: CustomBrushMembership };
+type CustomBrushMembership =
+  | { kind: "dense"; minX: number; minY: number; width: number; cells: Uint8Array }
+  | { kind: "sparse"; columns: Map<number, Set<number>> };
+type CustomBrushCache = { bounds: Bounds; integerOffsets: boolean; dense: boolean; membership?: CustomBrushMembership };
 
 // ponytail: EditorWorkspace가 immutable snapshot을 참조 교체하므로 WeakMap 캐시는 GC 가능하고 호출 간 재계산만 줄인다.
 const customBrushCache = new WeakMap<Point[], CustomBrushCache>();
@@ -95,20 +97,35 @@ function customBrushMetadata(customBrush: Point[]): CustomBrushCache {
       maxY: Math.max(current.maxY, point.y),
     };
   }, { minX: Infinity, maxX: -Infinity, minY: Infinity, maxY: -Infinity });
-  const metadata = { bounds, integerOffsets };
+  const brushWidth = bounds.maxX - bounds.minX + 1;
+  const brushHeight = bounds.maxY - bounds.minY + 1;
+  const metadata = { bounds, integerOffsets, dense: integerOffsets && brushWidth * brushHeight <= customBrush.length * 2 };
   customBrushCache.set(customBrush, metadata);
   return metadata;
 }
 
 function customBrushMembership(customBrush: Point[], metadata: CustomBrushCache): CustomBrushMembership {
   if (metadata.membership) return metadata.membership;
+  if (!metadata.dense) {
+    const columns = new Map<number, Set<number>>();
+    for (const offset of customBrush) {
+      let rows = columns.get(offset.x);
+      if (!rows) {
+        rows = new Set<number>();
+        columns.set(offset.x, rows);
+      }
+      rows.add(offset.y);
+    }
+    metadata.membership = { kind: "sparse", columns };
+    return metadata.membership;
+  }
   const minX = metadata.bounds.minX;
   const minY = metadata.bounds.minY;
   const width = metadata.bounds.maxX - minX + 1;
   const height = metadata.bounds.maxY - minY + 1;
   const cells = new Uint8Array(width * height);
   for (const offset of customBrush) cells[(offset.y - minY) * width + offset.x - minX] = 1;
-  metadata.membership = { minX, minY, width, cells };
+  metadata.membership = { kind: "dense", minX, minY, width, cells };
   return metadata.membership;
 }
 
@@ -170,9 +187,7 @@ function shouldScatterCustomBrush(
   mirrorY: boolean,
 ): boolean {
   const metadata = customBrushMetadata(customBrush);
-  const brushWidth = metadata.bounds.maxX - metadata.bounds.minX + 1;
-  const brushHeight = metadata.bounds.maxY - metadata.bounds.minY + 1;
-  if (!metadata.integerOffsets || brushWidth * brushHeight > customBrush.length * 2) return true;
+  if (!metadata.integerOffsets) return true;
   const scanArea = mirrorRegions(footprint, image.width, image.height, mirrorX, mirrorY)
     .reduce((total, region) => total + clippedBoundsArea(region, clipMinX, clipMaxX, clipMinY, clipMaxY), 0);
   const reachableCenters = reachableSprayCenterCount(reachability);
@@ -226,12 +241,18 @@ function sprayStampContains(
       const minY = reachability.minYByX[column];
       const maxY = reachability.maxYByX[column];
       for (let centerY = minY; centerY <= maxY; centerY += 1) {
-        const offsetX = x - centerX - customMembership.minX;
-        const offsetY = y - centerY - customMembership.minY;
-        if (offsetX >= 0 && offsetY >= 0
-          && offsetX < customMembership.width
-          && offsetY * customMembership.width + offsetX < customMembership.cells.length
-          && customMembership.cells[offsetY * customMembership.width + offsetX]) return true;
+        const offsetX = x - centerX;
+        const offsetY = y - centerY;
+        if (customMembership.kind === "sparse") {
+          if (customMembership.columns.get(offsetX)?.has(offsetY)) return true;
+          continue;
+        }
+        const cellX = offsetX - customMembership.minX;
+        const cellY = offsetY - customMembership.minY;
+        if (cellX >= 0 && cellY >= 0
+          && cellX < customMembership.width
+          && cellY * customMembership.width + cellX < customMembership.cells.length
+          && customMembership.cells[cellY * customMembership.width + cellX]) return true;
       }
     }
     return false;
