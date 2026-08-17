@@ -17,6 +17,41 @@ test("픽셀 변경은 실행 취소와 다시 실행을 왕복한다", () => {
   assert.deepEqual(Array.from(Object.values(history.document.images)[0].data.slice(4, 8)), [255, 0, 0, 255]);
 });
 
+test("오프셋된 셀은 문서 안에 놓인 로컬 픽셀만 변경한다", () => {
+  const document = createDocument({ width: 3, height: 1 });
+  const cel = Object.values(document.cels)[0];
+  document.width = 1;
+  cel.x = -1;
+
+  const result = applyCommand(document, {
+    type: "setPixels",
+    celId: cel.id,
+    pixels: [
+      { x: 0, y: 0, rgba: [1, 1, 1, 255] },
+      { x: 1, y: 0, rgba: [2, 2, 2, 255] },
+      { x: 2, y: 0, rgba: [3, 3, 3, 255] },
+    ],
+  });
+
+  assert.deepEqual(Array.from(result.images[cel.imageId].data), [
+    0, 0, 0, 0,
+    2, 2, 2, 255,
+    0, 0, 0, 0,
+  ]);
+});
+
+test("문서 밖 픽셀만 있는 명령은 문서와 이력을 바꾸지 않는다", () => {
+  const document = createDocument({ width: 2, height: 1 });
+  const cel = Object.values(document.cels)[0];
+  cel.x = 2;
+
+  assert.equal(applyCommand(document, {
+    type: "setPixels",
+    celId: cel.id,
+    pixels: [{ x: 0, y: 0, rgba: [1, 1, 1, 255] }],
+  }), document);
+});
+
 test("연결 셀을 편집하면 대상 셀만 자동 분리한다", () => {
   const document = createDocument({ width: 1, height: 1 });
   const sourceFrame = document.frames[0];

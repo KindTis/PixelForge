@@ -17,7 +17,14 @@ export function applyCommand(document: SpriteDocument, command: EditCommand): Sp
   if (document.layers.find((layer) => layer.id === layerId)?.locked) throw new Error("잠긴 레이어는 편집할 수 없습니다.");
   const source = document.images[cel.imageId];
   if (!source) throw new Error("편집할 셀 이미지가 없습니다.");
-  const pixels = command.pixels.filter(({ x, y }) => Number.isInteger(x) && Number.isInteger(y) && x >= 0 && y >= 0 && x < source.width && y < source.height);
+  const pixels = command.pixels.filter(({ x, y }) => {
+    const documentX = cel.x + x;
+    const documentY = cel.y + y;
+    return Number.isInteger(x) && Number.isInteger(y)
+      && x >= 0 && y >= 0 && x < source.width && y < source.height
+      && documentX >= 0 && documentY >= 0
+      && documentX < document.width && documentY < document.height;
+  });
   if (pixels.length === 0) return document;
 
   const data = new Uint8ClampedArray(source.data);
