@@ -34,6 +34,10 @@ export class CanvasRenderer {
     context.clearRect(0, 0, width, height);
     context.imageSmoothingEnabled = false;
 
+    context.fillStyle = "#14181c";
+    context.fillRect(0, 0, width, height);
+    context.clearRect(view.panX, view.panY, sprite.width * view.zoom, sprite.height * view.zoom);
+
     const frameIndex = sprite.frames.findIndex((frame) => frame.id === view.frameId);
     const current = compositeFrame(sprite, view.frameId);
     if (view.tilePreview) for (let y = -1; y <= 1; y += 1) for (let x = -1; x <= 1; x += 1) {
@@ -51,6 +55,11 @@ export class CanvasRenderer {
       for (let y = 0; y <= sprite.height; y += 1) { context.moveTo(view.panX, view.panY + y * view.zoom + 0.5); context.lineTo(view.panX + sprite.width * view.zoom, view.panY + y * view.zoom + 0.5); }
       context.stroke();
     }
+
+    context.strokeStyle = "rgba(233,229,218,.82)";
+    context.lineWidth = 1;
+    context.setLineDash([]);
+    context.strokeRect(view.panX + 0.5, view.panY + 0.5, sprite.width * view.zoom - 1, sprite.height * view.zoom - 1);
 
     if (overlay.selection) {
       context.save();

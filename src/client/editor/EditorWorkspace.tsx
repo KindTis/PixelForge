@@ -3,6 +3,7 @@ import type { AiEditReadyResult, AiEditRequest, AiEditTarget } from "../../core/
 import { applyCommand, History, type EditCommand, type PixelChange } from "../../core/commands.ts";
 import { compositeFrame } from "../../core/render.ts";
 import { convertDocumentToIndexed, indexedToRgba, nearestPaletteColor, quantizeToPalette, replaceColor, sameColor } from "../../core/palette.ts";
+import { resizeCanvas, resizeImage } from "../../core/resize.ts";
 import { extractSelection, flipSelection, moveSelection, pasteSelection, rectangleMask, rotateSelection, scaleSelectionNearest, type SelectionContent } from "../../core/selection.ts";
 import {
   addFrame,
@@ -24,6 +25,7 @@ import { runAiEditAttempts, type AiEditorSettings } from "../../core/ai-edit-run
 import { screenToPixel, ToolController, type EditorTool } from "../../core/tool-controller.ts";
 import { CanvasRenderer } from "./CanvasRenderer.ts";
 import { selectionOverlay, selectionReplayMask, selectionRuns } from "./ai-edit.ts";
+import { ResizeDialog, type ResizeRequest } from "./ResizeDialog.tsx";
 import { shortcutAction } from "./shortcuts.ts";
 
 const TOOLS: Array<{ id: EditorTool; icon: string; label: string; key: string }> = [
@@ -114,6 +116,7 @@ export const EditorWorkspace = forwardRef<EditorWorkspaceHandle, {
   const [coordinate, setCoordinate] = useState({ x: 0, y: 0 });
   const [tagName, setTagName] = useState("");
   const [tagDirection, setTagDirection] = useState<"forward" | "reverse" | "pingPong">("forward");
+  const [resizeOpen, setResizeOpen] = useState(false);
 
   useEffect(() => {
     if (project.document !== emitted.current) {
@@ -225,6 +228,18 @@ export const EditorWorkspace = forwardRef<EditorWorkspaceHandle, {
     try { emit(history.current.replace(transform(project.document))); } catch (error) { onError(error instanceof Error ? error.message : String(error)); }
   };
 
+  const applyResize = (request: ResizeRequest) => {
+    if (readOnly) return;
+    const current = history.current.document;
+    const resized = request.mode === "canvas"
+      ? resizeCanvas(current, request.width, request.height, request.horizontal, request.vertical)
+      : resizeImage(current, request.width, request.height);
+    if (resized === current) return;
+    emit(history.current.replace(resized));
+    setSelection(undefined);
+    setPanOffset({ x: 0, y: 0 });
+  };
+
   const undo = () => { if (!readOnly) emit(history.current.undo()); };
   const redo = () => { if (!readOnly) emit(history.current.redo()); };
 
@@ -272,10 +287,15 @@ export const EditorWorkspace = forwardRef<EditorWorkspaceHandle, {
     if (readOnly) {
       controller.current = undefined;
       setPlaying(false);
+      setResizeOpen(false);
     }
   }, [readOnly]);
 
-  const point = (event: ReactPointerEvent<HTMLCanvasElement>) => screenToPixel(event.clientX, event.clientY, event.currentTarget.getBoundingClientRect(), view());
+  const documentPoint = (event: ReactPointerEvent<HTMLCanvasElement>) => screenToPixel(event.clientX, event.clientY, event.currentTarget.getBoundingClientRect(), view());
+  const celPoint = (event: ReactPointerEvent<HTMLCanvasElement>) => {
+    const point = documentPoint(event);
+    return { x: point.x - (cel?.x ?? 0), y: point.y - (cel?.y ?? 0) };
+  };
 
   const pointerDown = (event: ReactPointerEvent<HTMLCanvasElement>) => {
     if (event.button === 1) {
@@ -288,7 +308,7 @@ export const EditorWorkspace = forwardRef<EditorWorkspaceHandle, {
     if (!cel || !image || event.button !== 0) return;
     event.currentTarget.setPointerCapture(event.pointerId);
     controller.current = new ToolController({ tool, celId: cel.id, color, secondaryColor, brushSize, brushShape, customBrush, filled, mirrorX, mirrorY, selection }, image);
-    controller.current.pointerDown(point(event));
+    controller.current.pointerDown(celPoint(event));
   };
 
   const pointerMove = (event: ReactPointerEvent<HTMLCanvasElement>) => {
@@ -296,16 +316,16 @@ export const EditorWorkspace = forwardRef<EditorWorkspaceHandle, {
       setPanOffset({ x: panDrag.current.panX + event.clientX - panDrag.current.x, y: panDrag.current.panY + event.clientY - panDrag.current.y });
       return;
     }
-    const current = point(event);
+    const current = documentPoint(event);
     setCoordinate(current);
-    const result = readOnly ? undefined : controller.current?.pointerMove(current);
+    const result = readOnly ? undefined : controller.current?.pointerMove({ x: current.x - (cel?.x ?? 0), y: current.y - (cel?.y ?? 0) });
     if (result?.command && !activeLayer?.locked) render(applyCommand(project.document, result.command));
   };
 
   const pointerUp = (event: ReactPointerEvent<HTMLCanvasElement>) => {
     if (panDrag.current) { panDrag.current = undefined; return; }
     if (readOnly) { controller.current = undefined; return; }
-    const result = controller.current?.pointerUp(point(event));
+    const result = controller.current?.pointerUp(celPoint(event));
     controller.current = undefined;
     if (result?.color) setColor(result.color);
     if (result?.selection) setSelection(result.selection);
@@ -478,7 +498,7 @@ export const EditorWorkspace = forwardRef<EditorWorkspaceHandle, {
       <section className="canvas-stage" aria-label="픽셀 편집 캔버스">
         <div className="stage-meta">
           <span>F{String(frameIndex + 1).padStart(2, "0")} · X {coordinate.x} Y {coordinate.y}</span>
-          <div><label><input type="checkbox" checked={onion} onChange={(event) => setOnion(event.target.checked)} /> 어니언</label><label><input type="checkbox" checked={tilePreview} onChange={(event) => setTilePreview(event.target.checked)} /> 타일</label><label><input type="checkbox" checked={grid} onChange={(event) => setGrid(event.target.checked)} /> 격자</label><button type="button" onClick={() => setZoom((value) => Math.max(1, value - 1))}>−</button><b>{zoom}×</b><button type="button" onClick={() => setZoom((value) => Math.min(32, value + 1))}>+</button></div>
+          <div><label><input type="checkbox" checked={onion} onChange={(event) => setOnion(event.target.checked)} /> 어니언</label><label><input type="checkbox" checked={tilePreview} onChange={(event) => setTilePreview(event.target.checked)} /> 타일</label><label><input type="checkbox" checked={grid} onChange={(event) => setGrid(event.target.checked)} /> 격자</label><button type="button" disabled={readOnly} onClick={() => setResizeOpen(true)}>크기 변경</button><button type="button" onClick={() => setZoom((value) => Math.max(1, value - 1))}>−</button><b>{zoom}×</b><button type="button" onClick={() => setZoom((value) => Math.min(32, value + 1))}>+</button></div>
         </div>
         <div className="editor-canvas-wrap">
           <canvas ref={canvas} className="editor-canvas" aria-label="픽셀을 그리는 캔버스" onPointerDown={pointerDown} onPointerMove={pointerMove} onPointerUp={pointerUp} onPointerCancel={() => { controller.current = undefined; panDrag.current = undefined; render(); }} onWheel={(event: WheelEvent<HTMLCanvasElement>) => { event.preventDefault(); setZoom((value) => Math.max(1, Math.min(32, value + (event.deltaY < 0 ? 1 : -1)))); }} />
@@ -520,5 +540,6 @@ export const EditorWorkspace = forwardRef<EditorWorkspaceHandle, {
       </div>)}</div>
       <div className="tag-editor"><span>태그</span><input aria-label="태그 이름" disabled={readOnly} placeholder="예: attack" value={tagName} onChange={(event) => setTagName(event.target.value)} /><select aria-label="태그 재생 방향" disabled={readOnly} value={tagDirection} onChange={(event) => setTagDirection(event.target.value as typeof tagDirection)}><option value="forward">정방향</option><option value="reverse">역방향</option><option value="pingPong">핑퐁</option></select><button type="button" disabled={readOnly} onClick={addAnimationTag}>전체 구간 추가</button>{project.document.tags.map((tag) => <button type="button" className="tag-chip" disabled={readOnly} key={tag.id} onClick={() => replace((document) => deleteTag(document, tag.id))}>{tag.name} ×</button>)}</div>
     </section>
+    {resizeOpen && <ResizeDialog initialWidth={project.document.width} initialHeight={project.document.height} onClose={() => setResizeOpen(false)} onApply={applyResize} />}
   </>;
 });

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createDocument, validateDocument } from "../src/core/document.ts";
+import { createDocument, createProject, renameProject, validateDocument } from "../src/core/document.ts";
 
 test("새 문서는 한 프레임과 한 레이어를 가진다", () => {
   const document = createDocument({ width: 32, height: 48 });
@@ -14,6 +14,18 @@ test("새 문서는 한 프레임과 한 레이어를 가진다", () => {
 
 test("0 크기 캔버스는 거부한다", () => {
   assert.throws(() => createDocument({ width: 0, height: 32 }), /캔버스 크기/);
+});
+
+test("프로젝트 이름의 앞뒤 공백을 제거해 변경한다", () => {
+  const project = createProject("기존 이름", createDocument({ width: 1, height: 1 }));
+
+  assert.equal(renameProject(project, "  새 이름  ").name, "새 이름");
+});
+
+test("빈 프로젝트 이름은 거부한다", () => {
+  const project = createProject("기존 이름", createDocument({ width: 1, height: 1 }));
+
+  assert.throws(() => renameProject(project, "   "), /프로젝트 이름/);
 });
 
 test("존재하지 않는 프레임을 참조하는 태그는 거부한다", () => {

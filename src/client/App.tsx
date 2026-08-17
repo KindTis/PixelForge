@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import type { SpriteProject } from "../core/types.ts";
+import { renameProject } from "../core/document.ts";
 import { api, cellEditApplicationDisposition, cellEditApplicationRequestTimeout, cellEditCompletionNotice, cellEditPayload, codexJobStatusTitle, completedFrameIndex, decodeProject, encodeProject, failedCodexJob, generationPayload, isRetryablePollingError, pollingErrorCodexJob, projectJobOwnershipMatches, projectLifetimeMatches, releaseProjectJobOwnership, type CellEditJob, type CodexJob, type GenerationJob, type ProjectJobOwnership, type ProjectLifetime, type Session } from "./api.ts";
 import { EditorWorkspace, type EditorWorkspaceHandle } from "./editor/EditorWorkspace.tsx";
 import { ExportDialog, type ExportResponse, type ExportResult, type ExportTarget } from "./ExportDialog.tsx";
@@ -77,6 +78,7 @@ export function App() {
   const [session, setSession] = useState<Session>();
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
   const [project, setProject] = useState<SpriteProject>();
+  const [projectNameDraft, setProjectNameDraft] = useState<string>();
   const latestProject = useRef<SpriteProject | undefined>(undefined);
   const projectEpoch = useRef(0);
   const projectLifetime = useRef<ProjectLifetime | undefined>(undefined);
@@ -113,6 +115,20 @@ export function App() {
   const setCurrentProject = (next: SpriteProject | undefined) => {
     latestProject.current = next;
     setProject(next);
+  };
+
+  const commitProjectName = () => {
+    if (!project || projectNameDraft === undefined) return;
+    try {
+      const renamed = renameProject(project, projectNameDraft);
+      setProjectNameDraft(undefined);
+      if (renamed.name === project.name) return;
+      setCurrentProject(renamed);
+      setProjects((current) => current.map((item) => item.id === renamed.id ? { ...item, name: renamed.name } : item));
+      setDirty(true);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    }
   };
 
   const beginProjectLifetime = (projectId: string): ProjectLifetime => {
@@ -489,6 +505,7 @@ export function App() {
     cellEditApplicationPending.current = undefined;
     cellEditCancelRequested.current = false;
     setCurrentProject(next);
+    setProjectNameDraft(undefined);
     setStartingKind(undefined);
     setJob(undefined);
     setReference(undefined);
@@ -572,7 +589,13 @@ export function App() {
       <header className="topbar">
         <button className="brand" type="button" disabled={codexBusy} onClick={() => void leaveProject()} aria-label="프로젝트 선택으로 이동"><span className="brand-mark">PF</span><b>PixelForge</b></button>
         <span className="divider" />
-        <strong className="project-name">{project?.name ?? "프로젝트 선택"}</strong>
+        {project ? projectNameDraft === undefined
+          ? <button className="project-name" type="button" disabled={codexBusy} aria-label="프로젝트 이름 변경" onClick={() => setProjectNameDraft(project.name)}>{project.name}</button>
+          : <input className="project-name" autoFocus disabled={codexBusy} aria-label="프로젝트 이름" value={projectNameDraft} onChange={(event) => setProjectNameDraft(event.target.value)} onBlur={commitProjectName} onKeyDown={(event) => {
+              if (event.key === "Enter") event.currentTarget.blur();
+              if (event.key === "Escape") setProjectNameDraft(undefined);
+            }} />
+          : <strong className="project-name">프로젝트 선택</strong>}
         <div className="top-actions">
           {account?.type === "chatgpt"
             ? <span className="account"><i />{account.planType || "ChatGPT"} · {account.email}</span>

@@ -60,6 +60,12 @@ export function createProject(name: string, document: SpriteDocument): SpritePro
   };
 }
 
+export function renameProject(project: SpriteProject, name: string): SpriteProject {
+  const trimmed = name.trim();
+  if (!trimmed) throw new Error("프로젝트 이름이 필요합니다.");
+  return { ...project, name: trimmed };
+}
+
 export function validateDocument(document: SpriteDocument): void {
   if (!Number.isInteger(document.width) || !Number.isInteger(document.height) || document.width < 1 || document.height < 1) {
     throw new Error("잘못된 캔버스 크기입니다.");
