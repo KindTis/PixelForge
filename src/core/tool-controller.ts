@@ -139,10 +139,12 @@ function shouldScatterCustomBrush(
   mirrorX: boolean,
   mirrorY: boolean,
 ): boolean {
-  const scanWork = mirrorRegions(footprint, image.width, image.height, mirrorX, mirrorY)
+  const scanArea = mirrorRegions(footprint, image.width, image.height, mirrorX, mirrorY)
     .reduce((total, region) => total + clippedBoundsArea(region, clipMinX, clipMaxX, clipMinY, clipMaxY), 0);
+  const reachableCenters = reachableSprayCenterCount(reachability);
+  const scanWork = scanArea * reachableCenters;
   const mirrorCount = 1 + (mirrorX ? 1 : 0) + (mirrorY ? 1 : 0) + (mirrorX && mirrorY ? 1 : 0);
-  const scatterWork = reachableSprayCenterCount(reachability) * customBrush.length * mirrorCount;
+  const scatterWork = reachableCenters * customBrush.length * mirrorCount;
   return scatterWork < scanWork;
 }
 
@@ -182,10 +184,16 @@ function sprayStampContains(
   y: number,
   settings: Pick<ToolSettings, "brushSize" | "brushShape" | "customBrush">,
   reachability: SprayReachability,
+  customOffsetKeys?: Set<string>,
 ): boolean {
-  if (settings.customBrush?.length) {
-    for (const offset of settings.customBrush) {
-      if (reachableSprayColumn(reachability, x - offset.x, y - offset.y, y - offset.y)) return true;
+  if (customOffsetKeys) {
+    for (let column = 0; column < reachability.minYByX.length; column += 1) {
+      const centerX = reachability.minX + column;
+      const minY = reachability.minYByX[column];
+      const maxY = reachability.maxYByX[column];
+      for (let centerY = minY; centerY <= maxY; centerY += 1) {
+        if (customOffsetKeys.has(`${x - centerX},${y - centerY}`)) return true;
+      }
     }
     return false;
   }
@@ -251,18 +259,11 @@ export function toolCursorOverlay(
     const seen = new Set<number>();
     const mirrorX = Boolean(settings.mirrorX);
     const mirrorY = Boolean(settings.mirrorY);
-    if (settings.customBrush?.length && shouldScatterCustomBrush(
-      settings.customBrush,
-      reachability,
-      footprint,
-      image,
-      clipMinX,
-      clipMaxX,
-      clipMinY,
-      clipMaxY,
-      mirrorX,
-      mirrorY,
-    )) {
+    const customBrush = settings.customBrush ?? [];
+    const scatterCustomBrush = customBrush?.length
+      ? shouldScatterCustomBrush(customBrush, reachability, footprint, image, clipMinX, clipMaxX, clipMinY, clipMaxY, mirrorX, mirrorY)
+      : false;
+    if (scatterCustomBrush) {
       const add = (x: number, y: number) => {
         if (x < clipMinX || y < clipMinY || x >= clipMaxX || y >= clipMaxY) return;
         const index = y * image.width + x;
@@ -276,7 +277,7 @@ export function toolCursorOverlay(
         const minY = reachability.minYByX[column];
         const maxY = reachability.maxYByX[column];
         for (let centerY = minY; centerY <= maxY; centerY += 1) {
-          for (const offset of settings.customBrush) {
+          for (const offset of customBrush) {
             const x = centerX + offset.x;
             const y = centerY + offset.y;
             add(x, y);
@@ -287,7 +288,12 @@ export function toolCursorOverlay(
         }
       }
     } else {
-      const stamped = (x: number, y: number) => sprayStampContains(x, y, settings, reachability);
+      let customOffsetKeys: Set<string> | undefined;
+      if (customBrush?.length) {
+        customOffsetKeys = new Set<string>();
+        for (const offset of customBrush) customOffsetKeys.add(`${offset.x},${offset.y}`);
+      }
+      const stamped = (x: number, y: number) => sprayStampContains(x, y, settings, reachability, customOffsetKeys);
       for (const region of mirrorRegions(footprint, image.width, image.height, mirrorX, mirrorY)) {
         const regionMinX = Math.max(clipMinX, Math.ceil(region.minX));
         const regionMaxX = Math.min(clipMaxX, Math.floor(region.maxX) + 1);
