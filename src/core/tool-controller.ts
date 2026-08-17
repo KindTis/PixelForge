@@ -33,6 +33,21 @@ export type ToolSettings = {
   random?: () => number;
 };
 
+export type ToolCursorSettings = Pick<ToolSettings,
+  "tool" | "brushSize" | "brushShape" | "customBrush" | "mirrorX" | "mirrorY" | "selection"
+>;
+export type ToolCursorBounds = {
+  documentWidth: number;
+  documentHeight: number;
+  celX: number;
+  celY: number;
+};
+export type ToolCursorOverlay = {
+  pixels: Point[];
+  mirrorAxisX?: number;
+  mirrorAxisY?: number;
+};
+
 export type ToolResult = { command?: EditCommand; color?: RGBA; selection?: Uint8Array };
 
 export function screenToPixel(clientX: number, clientY: number, bounds: { left: number; top: number }, view: { zoom: number; panX: number; panY: number }): Point {
@@ -44,6 +59,75 @@ export function screenToPixel(clientX: number, clientY: number, bounds: { left: 
 
 function unique(points: Point[]): Point[] {
   return [...new Map(points.map((point) => [`${point.x},${point.y}`, point])).values()];
+}
+
+const STAMP_TOOLS = new Set<EditorTool>([
+  "pencil", "eraser", "line", "curve", "rectangle", "ellipse", "polygon", "spray",
+]);
+const DOCUMENT_TARGET_TOOLS = new Set<EditorTool>(["gradient", "select", "lasso"]);
+const BUFFER_TARGET_TOOLS = new Set<EditorTool>(["fill", "eyedropper", "wand"]);
+
+function stamp(points: Point[], settings: Pick<ToolSettings, "brushSize" | "brushShape" | "customBrush">): Point[] {
+  const centers = unique(points);
+  return settings.customBrush?.length
+    ? unique(centers.flatMap((point) => settings.customBrush!.map((offset) => ({ x: point.x + offset.x, y: point.y + offset.y }))))
+    : stampBrush(centers, settings.brushSize, settings.brushShape);
+}
+
+// ponytail: 포인터 이동마다 정확한 합집합을 직접 계산한다. 지연이 실측되면 설정별 상대 오프셋을 캐시한다.
+function reachableSprayCenters(center: Point, radius: number): Point[] {
+  const extent = Math.ceil(radius + 0.5);
+  const points: Point[] = [];
+  for (let y = -extent; y <= extent; y += 1) {
+    for (let x = -extent; x <= extent; x += 1) {
+      const nearestX = Math.max(0, Math.abs(x) - 0.5);
+      const nearestY = Math.max(0, Math.abs(y) - 0.5);
+      if (nearestX * nearestX + nearestY * nearestY <= radius * radius) {
+        points.push({ x: center.x + x, y: center.y + y });
+      }
+    }
+  }
+  return points;
+}
+
+export function toolCursorOverlay(
+  point: Point,
+  settings: ToolCursorSettings,
+  image: PixelBuffer,
+  bounds: ToolCursorBounds,
+): ToolCursorOverlay {
+  const documentPoint = { x: Math.round(point.x), y: Math.round(point.y) };
+  const localPoint = { x: documentPoint.x - bounds.celX, y: documentPoint.y - bounds.celY };
+  const inDocument = ({ x, y }: Point) => x >= 0 && y >= 0 && x < bounds.documentWidth && y < bounds.documentHeight;
+  const inImage = ({ x, y }: Point) => x >= 0 && y >= 0 && x < image.width && y < image.height;
+
+  if (DOCUMENT_TARGET_TOOLS.has(settings.tool)) {
+    return { pixels: inDocument(documentPoint) ? [documentPoint] : [] };
+  }
+
+  if (BUFFER_TARGET_TOOLS.has(settings.tool)) {
+    const selected = settings.tool !== "fill" || !settings.selection
+      || Boolean(settings.selection[localPoint.y * image.width + localPoint.x]);
+    return { pixels: inDocument(documentPoint) && inImage(localPoint) && selected ? [documentPoint] : [] };
+  }
+
+  if (!STAMP_TOOLS.has(settings.tool)) return { pixels: [] };
+  const radius = Math.max(1, settings.brushSize * 2);
+  const centers = settings.tool === "spray" ? reachableSprayCenters(localPoint, radius) : [localPoint];
+  const localPixels = mirror(stamp(centers, settings), image.width, image.height, Boolean(settings.mirrorX), Boolean(settings.mirrorY));
+  const pixels = unique(localPixels)
+    .filter((candidate) => {
+      if (!inImage(candidate)) return false;
+      if (settings.selection && !settings.selection[candidate.y * image.width + candidate.x]) return false;
+      return inDocument({ x: candidate.x + bounds.celX, y: candidate.y + bounds.celY });
+    })
+    .map(({ x, y }) => ({ x: x + bounds.celX, y: y + bounds.celY }));
+
+  return {
+    pixels,
+    ...(pixels.length && settings.mirrorX ? { mirrorAxisX: bounds.celX + image.width / 2 } : {}),
+    ...(pixels.length && settings.mirrorY ? { mirrorAxisY: bounds.celY + image.height / 2 } : {}),
+  };
 }
 
 export class ToolController {
@@ -101,9 +185,7 @@ export class ToolController {
               : this.settings.tool === "ellipse" ? ellipse(start, end, this.settings.filled)
                 : this.settings.tool === "polygon" ? polygon([start, { x: start.x, y: end.y }, end], this.settings.filled)
                   : unique(this.path.flatMap((point) => spray(point, Math.max(1, this.settings.brushSize * 2), Math.max(8, this.settings.brushSize * 8), this.settings.random)));
-      points = this.settings.customBrush?.length
-        ? unique(points.flatMap((point) => this.settings.customBrush!.map((offset) => ({ x: point.x + offset.x, y: point.y + offset.y }))))
-        : stampBrush(unique(points), this.settings.brushSize, this.settings.brushShape);
+      points = stamp(points, this.settings);
       points = mirror(points, this.image.width, this.image.height, Boolean(this.settings.mirrorX), Boolean(this.settings.mirrorY));
       const rgba: RGBA = this.settings.tool === "eraser" ? [0, 0, 0, 0] : this.settings.color;
       pixels = points.map(({ x, y }) => ({ x, y, rgba }));
