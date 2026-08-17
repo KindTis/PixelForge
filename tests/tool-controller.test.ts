@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { ToolController, screenToPixel, toolCursorOverlay, type ToolCursorSettings } from "../src/core/tool-controller.ts";
+import { mirror, stampBrush } from "../src/core/raster.ts";
 
 const blank = { width: 4, height: 4, data: new Uint8ClampedArray(4 * 4 * 4) };
 
@@ -155,6 +156,14 @@ test("도장 중심이 문서 밖이어도 편집 가능한 교집합과 셀 축
   assert.deepEqual(overlay.pixels.map(({ x, y }) => `${x},${y}`).sort(), ["0,0", "0,1"]);
   assert.equal(overlay.mirrorAxisX, 2);
   assert.equal(overlay.mirrorAxisY, 1);
+
+  const mirroredIntoDocument = toolCursorOverlay(
+    { x: 3, y: 0 },
+    { tool: "pencil", brushSize: 1, brushShape: "square", mirrorX: true },
+    image,
+    { documentWidth: 2, documentHeight: 2, celX: 0, celY: 0 },
+  );
+  assert.deepEqual(mirroredIntoDocument.pixels, [{ x: 0, y: 0 }]);
 });
 
 test("최대 스프레이는 최종 버퍼 크기에 가까운 작업량으로 범위를 계산한다", () => {
@@ -176,5 +185,73 @@ test("최대 스프레이는 최종 버퍼 크기에 가까운 작업량으로 �
     assert.ok(callbackCalls <= image.width * image.height * 4, `flatMap callback count: ${callbackCalls}`);
   } finally {
     Array.prototype.flatMap = originalFlatMap as typeof Array.prototype.flatMap;
+  }
+});
+
+test("작은 도장 footprint는 큰 셀 버퍼 전체를 순회하지 않는다", () => {
+  const image = { width: 256, height: 256, data: new Uint8ClampedArray(256 * 256 * 4) };
+  let membershipReads = 0;
+  const selection = new Proxy({} as Record<string, number>, {
+    get(target, property) {
+      if (typeof property === "string" && /^\d+$/.test(property)) membershipReads += 1;
+      return 1;
+    },
+  }) as unknown as Uint8Array;
+
+  const overlay = toolCursorOverlay(
+    { x: 100, y: 80 },
+    { tool: "spray", brushSize: 1, brushShape: "square", mirrorX: true, mirrorY: true, selection },
+    image,
+    { documentWidth: 256, documentHeight: 256, celX: 0, celY: 0 },
+  );
+
+  assert.ok(overlay.pixels.length > 0);
+  assert.ok(membershipReads <= 500, `selection membership reads: ${membershipReads}`);
+});
+
+function referenceSprayCursor(
+  point: { x: number; y: number },
+  settings: ToolCursorSettings,
+  image: { width: number; height: number },
+  bounds: { documentWidth: number; documentHeight: number; celX: number; celY: number },
+): string[] {
+  const documentPoint = { x: Math.round(point.x), y: Math.round(point.y) };
+  const localPoint = { x: documentPoint.x - bounds.celX, y: documentPoint.y - bounds.celY };
+  const radius = Math.max(1, settings.brushSize * 2);
+  const extent = Math.ceil(radius + 0.5);
+  const centers: Array<{ x: number; y: number }> = [];
+  for (let y = -extent; y <= extent; y += 1) for (let x = -extent; x <= extent; x += 1) {
+    const nearestX = Math.max(0, Math.abs(x) - 0.5);
+    const nearestY = Math.max(0, Math.abs(y) - 0.5);
+    if (nearestX * nearestX + nearestY * nearestY <= radius * radius) centers.push({ x: localPoint.x + x, y: localPoint.y + y });
+  }
+  const stamped = settings.customBrush?.length
+    ? [...new Map(centers.flatMap((center) => settings.customBrush!.map((offset) => ({ x: center.x + offset.x, y: center.y + offset.y }))).map((candidate) => [`${candidate.x},${candidate.y}`, candidate])).values()]
+    : stampBrush(centers, settings.brushSize, settings.brushShape);
+  const pixels = mirror(stamped, image.width, image.height, Boolean(settings.mirrorX), Boolean(settings.mirrorY));
+  return [...new Set(pixels.filter(({ x, y }) => (
+    x >= 0 && y >= 0 && x < image.width && y < image.height
+    && (!settings.selection || settings.selection[y * image.width + x])
+    && x + bounds.celX >= 0 && y + bounds.celY >= 0
+    && x + bounds.celX < bounds.documentWidth && y + bounds.celY < bounds.documentHeight
+  )).map(({ x, y }) => `${x + bounds.celX},${y + bounds.celY}`))].sort();
+}
+
+test("스프레이 최적화는 독립 reference와 표준·사용자 브러시 및 미러 결과가 같다", () => {
+  const image = { width: 5, height: 4, data: new Uint8ClampedArray(5 * 4 * 4) };
+  const bounds = { documentWidth: 4, documentHeight: 3, celX: 1, celY: 0 };
+  const selection = new Uint8Array(image.width * image.height).fill(1);
+  selection[1 * image.width + 2] = 0;
+  const cases: ToolCursorSettings[] = [
+    { tool: "spray", brushSize: 1, brushShape: "square", selection },
+    { tool: "spray", brushSize: 2, brushShape: "circle", mirrorX: true, selection },
+    { tool: "spray", brushSize: 3, brushShape: "square", mirrorY: true, selection },
+    { tool: "spray", brushSize: 1, brushShape: "circle", customBrush: [{ x: -1, y: 0 }, { x: 0, y: 1 }, { x: 1, y: -1 }], mirrorX: true, mirrorY: true, selection },
+  ];
+
+  for (const settings of cases) {
+    const point = { x: 0, y: 1 };
+    const actual = toolCursorOverlay(point, settings, image, bounds).pixels.map(({ x, y }) => `${x},${y}`).sort();
+    assert.deepEqual(actual, referenceSprayCursor(point, settings, image, bounds), JSON.stringify(settings));
   }
 });

@@ -75,6 +75,39 @@ function stamp(points: Point[], settings: Pick<ToolSettings, "brushSize" | "brus
 }
 
 type SprayReachability = { minX: number; minYByX: Int32Array; maxYByX: Int32Array };
+type Bounds = { minX: number; maxX: number; minY: number; maxY: number };
+
+function stampBounds(settings: Pick<ToolSettings, "brushSize" | "brushShape" | "customBrush">): Bounds {
+  if (settings.customBrush?.length) {
+    return settings.customBrush.reduce((bounds, point) => ({
+      minX: Math.min(bounds.minX, point.x),
+      maxX: Math.max(bounds.maxX, point.x),
+      minY: Math.min(bounds.minY, point.y),
+      maxY: Math.max(bounds.maxY, point.y),
+    }), { minX: Infinity, maxX: -Infinity, minY: Infinity, maxY: -Infinity });
+  }
+  const diameter = Math.max(1, Math.round(settings.brushSize));
+  const before = Math.floor((diameter - 1) / 2);
+  const after = diameter - before - 1;
+  return { minX: -before, maxX: after, minY: -before, maxY: after };
+}
+
+function transformBounds(bounds: Bounds, width: number, height: number, horizontal: boolean, vertical: boolean): Bounds {
+  return {
+    minX: horizontal ? width - bounds.maxX - 1 : bounds.minX,
+    maxX: horizontal ? width - bounds.minX - 1 : bounds.maxX,
+    minY: vertical ? height - bounds.maxY - 1 : bounds.minY,
+    maxY: vertical ? height - bounds.minY - 1 : bounds.maxY,
+  };
+}
+
+function mirrorRegions(bounds: Bounds, width: number, height: number, horizontal: boolean, vertical: boolean): Bounds[] {
+  const regions = [bounds];
+  if (horizontal) regions.push(transformBounds(bounds, width, height, true, false));
+  if (vertical) regions.push(transformBounds(bounds, width, height, false, true));
+  if (horizontal && vertical) regions.push(transformBounds(bounds, width, height, true, true));
+  return regions;
+}
 
 // ponytail: 중심 객체×브러시 픽셀을 만들지 않고 열별 구간으로 압축한다. 더 빠른 캐시는 실측될 때만 검토한다.
 function reachableSprayColumns(center: Point, radius: number): SprayReachability {
@@ -163,18 +196,34 @@ export function toolCursorOverlay(
 
   if (!STAMP_TOOLS.has(settings.tool)) return { pixels: [] };
   const radius = Math.max(1, settings.brushSize * 2);
-  const minX = Math.max(0, -bounds.celX);
-  const maxX = Math.min(image.width, bounds.documentWidth - bounds.celX);
-  const minY = Math.max(0, -bounds.celY);
-  const maxY = Math.min(image.height, bounds.documentHeight - bounds.celY);
+  const offsetBounds = stampBounds(settings);
+  const sprayExtent = settings.tool === "spray" ? Math.ceil(radius + 0.5) : 0;
+  const footprint = {
+    minX: localPoint.x + offsetBounds.minX - sprayExtent,
+    maxX: localPoint.x + offsetBounds.maxX + sprayExtent,
+    minY: localPoint.y + offsetBounds.minY - sprayExtent,
+    maxY: localPoint.y + offsetBounds.maxY + sprayExtent,
+  };
+  const clipMinX = Math.max(0, -bounds.celX);
+  const clipMaxX = Math.min(image.width, bounds.documentWidth - bounds.celX);
+  const clipMinY = Math.max(0, -bounds.celY);
+  const clipMaxY = Math.min(image.height, bounds.documentHeight - bounds.celY);
   const pixels: Point[] = [];
-  if (minX < maxX && minY < maxY) {
-    if (settings.tool === "spray") {
-      const reachability = reachableSprayColumns(localPoint, radius);
-      const stamped = (x: number, y: number) => sprayStampContains(x, y, settings, reachability);
-      for (let y = minY; y < maxY; y += 1) {
-        for (let x = minX; x < maxX; x += 1) {
-          if (settings.selection && !settings.selection[y * image.width + x]) continue;
+  if (settings.tool === "spray") {
+    const reachability = reachableSprayColumns(localPoint, radius);
+    const stamped = (x: number, y: number) => sprayStampContains(x, y, settings, reachability);
+    const seen = new Set<number>();
+    for (const region of mirrorRegions(footprint, image.width, image.height, Boolean(settings.mirrorX), Boolean(settings.mirrorY))) {
+      const regionMinX = Math.max(clipMinX, Math.ceil(region.minX));
+      const regionMaxX = Math.min(clipMaxX, Math.floor(region.maxX) + 1);
+      const regionMinY = Math.max(clipMinY, Math.ceil(region.minY));
+      const regionMaxY = Math.min(clipMaxY, Math.floor(region.maxY) + 1);
+      for (let y = regionMinY; y < regionMaxY; y += 1) {
+        for (let x = regionMinX; x < regionMaxX; x += 1) {
+          const index = y * image.width + x;
+          if (seen.has(index)) continue;
+          seen.add(index);
+          if (settings.selection && !settings.selection[index]) continue;
           if (!stamped(x, y)
             && (!settings.mirrorX || !stamped(image.width - x - 1, y))
             && (!settings.mirrorY || !stamped(x, image.height - y - 1))
@@ -182,16 +231,16 @@ export function toolCursorOverlay(
           pixels.push({ x: x + bounds.celX, y: y + bounds.celY });
         }
       }
-    } else {
-      const localPixels = mirror(stamp([localPoint], settings), image.width, image.height, Boolean(settings.mirrorX), Boolean(settings.mirrorY));
-      pixels.push(...unique(localPixels)
-        .filter((candidate) => {
-          if (!inImage(candidate)) return false;
-          if (settings.selection && !settings.selection[candidate.y * image.width + candidate.x]) return false;
-          return inDocument({ x: candidate.x + bounds.celX, y: candidate.y + bounds.celY });
-        })
-        .map(({ x, y }) => ({ x: x + bounds.celX, y: y + bounds.celY })));
     }
+  } else {
+    const localPixels = mirror(stamp([localPoint], settings), image.width, image.height, Boolean(settings.mirrorX), Boolean(settings.mirrorY));
+    pixels.push(...unique(localPixels)
+      .filter((candidate) => {
+        if (!inImage(candidate)) return false;
+        if (settings.selection && !settings.selection[candidate.y * image.width + candidate.x]) return false;
+        return inDocument({ x: candidate.x + bounds.celX, y: candidate.y + bounds.celY });
+      })
+      .map(({ x, y }) => ({ x: x + bounds.celX, y: y + bounds.celY })));
   }
 
   return {
