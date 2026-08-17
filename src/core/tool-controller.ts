@@ -109,6 +109,43 @@ function mirrorRegions(bounds: Bounds, width: number, height: number, horizontal
   return regions;
 }
 
+function reachableSprayCenterCount(reachability: SprayReachability): number {
+  let count = 0;
+  for (let column = 0; column < reachability.minYByX.length; column += 1) {
+    const minY = reachability.minYByX[column];
+    const maxY = reachability.maxYByX[column];
+    if (minY <= maxY) count += maxY - minY + 1;
+  }
+  return count;
+}
+
+function clippedBoundsArea(bounds: Bounds, minX: number, maxX: number, minY: number, maxY: number): number {
+  const clippedMinX = Math.max(minX, Math.ceil(bounds.minX));
+  const clippedMaxX = Math.min(maxX, Math.floor(bounds.maxX) + 1);
+  const clippedMinY = Math.max(minY, Math.ceil(bounds.minY));
+  const clippedMaxY = Math.min(maxY, Math.floor(bounds.maxY) + 1);
+  return Math.max(0, clippedMaxX - clippedMinX) * Math.max(0, clippedMaxY - clippedMinY);
+}
+
+function shouldScatterCustomBrush(
+  customBrush: Point[],
+  reachability: SprayReachability,
+  footprint: Bounds,
+  image: { width: number; height: number },
+  clipMinX: number,
+  clipMaxX: number,
+  clipMinY: number,
+  clipMaxY: number,
+  mirrorX: boolean,
+  mirrorY: boolean,
+): boolean {
+  const scanWork = mirrorRegions(footprint, image.width, image.height, mirrorX, mirrorY)
+    .reduce((total, region) => total + clippedBoundsArea(region, clipMinX, clipMaxX, clipMinY, clipMaxY), 0);
+  const mirrorCount = 1 + (mirrorX ? 1 : 0) + (mirrorY ? 1 : 0) + (mirrorX && mirrorY ? 1 : 0);
+  const scatterWork = reachableSprayCenterCount(reachability) * customBrush.length * mirrorCount;
+  return scatterWork < scanWork;
+}
+
 // ponytail: 중심 객체×브러시 픽셀을 만들지 않고 열별 구간으로 압축한다. 더 빠른 캐시는 실측될 때만 검토한다.
 function reachableSprayColumns(center: Point, radius: number): SprayReachability {
   const extent = Math.ceil(radius + 0.5);
@@ -211,24 +248,63 @@ export function toolCursorOverlay(
   const pixels: Point[] = [];
   if (settings.tool === "spray") {
     const reachability = reachableSprayColumns(localPoint, radius);
-    const stamped = (x: number, y: number) => sprayStampContains(x, y, settings, reachability);
     const seen = new Set<number>();
-    for (const region of mirrorRegions(footprint, image.width, image.height, Boolean(settings.mirrorX), Boolean(settings.mirrorY))) {
-      const regionMinX = Math.max(clipMinX, Math.ceil(region.minX));
-      const regionMaxX = Math.min(clipMaxX, Math.floor(region.maxX) + 1);
-      const regionMinY = Math.max(clipMinY, Math.ceil(region.minY));
-      const regionMaxY = Math.min(clipMaxY, Math.floor(region.maxY) + 1);
-      for (let y = regionMinY; y < regionMaxY; y += 1) {
-        for (let x = regionMinX; x < regionMaxX; x += 1) {
-          const index = y * image.width + x;
-          if (seen.has(index)) continue;
-          seen.add(index);
-          if (settings.selection && !settings.selection[index]) continue;
-          if (!stamped(x, y)
-            && (!settings.mirrorX || !stamped(image.width - x - 1, y))
-            && (!settings.mirrorY || !stamped(x, image.height - y - 1))
-            && (!(settings.mirrorX && settings.mirrorY) || !stamped(image.width - x - 1, image.height - y - 1))) continue;
-          pixels.push({ x: x + bounds.celX, y: y + bounds.celY });
+    const mirrorX = Boolean(settings.mirrorX);
+    const mirrorY = Boolean(settings.mirrorY);
+    if (settings.customBrush?.length && shouldScatterCustomBrush(
+      settings.customBrush,
+      reachability,
+      footprint,
+      image,
+      clipMinX,
+      clipMaxX,
+      clipMinY,
+      clipMaxY,
+      mirrorX,
+      mirrorY,
+    )) {
+      const add = (x: number, y: number) => {
+        if (x < clipMinX || y < clipMinY || x >= clipMaxX || y >= clipMaxY) return;
+        const index = y * image.width + x;
+        if (seen.has(index)) return;
+        seen.add(index);
+        if (settings.selection && !settings.selection[index]) return;
+        pixels.push({ x: x + bounds.celX, y: y + bounds.celY });
+      };
+      for (let column = 0; column < reachability.minYByX.length; column += 1) {
+        const centerX = reachability.minX + column;
+        const minY = reachability.minYByX[column];
+        const maxY = reachability.maxYByX[column];
+        for (let centerY = minY; centerY <= maxY; centerY += 1) {
+          for (const offset of settings.customBrush) {
+            const x = centerX + offset.x;
+            const y = centerY + offset.y;
+            add(x, y);
+            if (mirrorX) add(image.width - x - 1, y);
+            if (mirrorY) add(x, image.height - y - 1);
+            if (mirrorX && mirrorY) add(image.width - x - 1, image.height - y - 1);
+          }
+        }
+      }
+    } else {
+      const stamped = (x: number, y: number) => sprayStampContains(x, y, settings, reachability);
+      for (const region of mirrorRegions(footprint, image.width, image.height, mirrorX, mirrorY)) {
+        const regionMinX = Math.max(clipMinX, Math.ceil(region.minX));
+        const regionMaxX = Math.min(clipMaxX, Math.floor(region.maxX) + 1);
+        const regionMinY = Math.max(clipMinY, Math.ceil(region.minY));
+        const regionMaxY = Math.min(clipMaxY, Math.floor(region.maxY) + 1);
+        for (let y = regionMinY; y < regionMaxY; y += 1) {
+          for (let x = regionMinX; x < regionMaxX; x += 1) {
+            const index = y * image.width + x;
+            if (seen.has(index)) continue;
+            seen.add(index);
+            if (settings.selection && !settings.selection[index]) continue;
+            if (!stamped(x, y)
+              && (!mirrorX || !stamped(image.width - x - 1, y))
+              && (!mirrorY || !stamped(x, image.height - y - 1))
+              && (!(mirrorX && mirrorY) || !stamped(image.width - x - 1, image.height - y - 1))) continue;
+            pixels.push({ x: x + bounds.celX, y: y + bounds.celY });
+          }
         }
       }
     }

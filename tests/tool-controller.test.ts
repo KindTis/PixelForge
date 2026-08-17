@@ -209,6 +209,33 @@ test("작은 도장 footprint는 큰 셀 버퍼 전체를 순회하지 않는다
   assert.ok(membershipReads <= 500, `selection membership reads: ${membershipReads}`);
 });
 
+test("희소 사용자 브러시는 빈 bbox를 순회하지 않는다", () => {
+  const image = { width: 1024, height: 1024, data: new Uint8ClampedArray(1) };
+  let membershipReads = 0;
+  const selection = new Proxy({} as Record<string, number>, {
+    get(target, property) {
+      if (typeof property === "string" && /^\d+$/.test(property)) membershipReads += 1;
+      return 1;
+    },
+  }) as unknown as Uint8Array;
+
+  const overlay = toolCursorOverlay(
+    { x: 512, y: 512 },
+    {
+      tool: "spray",
+      brushSize: 1,
+      brushShape: "square",
+      customBrush: [{ x: -500, y: -500 }, { x: 500, y: 500 }],
+      selection,
+    },
+    image,
+    { documentWidth: 1024, documentHeight: 1024, celX: 0, celY: 0 },
+  );
+
+  assert.ok(overlay.pixels.length < 100, `output pixels: ${overlay.pixels.length}`);
+  assert.ok(membershipReads <= 100, `selection membership reads: ${membershipReads}`);
+});
+
 function referenceSprayCursor(
   point: { x: number; y: number },
   settings: ToolCursorSettings,
@@ -238,20 +265,26 @@ function referenceSprayCursor(
 }
 
 test("스프레이 최적화는 독립 reference와 표준·사용자 브러시 및 미러 결과가 같다", () => {
-  const image = { width: 5, height: 4, data: new Uint8ClampedArray(5 * 4 * 4) };
-  const bounds = { documentWidth: 4, documentHeight: 3, celX: 1, celY: 0 };
+  const image = { width: 20, height: 20, data: new Uint8ClampedArray(1) };
+  const bounds = { documentWidth: 18, documentHeight: 18, celX: 1, celY: 1 };
   const selection = new Uint8Array(image.width * image.height).fill(1);
-  selection[1 * image.width + 2] = 0;
+  selection[4 * image.width + 6] = 0;
   const cases: ToolCursorSettings[] = [
-    { tool: "spray", brushSize: 1, brushShape: "square", selection },
+    { tool: "spray", brushSize: 2, brushShape: "square", selection },
+    { tool: "spray", brushSize: 2, brushShape: "circle", selection },
     { tool: "spray", brushSize: 2, brushShape: "circle", mirrorX: true, selection },
-    { tool: "spray", brushSize: 3, brushShape: "square", mirrorY: true, selection },
+    { tool: "spray", brushSize: 2, brushShape: "circle", mirrorY: true, selection },
+    { tool: "spray", brushSize: 2, brushShape: "circle", mirrorX: true, mirrorY: true, selection },
     { tool: "spray", brushSize: 1, brushShape: "circle", customBrush: [{ x: -1, y: 0 }, { x: 0, y: 1 }, { x: 1, y: -1 }], mirrorX: true, mirrorY: true, selection },
   ];
 
-  for (const settings of cases) {
-    const point = { x: 0, y: 1 };
-    const actual = toolCursorOverlay(point, settings, image, bounds).pixels.map(({ x, y }) => `${x},${y}`).sort();
-    assert.deepEqual(actual, referenceSprayCursor(point, settings, image, bounds), JSON.stringify(settings));
+  const point = { x: 5, y: 5 };
+  const actual = cases.map((settings) => toolCursorOverlay(point, settings, image, bounds).pixels.map(({ x, y }) => `${x},${y}`).sort());
+  for (let index = 0; index < cases.length; index += 1) {
+    assert.deepEqual(actual[index], referenceSprayCursor(point, cases[index], image, bounds), JSON.stringify(cases[index]));
   }
+  assert.notDeepEqual(actual[0], actual[1], "square와 circle이 같은 footprint가 되지 않아야 한다");
+  assert.notDeepEqual(actual[1], actual[2], "mirrorX가 결과를 바꿔야 한다");
+  assert.notDeepEqual(actual[1], actual[3], "mirrorY가 결과를 바꿔야 한다");
+  assert.notDeepEqual(actual[1], actual[4], "mirrorX+mirrorY가 결과를 바꿔야 한다");
 });
