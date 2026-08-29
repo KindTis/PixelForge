@@ -2,7 +2,7 @@
 .playwright-cli/
 .codex/
 .superpowers/
-docs/
+docs/superpowers/
 /graphify-out/
 /AGENTS.md
 node_modules/
