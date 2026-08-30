@@ -2,7 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import type { AiEditReadyResult, AiEditRequest } from "../src/core/ai-edit.ts";
 import { createDocument, createProject } from "../src/core/document.ts";
-import { api, cellEditApplicationDisposition, cellEditApplicationRequestTimeout, cellEditCompletionNotice, cellEditPayload, codexJobStatusTitle, completedFrameIndex, decodeProject, encodeProject, failedCodexJob, generationPayload, isRetryablePollingError, pollingErrorCodexJob, projectJobOwnershipMatches, projectLifetimeMatches, releaseProjectJobOwnership, type CellEditJob, type GenerationJob, type WireProject } from "../src/client/api.ts";
+import { addFrame } from "../src/core/timeline.ts";
+import type { AnimationDirection } from "../src/core/types.ts";
+import { api, cellEditApplicationDisposition, cellEditApplicationRequestTimeout, cellEditCompletionNotice, cellEditPayload, codexJobStatusTitle, completedFrameIndex, completedGenerationSelection, decodeProject, encodeProject, failedCodexJob, generationPayload, isInitialBlankProject, isRetryablePollingError, pollingErrorCodexJob, projectJobOwnershipMatches, projectLifetimeMatches, releaseProjectJobOwnership, type CellEditJob, type GenerationJob, type WireProject } from "../src/client/api.ts";
 
 test("프로젝트 픽셀을 JSON 배열로 보내고 Uint8ClampedArray로 복원한다", () => {
   const project = createProject("저장", createDocument({ width: 1, height: 1 }));
@@ -32,11 +34,64 @@ test("전체 및 선택 프레임 생성을 위한 요청 본문을 조립한다
   });
 
   const selectedId = project.document.frames[0].id;
-  assert.deepEqual(generationPayload(project, "검 공격", 8, 4, undefined, selectedId), {
+  assert.deepEqual(generationPayload(project, "검 공격", 8, 4, undefined, { frameId: selectedId }), {
     projectId: project.id,
     frameId: selectedId,
     request,
   });
+});
+
+test("추가 생성 payload는 frameId 없이 appendAnimation 메타데이터를 보낸다", () => {
+  const project = createProject("기사", createDocument({ width: 16, height: 24 }));
+  const appendAnimation = {
+    name: "attack",
+    baseFrameId: project.document.frames[0].id,
+    targetLayerId: project.document.layers[0].id,
+    direction: "reverse" as const,
+  };
+  const payload = generationPayload(project, "검 공격", 3, 2, undefined, { appendAnimation });
+  assert.deepEqual(payload.appendAnimation, appendAnimation);
+  assert.equal("frameId" in payload, false);
+  assert.equal(payload.request.durationMs, 100);
+});
+
+function appendedProject(direction: AnimationDirection) {
+  let document = createDocument({ width: 1, height: 1 });
+  for (let index = 1; index < 4; index += 1) document = addFrame(document);
+  document.tags.push({
+    id: crypto.randomUUID(),
+    name: "attack",
+    fromFrameId: document.frames[0].id,
+    toFrameId: document.frames[3].id,
+    direction,
+  });
+  return createProject("기사", document);
+}
+
+test("추가 완료 선택은 새 태그의 재생 첫 프레임과 물리 프레임 수를 반환한다", () => {
+  const project = appendedProject("reverse");
+  const target = {
+    appendAnimation: {
+      name: "attack",
+      baseFrameId: "base",
+      targetLayerId: "layer",
+      direction: "reverse" as const,
+    },
+  };
+  const selection = completedGenerationSelection(project, target);
+  const tag = project.document.tags.find((candidate) => candidate.name === "attack")!;
+  assert.deepEqual(selection, {
+    frameIndex: project.document.frames.findIndex((frame) => frame.id === tag.toFrameId),
+    tag,
+    frameCount: 4,
+  });
+});
+
+test("초기 빈 프로젝트만 전체 시트 교체 확인을 생략한다", () => {
+  const project = createProject("기사", createDocument({ width: 1, height: 1 }));
+  assert.equal(isInitialBlankProject(project), true);
+  Object.values(project.document.images)[0].data[3] = 1;
+  assert.equal(isInitialBlankProject(project), false);
 });
 
 test("현재 셀 편집 요청 본문을 그대로 조립한다", () => {

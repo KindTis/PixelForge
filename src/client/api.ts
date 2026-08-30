@@ -1,5 +1,6 @@
 import type { AiEditReadyResult, AiEditRequest, AiEditTarget } from "../core/ai-edit.ts";
-import type { PixelBuffer, SpriteProject } from "../core/types.ts";
+import { frameSequence } from "../core/animation.ts";
+import type { AnimationDirection, PixelBuffer, SpriteProject } from "../core/types.ts";
 
 export type WireProject = Omit<SpriteProject, "document"> & {
   document: Omit<SpriteProject["document"], "images"> & {
@@ -44,6 +45,17 @@ export type CodexJob = GenerationJob | CellEditJob;
 export type ProjectLifetime = { projectId: string; epoch: number };
 export type ProjectJobOwnership = ProjectLifetime & { jobId: string };
 
+export type AppendAnimationTarget = {
+  name: string;
+  baseFrameId: string;
+  targetLayerId: string;
+  direction: AnimationDirection;
+};
+
+export type GenerationTarget =
+  | { frameId: string; appendAnimation?: never }
+  | { appendAnimation: AppendAnimationTarget; frameId?: never };
+
 export function decodeProject(value: SpriteProject | WireProject): SpriteProject {
   const images = Object.fromEntries(Object.entries(value.document.images).map(([id, image]) => [id, {
     ...image,
@@ -60,10 +72,17 @@ export function encodeProject(value: SpriteProject): WireProject {
   return { ...value, document: { ...value.document, images } };
 }
 
-export function generationPayload(project: SpriteProject, prompt: string, frameCount: number, columns: number, referencePath?: string, frameId?: string) {
+export function generationPayload(
+  project: SpriteProject,
+  prompt: string,
+  frameCount: number,
+  columns: number,
+  referencePath?: string,
+  target?: GenerationTarget,
+) {
   return {
     projectId: project.id,
-    ...(frameId === undefined ? {} : { frameId }),
+    ...target,
     request: {
       prompt,
       frameCount,
@@ -75,6 +94,14 @@ export function generationPayload(project: SpriteProject, prompt: string, frameC
       referencePath,
     },
   };
+}
+
+export function isInitialBlankProject(project: SpriteProject): boolean {
+  return project.generationHistory.length === 0
+    && project.document.frames.length === 1
+    && project.document.tags.length === 0
+    && Object.values(project.document.images).every((image) =>
+      image.data.every((channel, index) => index % 4 !== 3 || channel === 0));
 }
 
 export function cellEditPayload(projectId: string, request: AiEditRequest): { projectId: string; request: AiEditRequest } {
@@ -154,6 +181,32 @@ export function completedFrameIndex(project: SpriteProject | undefined, requeste
   const index = project.document.frames.findIndex((frame) => frame.id === requestedFrameId);
   if (index < 0) throw new Error("선택 프레임을 결과 프로젝트에서 찾을 수 없습니다.");
   return index;
+}
+
+export function completedGenerationSelection(
+  project: SpriteProject | undefined,
+  target?: GenerationTarget,
+  responseFrameId?: string,
+) {
+  if (target?.appendAnimation) {
+    if (!project) throw new Error("완료된 생성 결과가 없습니다.");
+    const tag = project.document.tags.find((candidate) => candidate.name === target.appendAnimation.name.trim());
+    if (!tag) throw new Error("완료 결과에서 추가된 애니메이션 태그를 찾을 수 없습니다.");
+    const firstId = frameSequence(tag, project.document.frames)[0];
+    const from = project.document.frames.findIndex((frame) => frame.id === tag.fromFrameId);
+    const to = project.document.frames.findIndex((frame) => frame.id === tag.toFrameId);
+    return {
+      frameIndex: project.document.frames.findIndex((frame) => frame.id === firstId),
+      tag,
+      frameCount: to - from + 1,
+    };
+  }
+  const requestedFrameId = target?.frameId;
+  return {
+    frameIndex: completedFrameIndex(project, requestedFrameId, responseFrameId),
+    tag: undefined,
+    frameCount: undefined,
+  };
 }
 
 export function pollingErrorCodexJob(job: CodexJob | undefined, id: string, error: string): CodexJob | undefined {

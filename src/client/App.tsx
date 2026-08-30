@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import type { SpriteProject } from "../core/types.ts";
 import { renameProject } from "../core/document.ts";
-import { api, cellEditApplicationDisposition, cellEditApplicationRequestTimeout, cellEditCompletionNotice, cellEditPayload, codexJobStatusTitle, completedFrameIndex, decodeProject, encodeProject, failedCodexJob, generationPayload, isRetryablePollingError, pollingErrorCodexJob, projectJobOwnershipMatches, projectLifetimeMatches, releaseProjectJobOwnership, type CellEditJob, type CodexJob, type GenerationJob, type ProjectJobOwnership, type ProjectLifetime, type Session } from "./api.ts";
+import { api, cellEditApplicationDisposition, cellEditApplicationRequestTimeout, cellEditCompletionNotice, cellEditPayload, codexJobStatusTitle, completedGenerationSelection, decodeProject, encodeProject, failedCodexJob, generationPayload, isRetryablePollingError, pollingErrorCodexJob, projectJobOwnershipMatches, projectLifetimeMatches, releaseProjectJobOwnership, type CellEditJob, type CodexJob, type GenerationJob, type GenerationTarget, type ProjectJobOwnership, type ProjectLifetime, type Session } from "./api.ts";
 import { EditorWorkspace, type EditorWorkspaceHandle } from "./editor/EditorWorkspace.tsx";
 import { ExportDialog, type ExportResponse, type ExportResult, type ExportTarget } from "./ExportDialog.tsx";
 
@@ -196,11 +196,12 @@ export function App() {
     }
   };
 
-  const poll = async (started: CodexJob, ownership: ProjectJobOwnership, requestedFrameId?: string) => {
+  const poll = async (started: CodexJob, ownership: ProjectJobOwnership, target?: GenerationTarget) => {
     let applied: ReturnType<EditorWorkspaceHandle["applyAiEdit"]> | undefined;
     let applicationError = "";
     let applicationDeadline = 0;
     let applicationCompleted = false;
+    const requestedFrameId = target && "frameId" in target ? target.frameId : undefined;
     const current = () => projectJobOwnershipMatches(projectLifetime.current, activeJobOwnership.current, ownership);
 
     try {
@@ -297,15 +298,15 @@ export function App() {
 
         if (next.kind === "generation" && next.status === "completed") {
           if (!next.project) {
-            completedFrameIndex(undefined, requestedFrameId, next.frameId);
+            completedGenerationSelection(undefined, target, next.frameId);
           } else {
             const completedProject = decodeProject(next.project);
-            const selectedFrameIndex = completedFrameIndex(completedProject, requestedFrameId, next.frameId);
+            const selection = completedGenerationSelection(completedProject, target, next.frameId);
             setJob({ ...next, project: completedProject });
             beginProjectLifetime(completedProject.id);
             setCurrentProject(completedProject);
             setDirty(false);
-            setFrameIndex(selectedFrameIndex);
+            setFrameIndex(selection.frameIndex);
             setNotice(requestedFrameId === undefined ? "생성 결과를 프레임으로 가져와 저장했습니다." : "선택 프레임을 재생성해 저장했습니다.");
           }
           return;
@@ -322,7 +323,7 @@ export function App() {
     }
   };
 
-  const generate = async (frameId?: string) => {
+  const generate = async (target?: GenerationTarget) => {
     if (!session || !project) return;
     const lifetime = beginProjectLifetime(project.id);
     setError("");
@@ -332,7 +333,7 @@ export function App() {
       if (!(await save(lifetime)) || !projectLifetimeMatches(projectLifetime.current, lifetime)) return;
       const started = await api<GenerationJob>("/api/generations", session.token, {
         method: "POST",
-        body: JSON.stringify(generationPayload(project, prompt, frameCount, Math.min(columns, frameCount), reference?.path, frameId)),
+        body: JSON.stringify(generationPayload(project, prompt, frameCount, Math.min(columns, frameCount), reference?.path, target)),
       });
       if (!projectLifetimeMatches(projectLifetime.current, lifetime)) {
         await api(`/api/generations/${started.id}`, session.token, { method: "DELETE" }).catch(() => undefined);
@@ -342,7 +343,7 @@ export function App() {
       activeJobOwnership.current = ownership;
       setJob(started);
       setStartingKind(undefined);
-      void poll(started, ownership, frameId)
+      void poll(started, ownership, target)
         .catch((reason) => {
           if (!projectJobOwnershipMatches(projectLifetime.current, activeJobOwnership.current, ownership)) return;
           const message = reason instanceof Error ? reason.message : String(reason);
@@ -627,7 +628,7 @@ export function App() {
               <button className="forge-button" type="submit" disabled={!account || codexBusy}>
                 <span>{project.generationHistory.length ? "프롬프트로 다시 생성" : "스프라이트 생성"}</span><b>⌘ ↗</b>
               </button>
-              <button className="forge-button" type="button" disabled={!account || codexBusy || !project.document.frames[frameIndex]} onClick={() => void generate(project.document.frames[frameIndex]?.id)}>
+              <button className="forge-button" type="button" disabled={!account || codexBusy || !project.document.frames[frameIndex]} onClick={() => void generate({ frameId: project.document.frames[frameIndex].id })}>
                 <span>선택 프레임 재생성</span><b>⌘ ↗</b>
               </button>
               <button className="forge-button" type="button" disabled={account?.type !== "chatgpt" || !prompt.trim() || !hasActiveCel || activeLayerLocked || codexBusy || Boolean(cellEditUnavailable)} onClick={() => void editCurrentCell()}>
