@@ -2,9 +2,12 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import * as React from "react";
 import { createDocument, createProject } from "../src/core/document.ts";
-import { EditorWorkspace } from "../src/client/editor/EditorWorkspace.tsx";
+import { duplicateFrame } from "../src/core/timeline.ts";
+import { celKey } from "../src/core/types.ts";
+import { EditorWorkspace, type GenerationPanelContext } from "../src/client/editor/EditorWorkspace.tsx";
 
 type CanvasProps = Record<string, (event: PointerEventLike) => void>;
+type ElementNode = { type?: unknown; props?: Record<string, unknown> & { children?: unknown } };
 type PointerEventLike = {
   button: number;
   clientX: number;
@@ -23,7 +26,27 @@ type CanvasLike = {
   setPointerCapture(pointerId: number): void;
 };
 
-function workspaceCanvas(project: ReturnType<typeof createProject>, captures: number[]): { props: CanvasProps; canvas: CanvasLike } {
+function elements(node: unknown): ElementNode[] {
+  if (Array.isArray(node)) return node.flatMap(elements);
+  if (!node || typeof node !== "object") return [];
+  const value = node as ElementNode;
+  const children = value.props?.children;
+  return [value, ...(Array.isArray(children) ? children : [children]).flatMap(elements)];
+}
+
+function renderedText(node: unknown): string {
+  if (Array.isArray(node)) return node.map(renderedText).join(" ");
+  if (typeof node === "string") return node;
+  if (!node || typeof node !== "object") return "";
+  const children = (node as ElementNode).props?.children;
+  return (Array.isArray(children) ? children : [children]).map(renderedText).join(" ");
+}
+
+function workspaceCanvas(
+  project: ReturnType<typeof createProject>,
+  captures: number[],
+  overrides: Record<string, unknown> = {},
+): { props: CanvasProps; canvas: CanvasLike; element: unknown } {
   const context = {
     setTransform() {}, clearRect() {}, fillRect() {}, drawImage() {}, putImageData() {},
     strokeRect() {}, setLineDash() {}, save() {}, restore() {}, beginPath() {},
@@ -51,22 +74,21 @@ function workspaceCanvas(project: ReturnType<typeof createProject>, captures: nu
       frameIndex: 0,
       readOnly: false,
       onFrameIndex() {},
+      selectedAnimationTagId: undefined,
+      onSelectedAnimationTagId() {},
       onChange() {},
       onSave() {},
       generationPanel: () => null,
       saveState: "저장됨",
       onError() {},
+      ...overrides,
     }, null);
-    const findCanvas = (node: unknown): CanvasProps | undefined => {
-      if (!node || typeof node !== "object") return undefined;
-      const value = node as { type?: unknown; props?: { children?: unknown } & CanvasProps };
-      if (value.type === "canvas") return value.props;
-      const children = value.props?.children;
-      return Array.isArray(children)
-        ? children.map(findCanvas).find(Boolean)
-        : findCanvas(children);
+    const canvasElement = elements(element).find((value) => value.type === "canvas");
+    return {
+      props: canvasElement?.props as CanvasProps ?? (() => { throw new Error("캔버스를 찾지 못했습니다."); })(),
+      canvas,
+      element,
     };
-    return { props: findCanvas(element) ?? (() => { throw new Error("캔버스를 찾지 못했습니다."); })(), canvas };
   } finally {
     internals.H = previous;
   }
@@ -124,4 +146,56 @@ test("잠긴 레이어는 포인터 편집을 시작하거나 커밋하지 않�
   } finally {
     Object.assign(globalThis, { window: previousWindow, document: previousDocument, ImageData: previousImageData });
   }
+});
+
+test("태그 선택은 aria-pressed와 재생 첫 프레임을 갱신하고 삭제는 전체 범위로 돌아간다", () => {
+  let document = createDocument({ width: 1, height: 1 });
+  document = duplicateFrame(document, document.frames[0].id);
+  const layer = document.layers[0];
+  document.cels[celKey(document.frames[1].id, layer.id)].imageId = document.cels[celKey(document.frames[0].id, layer.id)].imageId;
+  const tagId = crypto.randomUUID();
+  document.tags.push({
+    id: tagId,
+    name: "attack",
+    fromFrameId: document.frames[0].id,
+    toFrameId: document.frames[1].id,
+    direction: "reverse",
+  });
+  const project = createProject("기사", document);
+  const selected: Array<string | undefined> = [];
+  const frameIndexes: number[] = [];
+  const rendered = workspaceCanvas(project, [], {
+    selectedAnimationTagId: undefined,
+    onSelectedAnimationTagId: (id: string | undefined) => selected.push(id),
+    onFrameIndex: (index: number) => frameIndexes.push(index),
+  }).element;
+  const attack = elements(rendered).find((value) => value.type === "button" && value.props?.children === "attack");
+  assert.ok(attack);
+  assert.equal(attack.props?.["aria-pressed"], false);
+  (attack.props?.onClick as () => void)();
+  assert.deepEqual(selected, [tagId]);
+  assert.deepEqual(frameIndexes, [1]);
+  assert.match(renderedText(rendered), /연결된 셀 · 편집하면 현재 레이어의 셀만 자동 분리됩니다/);
+
+  const selectedRendered = workspaceCanvas(project, [], {
+    selectedAnimationTagId: tagId,
+    onSelectedAnimationTagId: (id: string | undefined) => selected.push(id),
+    onFrameIndex: (index: number) => frameIndexes.push(index),
+  }).element;
+  const remove = elements(selectedRendered).find((value) => value.type === "button"
+    && value.props?.["aria-label"] === "attack 애니메이션 태그 삭제");
+  assert.ok(remove);
+  (remove.props?.onClick as () => void)();
+  assert.equal(selected.at(-1), undefined);
+
+  let context: GenerationPanelContext | undefined;
+  workspaceCanvas(project, [], {
+    generationPanel: (value: GenerationPanelContext) => { context = value; return null; },
+  });
+  assert.deepEqual(context, {
+    activeFrameId: project.document.frames[0].id,
+    activeFrameNumber: 1,
+    activeLayer: project.document.layers[0],
+    hasActiveCel: true,
+  });
 });

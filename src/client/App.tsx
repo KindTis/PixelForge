@@ -85,6 +85,7 @@ export function App() {
   const activeJobOwnership = useRef<ProjectJobOwnership | undefined>(undefined);
   const editor = useRef<EditorWorkspaceHandle>(null);
   const [frameIndex, setFrameIndex] = useState(0);
+  const [selectedAnimationTagId, setSelectedAnimationTagId] = useState<string>();
   const [dirty, setDirty] = useState(false);
   const [prompt, setPrompt] = useState("칼을 휘두르는 2D 기사 캐릭터, 선명한 실루엣, 제한된 판타지 팔레트");
   const [frameCount, setFrameCount] = useState(8);
@@ -307,6 +308,7 @@ export function App() {
             setCurrentProject(completedProject);
             setDirty(false);
             setFrameIndex(selection.frameIndex);
+            if (!target) setSelectedAnimationTagId(undefined);
             setNotice(requestedFrameId === undefined ? "생성 결과를 프레임으로 가져와 저장했습니다." : "선택 프레임을 재생성해 저장했습니다.");
           }
           return;
@@ -490,6 +492,7 @@ export function App() {
       setCurrentProject(imported);
       setDirty(false);
       setFrameIndex(0);
+      setSelectedAnimationTagId(undefined);
       setNotice("PNG 시트를 프레임으로 가져왔습니다.");
     } catch (reason) {
       if (projectLifetimeMatches(projectLifetime.current, lifetime)) setError(reason instanceof Error ? reason.message : String(reason));
@@ -512,6 +515,7 @@ export function App() {
     setReference(undefined);
     setDirty(false);
     setFrameIndex(0);
+    setSelectedAnimationTagId(undefined);
     const generatedFrames = next.generationHistory.length ? next.document.frames.length : 8;
     setFrameCount(generatedFrames);
     setColumns(Math.min(next.exportSettings.columns, generatedFrames));
@@ -606,11 +610,11 @@ export function App() {
         </div>
       </header>
 
-      {!project ? <NewProject projects={projects} onOpen={openProject} onCreate={createNewProject} /> : <EditorWorkspace ref={editor} project={project} frameIndex={frameIndex} readOnly={codexBusy} onFrameIndex={setFrameIndex} onChange={(next) => {
+      {!project ? <NewProject projects={projects} onOpen={openProject} onCreate={createNewProject} /> : <EditorWorkspace ref={editor} project={project} frameIndex={frameIndex} readOnly={codexBusy} onFrameIndex={setFrameIndex} selectedAnimationTagId={selectedAnimationTagId} onSelectedAnimationTagId={setSelectedAnimationTagId} onChange={(next) => {
         setCurrentProject(next);
         const pending = cellEditApplicationPending.current;
         if (!pending || !projectJobOwnershipMatches(projectLifetime.current, activeJobOwnership.current, pending)) setDirty(true);
-      }} onSave={() => void save()} saveState={dirty ? "저장 대기" : "저장됨"} onError={setError} generationPanel={({ hasActiveCel, activeLayerLocked }) =>
+      }} onSave={() => void save()} saveState={dirty ? "저장 대기" : "저장됨"} onError={setError} generationPanel={({ hasActiveCel, activeLayer }) =>
           <section className="generation-panel">
             <div className="panel-title"><span>CODEX FORGE</span><b>{account?.type === "chatgpt" ? "연결됨" : "로그인 필요"}</b></div>
             <form onSubmit={(event) => { event.preventDefault(); void generate(); }}>
@@ -631,7 +635,7 @@ export function App() {
               <button className="forge-button" type="button" disabled={!account || codexBusy || !project.document.frames[frameIndex]} onClick={() => void generate({ frameId: project.document.frames[frameIndex].id })}>
                 <span>선택 프레임 재생성</span><b>⌘ ↗</b>
               </button>
-              <button className="forge-button" type="button" disabled={account?.type !== "chatgpt" || !prompt.trim() || !hasActiveCel || activeLayerLocked || codexBusy || Boolean(cellEditUnavailable)} onClick={() => void editCurrentCell()}>
+              <button className="forge-button" type="button" disabled={account?.type !== "chatgpt" || !prompt.trim() || !hasActiveCel || activeLayer?.locked || codexBusy || Boolean(cellEditUnavailable)} onClick={() => void editCurrentCell()}>
                 <span>현재 셀 편집</span><b>⌘ ↗</b>
               </button>
               <p className="hint cell-edit-scope">현재 프레임의 활성 레이어 셀 하나만 편집합니다.</p>
