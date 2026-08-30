@@ -1,4 +1,5 @@
 import { readFile } from "node:fs/promises";
+import { assertUniqueUnityAnimationClipFileNames, unityAnimationClipFileName } from "../../core/animation.ts";
 import type { SpriteDocument } from "../../core/types.ts";
 import { buildCommon, type ExportFile, type SheetOptions } from "./common.ts";
 
@@ -10,6 +11,7 @@ export type UnityOptions = SheetOptions & {
 export async function exportUnity(document: SpriteDocument, options: UnityOptions): Promise<ExportFile[]> {
   if (!Number.isFinite(options.pixelsPerUnit) || options.pixelsPerUnit <= 0) throw new Error("Pixels Per Unit은 0보다 커야 합니다.");
   if (options.pivot.x < 0 || options.pivot.x > 1 || options.pivot.y < 0 || options.pivot.y > 1) throw new Error("피벗은 0~1 사이여야 합니다.");
+  assertUniqueUnityAnimationClipFileNames(document.tags);
   const common = buildCommon(document, options);
   const metadata = {
     texture: "spritesheet.png",
@@ -17,7 +19,11 @@ export async function exportUnity(document: SpriteDocument, options: UnityOption
     pixelsPerUnit: options.pixelsPerUnit,
     pivot: options.pivot,
     frames: common.metadata.frames,
-    animations: Object.entries(common.metadata.animations).map(([name, animation]) => ({ name, ...animation })),
+    animations: Object.entries(common.metadata.animations).map(([name, animation]) => ({
+      name,
+      clipFilename: unityAnimationClipFileName(name),
+      ...animation,
+    })),
   };
   return [
     { path: "spritesheet.png", data: common.png },

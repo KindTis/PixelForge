@@ -1,4 +1,6 @@
-import type { Cel, Frame, Layer, PixelBuffer, SpriteProject } from "../core/types.ts";
+import { assertUniqueUnityAnimationClipFileNames } from "../core/animation.ts";
+import { addTag, duplicateFrame, moveFrame } from "../core/timeline.ts";
+import type { AnimationDirection, Cel, Frame, Layer, PixelBuffer, RGBA, SpriteProject } from "../core/types.ts";
 import { celKey } from "../core/types.ts";
 import { validateDocument } from "../core/document.ts";
 import { indexedToRgba, quantizeToPalette } from "../core/palette.ts";
@@ -28,7 +30,21 @@ export type FrameReferencePaths = {
   next?: string;
 };
 
-function validate(request: SpriteSheetRequest): void {
+export type AppendAnimationRequest = {
+  name: string;
+  baseFrameId: string;
+  targetLayerId: string;
+  direction: AnimationDirection;
+  prompt: string;
+  frameCount: number;
+  columns: number;
+  cellWidth: number;
+  cellHeight: number;
+  parentId?: string;
+  referencePath?: string;
+};
+
+function validateSheetShape(request: Pick<SpriteSheetRequest, "prompt" | "frameCount" | "columns" | "cellWidth" | "cellHeight">): void {
   if (!request.prompt.trim()) throw new Error("생성 프롬프트가 필요합니다.");
   if (!Number.isInteger(request.frameCount) || request.frameCount < 1 || request.frameCount > 256) {
     throw new Error("프레임 수는 1~256 사이의 정수여야 합니다.");
@@ -41,12 +57,50 @@ function validate(request: SpriteSheetRequest): void {
     || request.cellWidth > 4096 || request.cellHeight > 4096) {
     throw new Error("프레임 크기는 1~4096 사이의 정수여야 합니다.");
   }
-  if (!Number.isFinite(request.durationMs) || request.durationMs < 1) {
-    throw new Error("프레임 시간은 1ms 이상이어야 합니다.");
-  }
   const rows = Math.ceil(request.frameCount / request.columns);
   if (request.columns * request.cellWidth > 8192 || rows * request.cellHeight > 8192) {
     throw new Error("전체 시트 크기는 8192픽셀을 넘을 수 없습니다.");
+  }
+}
+
+function validate(request: SpriteSheetRequest): void {
+  validateSheetShape(request);
+  if (!Number.isFinite(request.durationMs) || request.durationMs < 1) {
+    throw new Error("프레임 시간은 1ms 이상이어야 합니다.");
+  }
+}
+
+export function assertAppendAnimationRequest(project: SpriteProject, request: AppendAnimationRequest): void {
+  validateDocument(project.document);
+  validateSheetShape(request);
+  const name = request.name.trim();
+  if (!name) throw new Error("애니메이션 태그 이름이 필요합니다.");
+  if (!(["forward", "reverse", "pingPong"] as const).includes(request.direction)) {
+    throw new Error("재생 방향이 올바르지 않습니다.");
+  }
+  if (project.document.tags.length === 0) {
+    throw new Error("먼저 타임라인에서 현재 전체 구간의 애니메이션 태그를 추가하세요.");
+  }
+  if (project.document.tags.some((tag) => tag.name === name)) {
+    throw new Error("애니메이션 태그 이름은 비어 있지 않고 고유해야 합니다.");
+  }
+  assertUniqueUnityAnimationClipFileNames([...project.document.tags, { name }]);
+  if (!project.document.frames.some((frame) => frame.id === request.baseFrameId)) {
+    throw new Error("기준 프레임을 찾을 수 없습니다.");
+  }
+  const layer = project.document.layers.find((candidate) => candidate.id === request.targetLayerId);
+  if (!layer) throw new Error("대상 레이어를 찾을 수 없습니다.");
+  if (!project.document.cels[celKey(request.baseFrameId, request.targetLayerId)]) {
+    throw new Error("기준 프레임의 대상 레이어 셀을 찾을 수 없습니다.");
+  }
+  if (!layer.visible || layer.locked || layer.blendMode !== "normal" || layer.opacity !== 1) {
+    throw new Error("대상 레이어는 보이고 잠기지 않은 normal·불투명도 1 레이어여야 합니다.");
+  }
+  if (request.cellWidth !== project.document.width || request.cellHeight !== project.document.height) {
+    throw new Error("요청 셀 크기가 프로젝트 캔버스와 다릅니다.");
+  }
+  if (project.document.colorMode === "indexed" && !project.document.palette.some((entry) => entry.color[3] === 0)) {
+    throw new Error("인덱스 문서에는 투명 팔레트 색상이 필요합니다.");
   }
 }
 
@@ -64,6 +118,36 @@ export function buildSpriteSheetPrompt(request: SpriteSheetRequest, outputPath: 
     "모든 프레임에서 캐릭터 비율, 카메라, 조명, 팔레트를 일관되게 유지하고 셀 경계가 겹치지 않게 하세요.",
     `모든 프레임의 지면 기준점과 하체 중심을 각 셀의 x=${anchorX}, y=${anchorY} 픽셀에 고정하고, 카메라 이동이나 루트 이동 없는 제자리 모션으로 만드세요.`,
     "투명 배경의 픽셀 아트 PNG 한 장만 만들고, 빈 셀은 완전히 투명하게 두세요.",
+    `결과를 반드시 다음 경로에 저장하세요: ${outputPath}`,
+  ].filter(Boolean).join("\n");
+}
+
+export function buildAppendAnimationPrompt(
+  request: AppendAnimationRequest,
+  baseReferencePath: string,
+  outputPath: string,
+): string {
+  validateSheetShape(request);
+  if (!request.name.trim()) throw new Error("애니메이션 태그 이름이 필요합니다.");
+  if (!(["forward", "reverse", "pingPong"] as const).includes(request.direction)) {
+    throw new Error("재생 방향이 올바르지 않습니다.");
+  }
+  if (!baseReferencePath.trim()) throw new Error("기준 프레임 참조 경로가 필요합니다.");
+  if (!outputPath.trim()) throw new Error("출력 파일 경로가 필요합니다.");
+  const rows = Math.ceil(request.frameCount / request.columns);
+  const anchorX = Math.floor(request.cellWidth / 2);
+  const anchorY = request.cellHeight - Math.max(1, Math.round(request.cellHeight / 8));
+  return [
+    request.prompt.trim(),
+    `기준 프레임 참조: ${baseReferencePath}`,
+    request.referencePath ? `외형 보조 참조: ${request.referencePath}` : "",
+    "기준 프레임은 출력 시트에 포함하지 마세요.",
+    `기준 프레임 직후의 후속 동작 프레임을 정확히 ${request.frameCount}개, ${request.columns}열 × ${rows}행으로 만드세요.`,
+    `각 프레임 크기: ${request.cellWidth} × ${request.cellHeight} 픽셀. 전체 이미지 크기: ${request.columns * request.cellWidth} × ${rows * request.cellHeight} 픽셀.`,
+    `프레임은 시간상 정방향으로 배치하세요. 재생 방향 ${request.direction}은 생성 순서가 아니라 재생과 내보내기 의미입니다.`,
+    "기준 프레임의 캐릭터 외형, 팔레트, 비율, 카메라를 유지하세요.",
+    `지면 기준점과 하체 중심을 각 셀의 x=${anchorX}, y=${anchorY} 픽셀에 고정하세요.`,
+    "투명 배경의 픽셀 아트 PNG 한 장만 만드세요.",
     `결과를 반드시 다음 경로에 저장하세요: ${outputPath}`,
   ].filter(Boolean).join("\n");
 }
@@ -186,6 +270,31 @@ function alignFrame(data: Uint8ClampedArray, width: number, height: number): Uin
   return aligned;
 }
 
+function extractSheetFrame(
+  sheet: PixelBuffer,
+  index: number,
+  request: Pick<SpriteSheetRequest, "columns" | "cellWidth" | "cellHeight">,
+): PixelBuffer {
+  const data = new Uint8ClampedArray(request.cellWidth * request.cellHeight * 4);
+  const originX = (index % request.columns) * request.cellWidth;
+  const originY = Math.floor(index / request.columns) * request.cellHeight;
+  for (let y = 0; y < request.cellHeight; y += 1) {
+    const source = ((originY + y) * sheet.width + originX) * 4;
+    data.set(sheet.data.subarray(source, source + request.cellWidth * 4), y * request.cellWidth * 4);
+  }
+  return {
+    width: request.cellWidth,
+    height: request.cellHeight,
+    data: alignFrame(data, request.cellWidth, request.cellHeight),
+  };
+}
+
+function transparentFrame(width: number, height: number, color?: RGBA): PixelBuffer {
+  const data = new Uint8ClampedArray(width * height * 4);
+  if (color) for (let offset = 0; offset < data.length; offset += 4) data.set(color, offset);
+  return { width, height, data };
+}
+
 function offsetFrame(data: Uint8ClampedArray, width: number, height: number, x: number, y: number): Uint8ClampedArray {
   if (x === 0 && y === 0) return data;
   const offset = new Uint8ClampedArray(data.length);
@@ -232,16 +341,8 @@ export function importSpriteSheet(
   for (let index = 0; index < request.frameCount; index += 1) {
     const frame: Frame = { id: crypto.randomUUID(), durationMs: request.durationMs };
     const imageId = crypto.randomUUID();
-    const data = new Uint8ClampedArray(request.cellWidth * request.cellHeight * 4);
-    const originX = (index % request.columns) * request.cellWidth;
-    const originY = Math.floor(index / request.columns) * request.cellHeight;
-    for (let y = 0; y < request.cellHeight; y += 1) {
-      const source = ((originY + y) * sheet.width + originX) * 4;
-      const target = y * request.cellWidth * 4;
-      data.set(sheet.data.subarray(source, source + request.cellWidth * 4), target);
-    }
     frames.push(frame);
-    images[imageId] = { width: request.cellWidth, height: request.cellHeight, data: alignFrame(data, request.cellWidth, request.cellHeight) };
+    images[imageId] = extractSheetFrame(sheet, index, request);
     cels[celKey(frame.id, layer.id)] = { id: crypto.randomUUID(), imageId, x: 0, y: 0, opacity: 1 };
   }
 
@@ -266,6 +367,68 @@ export function importSpriteSheet(
       parentId: request.parentId,
     }],
     exportSettings: { ...project.exportSettings, columns: request.columns },
+  };
+}
+
+export function appendAnimationSheet(
+  project: SpriteProject,
+  png: Uint8Array,
+  request: AppendAnimationRequest,
+  outputPath: string,
+): SpriteProject {
+  assertAppendAnimationRequest(project, request);
+  if (!outputPath.trim()) throw new Error("출력 파일 경로가 필요합니다.");
+  const sheet = decodePng(png);
+  const rows = Math.ceil(request.frameCount / request.columns);
+  if (sheet.width !== request.columns * request.cellWidth || sheet.height !== rows * request.cellHeight) {
+    throw new Error("생성된 시트 크기가 요청한 격자와 다릅니다.");
+  }
+
+  const baseIndex = project.document.frames.findIndex((frame) => frame.id === request.baseFrameId);
+  let document = duplicateFrame(project.document, request.baseFrameId);
+  const baseCloneId = document.frames[baseIndex + 1].id;
+  document = moveFrame(document, baseCloneId, document.frames.length - 1);
+  const durationMs = project.document.frames[baseIndex].durationMs;
+  const palette = document.palette.map((entry) => entry.color);
+  const transparent = palette.find((color) => color[3] === 0);
+
+  for (let index = 0; index < request.frameCount; index += 1) {
+    const frame: Frame = { id: crypto.randomUUID(), durationMs };
+    document.frames.push(frame);
+    for (const layer of document.layers) {
+      const imageId = crypto.randomUUID();
+      const rgba = layer.id === request.targetLayerId
+        ? extractSheetFrame(sheet, index, request)
+        : transparentFrame(request.cellWidth, request.cellHeight, document.colorMode === "indexed" ? transparent : undefined);
+      document.images[imageId] = document.colorMode === "indexed"
+        ? indexedToRgba(quantizeToPalette(rgba, palette), rgba.width, rgba.height, palette)
+        : rgba;
+      document.cels[celKey(frame.id, layer.id)] = {
+        id: crypto.randomUUID(),
+        imageId,
+        x: 0,
+        y: 0,
+        opacity: 1,
+      };
+    }
+  }
+
+  document = addTag(document, {
+    name: request.name,
+    fromFrameId: baseCloneId,
+    toFrameId: document.frames.at(-1)!.id,
+    direction: request.direction,
+  });
+  return {
+    ...project,
+    document,
+    generationHistory: [...project.generationHistory, {
+      id: crypto.randomUUID(),
+      prompt: request.prompt.trim(),
+      createdAt: new Date().toISOString(),
+      outputPath,
+      parentId: request.parentId,
+    }],
   };
 }
 

@@ -64,10 +64,13 @@ kbd { margin-left: 8px; color: var(--muted); font: 10px Consolas, monospace; }
 
 .generation-panel form { padding: 14px; }
 .generation-panel label, .new-project label { display: grid; gap: 7px; color: var(--muted); font-size: 10px; font-weight: 600; letter-spacing: .03em; }
+.generation-panel .generation-mode { margin-bottom: 11px; }
 textarea, input, select { width: 100%; border: 1px solid var(--line); border-radius: 0; background: #0e1114; padding: 9px; }
 textarea { resize: vertical; color: var(--paper); font-size: 12px; line-height: 1.55; }
 .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; margin-top: 11px; }
 .hint { color: var(--muted); font: 9px Consolas, monospace; }
+.append-context { margin-bottom: 0; color: var(--cool); }
+.append-issue { margin: 8px 0 0; line-height: 1.4; }
 .asset-inputs { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin: 10px 0; }
 .asset-inputs label { display: block; padding: 7px; border: 1px dashed var(--line); color: var(--muted); text-align: center; cursor: pointer; }
 .asset-inputs input { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
@@ -212,6 +215,7 @@ textarea { resize: vertical; color: var(--paper); font-size: 12px; line-height: 
 .right-dock .history { max-height: 112px; overflow-y: auto; }
 .layers-panel, .palette-panel { border-bottom: 1px solid var(--line); }
 .layer-actions { display: flex; gap: 4px; padding: 8px 10px; }
+.linked-cel-status { margin: 0 10px 8px; color: var(--muted); font: 8px/1.4 Consolas, monospace; }
 .layer-list { padding: 0 8px 8px; }
 .layer-list > div { display: grid; grid-template-columns: 24px minmax(70px, 1fr) 24px; gap: 5px; padding: 6px; border: 1px solid transparent; }
 .layer-list > div.selected { border-color: var(--forge); background: #201b14; }
@@ -240,7 +244,9 @@ textarea { resize: vertical; color: var(--paper); font-size: 12px; line-height: 
 .tag-editor { display: flex; align-content: flex-start; flex-wrap: wrap; gap: 5px; padding: 12px; border-left: 1px solid var(--line); overflow-y: auto; }
 .tag-editor > span { width: 100%; color: var(--muted); font: 9px Consolas, monospace; text-transform: uppercase; }
 .tag-editor input, .tag-editor select { width: 100%; padding: 5px; font-size: 9px; }
-.tag-editor .tag-chip { border-color: var(--forge); color: var(--forge); }
+.tag-editor > .tag-chip { width: auto; display: inline-flex; gap: 1px; border: 1px solid var(--forge); color: var(--forge); text-transform: none; }
+.tag-editor .tag-chip button { border: 0; color: inherit; }
+.tag-editor button[aria-pressed="true"] { border-color: var(--forge); background: #201b14; color: var(--forge); }
 
 @media (max-width: 1080px) {
   .editor-workspace { grid-template-columns: 190px minmax(300px, 1fr) 320px; }

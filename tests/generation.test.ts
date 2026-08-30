@@ -4,7 +4,17 @@ import { createDocument, createProject } from "../src/core/document.ts";
 import { compositeFrame } from "../src/core/render.ts";
 import { addFrame, addLayer } from "../src/core/timeline.ts";
 import { celKey } from "../src/core/types.ts";
-import { buildFrameRegenerationPrompt, buildSpriteSheetPrompt, importRegeneratedFrame, importSpriteSheet, type SpriteSheetRequest } from "../src/server/generation.ts";
+import {
+  appendAnimationSheet,
+  assertAppendAnimationRequest,
+  buildAppendAnimationPrompt,
+  buildFrameRegenerationPrompt,
+  buildSpriteSheetPrompt,
+  importRegeneratedFrame,
+  importSpriteSheet,
+  type AppendAnimationRequest,
+  type SpriteSheetRequest,
+} from "../src/server/generation.ts";
 import { encodePng } from "../src/server/png.ts";
 
 const request: SpriteSheetRequest = {
@@ -71,6 +81,58 @@ function projectWithThreeFramesAndTwoLayers() {
   return project;
 }
 
+function taggedProject() {
+  let document = createDocument({ width: 2, height: 1 });
+  document = addFrame(document);
+  document.tags.push({
+    id: crypto.randomUUID(),
+    name: "walk",
+    fromFrameId: document.frames[0].id,
+    toFrameId: document.frames[1].id,
+    direction: "forward",
+  });
+  return createProject("기사", document);
+}
+
+function appendRequest(
+  project: ReturnType<typeof taggedProject>,
+  patch: Partial<AppendAnimationRequest> = {},
+): AppendAnimationRequest {
+  return {
+    name: "attack",
+    baseFrameId: project.document.frames[0].id,
+    targetLayerId: project.document.layers[0].id,
+    direction: "forward",
+    prompt: "검 공격",
+    frameCount: 2,
+    columns: 2,
+    cellWidth: project.document.width,
+    cellHeight: project.document.height,
+    ...patch,
+  };
+}
+
+function fiveFrameWalkProject() {
+  let document = createDocument({ width: 2, height: 1 });
+  for (let index = 1; index < 5; index += 1) document = addFrame(document);
+  document = addLayer(document, "효과");
+  document.tags.push({
+    id: crypto.randomUUID(),
+    name: "walk",
+    fromFrameId: document.frames[0].id,
+    toFrameId: document.frames[4].id,
+    direction: "forward",
+  });
+  const project = createProject("기사", document);
+  project.generationHistory.push({
+    id: crypto.randomUUID(),
+    prompt: "걷기",
+    createdAt: "2026-08-30T00:00:00.000Z",
+    outputPath: "generated/walk.png",
+  });
+  return project;
+}
+
 test("생성 프롬프트는 투명 배경, 정확한 격자와 출력 파일을 강제한다", () => {
   const prompt = buildSpriteSheetPrompt({ ...request, referencePath: "C:/project/references/hero.png" }, "C:/project/generated/sheet.png");
 
@@ -82,6 +144,180 @@ test("생성 프롬프트는 투명 배경, 정확한 격자와 출력 파일을
   assert.match(prompt, /제자리 모션/);
   assert.match(prompt, /references\/hero\.png/);
   assert.match(prompt, /C:\/project\/generated\/sheet\.png/);
+});
+
+test("추가 애니메이션 프롬프트는 기준 프레임을 제외한 정확한 후속 시트를 요구한다", () => {
+  const project = taggedProject();
+  const request: AppendAnimationRequest = {
+    name: "attack",
+    baseFrameId: project.document.frames[0].id,
+    targetLayerId: project.document.layers[0].id,
+    direction: "reverse",
+    prompt: "검 공격",
+    frameCount: 3,
+    columns: 2,
+    cellWidth: project.document.width,
+    cellHeight: project.document.height,
+  };
+  assertAppendAnimationRequest(project, request);
+  const prompt = buildAppendAnimationPrompt(request, "generated/job/base.png", "generated/job/animation.png");
+
+  assert.match(prompt, /기준 프레임.*출력 시트에 포함하지/);
+  assert.match(prompt, /정확히 3개/);
+  assert.match(prompt, /시간상 정방향/);
+  assert.match(prompt, /재생 방향.*reverse/);
+  assert.match(prompt, /2열 × 2행/);
+  assert.match(prompt, /기준 프레임 참조.*base\.png/);
+  assert.match(prompt, /투명 배경.*PNG 한 장/);
+});
+
+test("추가 애니메이션 사전 검증은 Codex 전에 잘못된 프로젝트 대상을 거부한다", () => {
+  const project = taggedProject();
+  const valid = appendRequest(project);
+  const cases: Array<[Partial<AppendAnimationRequest>, RegExp]> = [
+    [{ name: "walk" }, /고유/],
+    [{ name: "WALK?" }, /AnimationClip.*충돌/],
+    [{ baseFrameId: "missing" }, /기준 프레임/],
+    [{ targetLayerId: "missing" }, /대상 레이어/],
+    [{ cellWidth: project.document.width + 1 }, /캔버스/],
+    [{ direction: "sideways" as AppendAnimationRequest["direction"] }, /재생 방향/],
+  ];
+  for (const [patch, error] of cases) {
+    assert.throws(() => assertAppendAnimationRequest(project, { ...valid, ...patch }), error);
+  }
+
+  const missingCel = structuredClone(project);
+  delete missingCel.document.cels[celKey(valid.baseFrameId, valid.targetLayerId)];
+  assert.throws(() => assertAppendAnimationRequest(missingCel, valid), /대상 레이어 셀/);
+
+  const noTag = structuredClone(project);
+  noTag.document.tags = [];
+  assert.throws(() => assertAppendAnimationRequest(noTag, valid), /먼저 타임라인/);
+
+  for (const patch of [
+    { visible: false },
+    { locked: true },
+    { blendMode: "multiply" as const },
+    { opacity: 0.5 },
+  ]) {
+    const invalidLayer = structuredClone(project);
+    Object.assign(invalidLayer.document.layers[0], patch);
+    assert.throws(() => assertAppendAnimationRequest(invalidLayer, valid), /보이고 잠기지 않은/);
+  }
+
+  const indexedWithoutTransparency = structuredClone(project);
+  indexedWithoutTransparency.document.colorMode = "indexed";
+  for (const image of Object.values(indexedWithoutTransparency.document.images)) {
+    for (let offset = 0; offset < image.data.length; offset += 4) image.data.set([0, 0, 0, 255], offset);
+  }
+  assert.throws(() => assertAppendAnimationRequest(indexedWithoutTransparency, valid), /투명 팔레트/);
+});
+
+test("추가 시트는 기존 상태를 보존하고 기준 연결 복제본과 생성 프레임을 끝에 붙인다", () => {
+  const project = fiveFrameWalkProject();
+  const before = structuredClone(project);
+  const base = project.document.frames[0];
+  const target = project.document.layers[0];
+  const request = appendRequest(project, {
+    name: "attack",
+    frameCount: 3,
+    columns: 3,
+    direction: "forward",
+  });
+  const pixels = new Uint8ClampedArray(project.document.width * project.document.height * 4 * 3);
+  pixels.set([255, 0, 0, 255], 0);
+  pixels.set([0, 255, 0, 255], project.document.width * project.document.height * 4);
+  pixels.set([0, 0, 255, 255], project.document.width * project.document.height * 8);
+
+  const after = appendAnimationSheet(
+    project,
+    encodePng(project.document.width * 3, project.document.height, pixels),
+    request,
+    "generated/animation.png",
+  );
+
+  assert.equal(after.document.frames.length, 9);
+  assert.deepEqual(after.document.frames.slice(0, 5), before.document.frames);
+  assert.deepEqual(after.document.layers, before.document.layers);
+  assert.deepEqual(after.document.tags.slice(0, -1), before.document.tags);
+  assert.deepEqual(after.document.palette, before.document.palette);
+  assert.deepEqual(after.exportSettings, before.exportSettings);
+  assert.deepEqual(after.generationHistory.slice(0, -1), before.generationHistory);
+  for (const [key, cel] of Object.entries(before.document.cels)) assert.deepEqual(after.document.cels[key], cel);
+  for (const [id, image] of Object.entries(before.document.images)) assert.deepEqual(after.document.images[id], image);
+  assert.equal(JSON.stringify(project), JSON.stringify(before));
+
+  const clone = after.document.frames[5];
+  assert.equal(clone.durationMs, base.durationMs);
+  for (const layer of after.document.layers) {
+    const sourceCel = before.document.cels[celKey(base.id, layer.id)];
+    const clonedCel = after.document.cels[celKey(clone.id, layer.id)];
+    if (!sourceCel) assert.equal(clonedCel, undefined);
+    else {
+      assert.notEqual(clonedCel.id, sourceCel.id);
+      assert.equal(clonedCel.imageId, sourceCel.imageId);
+    }
+  }
+  assert.deepEqual(after.document.frames.slice(6).map((frame) => frame.durationMs), [base.durationMs, base.durationMs, base.durationMs]);
+  assert.ok(after.document.frames.slice(6).every((frame) => after.document.cels[celKey(frame.id, target.id)]));
+  for (const generated of after.document.frames.slice(6)) {
+    const blankCel = after.document.cels[celKey(generated.id, after.document.layers[1].id)];
+    assert.ok(after.document.images[blankCel.imageId].data.every((channel) => channel === 0));
+    assert.ok(compositeFrame(after.document, generated.id).data.some((channel, offset) => offset % 4 === 3 && channel > 0));
+  }
+  const attack = after.document.tags.at(-1)!;
+  assert.deepEqual({
+    name: attack.name,
+    from: attack.fromFrameId,
+    to: attack.toFrameId,
+    direction: attack.direction,
+  }, {
+    name: "attack",
+    from: clone.id,
+    to: after.document.frames[8].id,
+    direction: "forward",
+  });
+  assert.equal(after.generationHistory.at(-1)?.outputPath, "generated/animation.png");
+});
+
+test("인덱스 추가 프레임은 기존 팔레트로 양자화하고 다른 레이어를 투명색으로 채운다", () => {
+  const project = fiveFrameWalkProject();
+  const transparent = [10, 20, 30, 0] as const;
+  project.document.colorMode = "indexed";
+  project.document.palette.push({ id: crypto.randomUUID(), name: "투명", color: transparent });
+  for (const image of Object.values(project.document.images)) {
+    for (let offset = 0; offset < image.data.length; offset += 4) image.data.set(transparent, offset);
+  }
+  const request = appendRequest(project, { frameCount: 1, columns: 1 });
+  const png = encodePng(2, 1, new Uint8ClampedArray([250, 250, 250, 255, 0, 0, 0, 0]));
+
+  const after = appendAnimationSheet(project, png, request, "generated/animation.png");
+  const generated = after.document.frames.at(-1)!;
+  const blankCel = after.document.cels[celKey(generated.id, after.document.layers[1].id)];
+  assert.deepEqual(Array.from(after.document.images[blankCel.imageId].data), [...transparent, ...transparent]);
+  const palette = new Set(after.document.palette.map((entry) => entry.color.join(",")));
+  for (const layer of after.document.layers) {
+    const cel = after.document.cels[celKey(generated.id, layer.id)];
+    const data = after.document.images[cel.imageId].data;
+    for (let offset = 0; offset < data.length; offset += 4) {
+      assert.ok(palette.has(Array.from(data.subarray(offset, offset + 4)).join(",")));
+    }
+  }
+});
+
+test("잘못된 추가 시트는 입력 프로젝트를 변경하지 않는다", () => {
+  const project = fiveFrameWalkProject();
+  const before = JSON.stringify(project);
+  assert.throws(
+    () => appendAnimationSheet(
+      project,
+      encodePng(1, 1, new Uint8ClampedArray(4)),
+      appendRequest(project),
+      "generated/animation.png",
+    ),
+    /격자/,
+  );
+  assert.equal(JSON.stringify(project), before);
 });
 
 test("선택 프레임 프롬프트는 태그 진행률과 역할별 참조를 포함한다", () => {
