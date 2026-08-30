@@ -64,10 +64,13 @@ kbd { margin-left: 8px; color: var(--muted); font: 10px Consolas, monospace; }
 
 .generation-panel form { padding: 14px; }
 .generation-panel label, .new-project label { display: grid; gap: 7px; color: var(--muted); font-size: 10px; font-weight: 600; letter-spacing: .03em; }
+.generation-panel .generation-mode { margin-bottom: 11px; }
 textarea, input, select { width: 100%; border: 1px solid var(--line); border-radius: 0; background: #0e1114; padding: 9px; }
 textarea { resize: vertical; color: var(--paper); font-size: 12px; line-height: 1.55; }
 .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; margin-top: 11px; }
 .hint { color: var(--muted); font: 9px Consolas, monospace; }
+.append-context { margin-bottom: 0; color: var(--cool); }
+.append-issue { margin: 8px 0 0; line-height: 1.4; }
 .asset-inputs { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin: 10px 0; }
 .asset-inputs label { display: block; padding: 7px; border: 1px dashed var(--line); color: var(--muted); text-align: center; cursor: pointer; }
 .asset-inputs input { position: absolute; width: 1px; height: 1px; opacity: 0; pointer-events: none; }

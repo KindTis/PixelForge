@@ -1,6 +1,6 @@
 import type { AiEditReadyResult, AiEditRequest, AiEditTarget } from "../core/ai-edit.ts";
-import { frameSequence } from "../core/animation.ts";
-import type { AnimationDirection, PixelBuffer, SpriteProject } from "../core/types.ts";
+import { conflictingUnityAnimationTagNames, frameSequence } from "../core/animation.ts";
+import type { AnimationDirection, Layer, PixelBuffer, SpriteProject } from "../core/types.ts";
 
 export type WireProject = Omit<SpriteProject, "document"> & {
   document: Omit<SpriteProject["document"], "images"> & {
@@ -102,6 +102,33 @@ export function isInitialBlankProject(project: SpriteProject): boolean {
     && project.document.tags.length === 0
     && Object.values(project.document.images).every((image) =>
       image.data.every((channel, index) => index % 4 !== 3 || channel === 0));
+}
+
+export function appendAnimationIssue(
+  project: SpriteProject,
+  prompt: string,
+  nameInput: string,
+  activeLayer: Layer | undefined,
+  hasActiveCel: boolean,
+): string | undefined {
+  const name = nameInput.trim();
+  if (!prompt.trim()) return "생성 프롬프트가 필요합니다.";
+  if (!name) return "애니메이션 태그 이름이 필요합니다.";
+  if (project.document.tags.length === 0) {
+    return "먼저 타임라인에서 현재 전체 구간의 애니메이션 태그를 추가하세요.";
+  }
+  if (project.document.tags.some((tag) => tag.name === name)) {
+    return "애니메이션 태그 이름은 비어 있지 않고 고유해야 합니다.";
+  }
+  const conflicts = conflictingUnityAnimationTagNames([...project.document.tags, { name }]);
+  if (conflicts.length) {
+    return `Unity AnimationClip 파일명이 충돌합니다: ${conflicts.join(", ")}. 충돌하는 태그를 삭제하고 서로 다른 이름으로 다시 추가하세요.`;
+  }
+  if (!hasActiveCel) return "현재 프레임의 활성 셀이 필요합니다.";
+  if (!activeLayer?.visible || activeLayer.locked || activeLayer.blendMode !== "normal" || activeLayer.opacity !== 1) {
+    return "대상 레이어는 보이고 잠기지 않은 normal·불투명도 1 레이어여야 합니다.";
+  }
+  return undefined;
 }
 
 export function cellEditPayload(projectId: string, request: AiEditRequest): { projectId: string; request: AiEditRequest } {

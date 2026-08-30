@@ -173,7 +173,7 @@ test("태그 선택은 aria-pressed와 재생 첫 프레임을 갱신하고 삭�
   assert.ok(attack);
   assert.equal(attack.props?.["aria-pressed"], false);
   (attack.props?.onClick as () => void)();
-  assert.deepEqual(selected, [tagId]);
+  assert.deepEqual(Array.from(selected), [tagId]);
   assert.deepEqual(frameIndexes, [1]);
   assert.match(renderedText(rendered), /연결된 셀 · 편집하면 현재 레이어의 셀만 자동 분리됩니다/);
 
