@@ -11,10 +11,18 @@ test("Unity 묶음은 스프라이트 분할과 AnimationClip 생성 정보를 �
   document.images[cel.imageId].data.set([255, 255, 255, 255], (3 * 16 + 2) * 4);
   document = duplicateFrame(document, document.frames[0].id);
   document.frames[1].durationMs = 140;
+  document = duplicateFrame(document, document.frames[1].id);
+  document = duplicateFrame(document, document.frames[2].id);
   document = addTag(document, {
-    name: "attack",
+    name: "walk",
     fromFrameId: document.frames[0].id,
     toFrameId: document.frames[1].id,
+    direction: "forward",
+  });
+  document = addTag(document, {
+    name: "attack",
+    fromFrameId: document.frames[2].id,
+    toFrameId: document.frames[3].id,
     direction: "reverse",
   });
 
@@ -38,12 +46,17 @@ test("Unity 묶음은 스프라이트 분할과 AnimationClip 생성 정보를 �
   assert.deepEqual(metadata.frames[0].frame, { x: 1, y: 1, w: 1, h: 1 });
   assert.deepEqual(metadata.frames[0].spriteSourceSize, { x: 2, y: 3, w: 1, h: 1 });
   assert.equal(metadata.frames[1].duration, 140);
-  assert.deepEqual(metadata.animations[0], {
+  assert.deepEqual(
+    metadata.animations.map(({ name, clipFilename }: { name: string; clipFilename: string }) => ({ name, clipFilename })),
+    [{ name: "walk", clipFilename: "walk" }, { name: "attack", clipFilename: "attack" }],
+  );
+  assert.deepEqual(metadata.animations[1], {
     name: "attack",
     clipFilename: "attack",
-    frames: ["attack_000", "attack_001"],
+    frames: ["attack_002", "attack_003"],
     direction: "reverse",
   });
+  assert.equal(files.filter((file) => file.path === "spritesheet.png").length, 1);
   const importer = files[2].data as string;
   assert.match(importer, /AssetPostprocessor/);
   assert.match(importer, /MenuItem\("PixelForge\/Import Selected Bundle"\)/);
