@@ -40,6 +40,7 @@ test("Unity 묶음은 스프라이트 분할과 AnimationClip 생성 정보를 �
   assert.equal(metadata.frames[1].duration, 140);
   assert.deepEqual(metadata.animations[0], {
     name: "attack",
+    clipFilename: "attack",
     frames: ["attack_000", "attack_001"],
     direction: "reverse",
   });
@@ -53,5 +54,36 @@ test("Unity 묶음은 스프라이트 분할과 AnimationClip 생성 정보를 �
   assert.match(importer, /spriteSourceSize/);
   assert.doesNotMatch(importer, /importer\.spritesheet/);
   assert.match(importer, /AnimationUtility\.SetObjectReferenceCurve/);
+  assert.match(importer, /animation\.clipFilename/);
+  assert.doesNotMatch(importer, /GetInvalidFileNameChars/);
   assert.ok((files[3].data as string).includes("Unity 프로젝트의 Assets"));
+});
+
+test("Unity 내보내기는 충돌한 AnimationClip 파일명을 파일 생성 전에 거부한다", async () => {
+  let document = createDocument({ width: 1, height: 1 });
+  document = duplicateFrame(document, document.frames[0].id);
+  document = addTag(document, {
+    name: "attack?",
+    fromFrameId: document.frames[0].id,
+    toFrameId: document.frames[0].id,
+    direction: "forward",
+  });
+  document = addTag(document, {
+    name: "ATTACK*",
+    fromFrameId: document.frames[1].id,
+    toFrameId: document.frames[1].id,
+    direction: "forward",
+  });
+
+  await assert.rejects(
+    exportUnity(document, {
+      columns: 2,
+      padding: 0,
+      margin: 0,
+      trim: false,
+      pixelsPerUnit: 32,
+      pivot: { x: 0.5, y: 0 },
+    }),
+    /attack\?.*ATTACK\*.*충돌하는 태그를 삭제하고 서로 다른 이름으로 다시 추가하세요/,
+  );
 });

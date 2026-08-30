@@ -12,7 +12,7 @@ public sealed class PixelForgeImporter : AssetPostprocessor
     [Serializable] private sealed class Pivot { public float x; public float y; }
     [Serializable] private sealed class RectData { public int x; public int y; public int w; public int h; }
     [Serializable] private sealed class Frame { public string filename; public RectData frame; public RectData spriteSourceSize; public RectData sourceSize; public int duration; }
-    [Serializable] private sealed class Animation { public string name; public string[] frames; public string direction; }
+    [Serializable] private sealed class Animation { public string name; public string clipFilename; public string[] frames; public string direction; }
 
     [MenuItem("PixelForge/Import Selected Bundle")]
     private static void ImportSelectedBundle()
@@ -86,8 +86,7 @@ public sealed class PixelForgeImporter : AssetPostprocessor
         keys.Add(new ObjectReferenceKeyframe { time = time, value = sprites[sequence[0]] });
         var clip = new AnimationClip { frameRate = 60, wrapMode = WrapMode.Loop };
         AnimationUtility.SetObjectReferenceCurve(clip, EditorCurveBinding.PPtrCurve("", typeof(SpriteRenderer), "m_Sprite"), keys.ToArray());
-        var filename = string.Join("_", animation.name.Split(Path.GetInvalidFileNameChars(), StringSplitOptions.RemoveEmptyEntries)).Replace('/', '_');
-        var path = folder + "/" + (string.IsNullOrEmpty(filename) ? "animation" : filename) + ".anim";
+        var path = folder + "/" + animation.clipFilename + ".anim";
         if (AssetDatabase.LoadAssetAtPath<AnimationClip>(path) != null) AssetDatabase.DeleteAsset(path);
         AssetDatabase.CreateAsset(clip, path);
     }
