@@ -4,7 +4,16 @@ import { createDocument, createProject } from "../src/core/document.ts";
 import { compositeFrame } from "../src/core/render.ts";
 import { addFrame, addLayer } from "../src/core/timeline.ts";
 import { celKey } from "../src/core/types.ts";
-import { buildFrameRegenerationPrompt, buildSpriteSheetPrompt, importRegeneratedFrame, importSpriteSheet, type SpriteSheetRequest } from "../src/server/generation.ts";
+import {
+  assertAppendAnimationRequest,
+  buildAppendAnimationPrompt,
+  buildFrameRegenerationPrompt,
+  buildSpriteSheetPrompt,
+  importRegeneratedFrame,
+  importSpriteSheet,
+  type AppendAnimationRequest,
+  type SpriteSheetRequest,
+} from "../src/server/generation.ts";
 import { encodePng } from "../src/server/png.ts";
 
 const request: SpriteSheetRequest = {
@@ -71,6 +80,37 @@ function projectWithThreeFramesAndTwoLayers() {
   return project;
 }
 
+function taggedProject() {
+  let document = createDocument({ width: 2, height: 1 });
+  document = addFrame(document);
+  document.tags.push({
+    id: crypto.randomUUID(),
+    name: "walk",
+    fromFrameId: document.frames[0].id,
+    toFrameId: document.frames[1].id,
+    direction: "forward",
+  });
+  return createProject("기사", document);
+}
+
+function appendRequest(
+  project: ReturnType<typeof taggedProject>,
+  patch: Partial<AppendAnimationRequest> = {},
+): AppendAnimationRequest {
+  return {
+    name: "attack",
+    baseFrameId: project.document.frames[0].id,
+    targetLayerId: project.document.layers[0].id,
+    direction: "forward",
+    prompt: "검 공격",
+    frameCount: 2,
+    columns: 2,
+    cellWidth: project.document.width,
+    cellHeight: project.document.height,
+    ...patch,
+  };
+}
+
 test("생성 프롬프트는 투명 배경, 정확한 격자와 출력 파일을 강제한다", () => {
   const prompt = buildSpriteSheetPrompt({ ...request, referencePath: "C:/project/references/hero.png" }, "C:/project/generated/sheet.png");
 
@@ -82,6 +122,73 @@ test("생성 프롬프트는 투명 배경, 정확한 격자와 출력 파일을
   assert.match(prompt, /제자리 모션/);
   assert.match(prompt, /references\/hero\.png/);
   assert.match(prompt, /C:\/project\/generated\/sheet\.png/);
+});
+
+test("추가 애니메이션 프롬프트는 기준 프레임을 제외한 정확한 후속 시트를 요구한다", () => {
+  const project = taggedProject();
+  const request: AppendAnimationRequest = {
+    name: "attack",
+    baseFrameId: project.document.frames[0].id,
+    targetLayerId: project.document.layers[0].id,
+    direction: "reverse",
+    prompt: "검 공격",
+    frameCount: 3,
+    columns: 2,
+    cellWidth: project.document.width,
+    cellHeight: project.document.height,
+  };
+  assertAppendAnimationRequest(project, request);
+  const prompt = buildAppendAnimationPrompt(request, "generated/job/base.png", "generated/job/animation.png");
+
+  assert.match(prompt, /기준 프레임.*출력 시트에 포함하지/);
+  assert.match(prompt, /정확히 3개/);
+  assert.match(prompt, /시간상 정방향/);
+  assert.match(prompt, /재생 방향.*reverse/);
+  assert.match(prompt, /2열 × 2행/);
+  assert.match(prompt, /기준 프레임 참조.*base\.png/);
+  assert.match(prompt, /투명 배경.*PNG 한 장/);
+});
+
+test("추가 애니메이션 사전 검증은 Codex 전에 잘못된 프로젝트 대상을 거부한다", () => {
+  const project = taggedProject();
+  const valid = appendRequest(project);
+  const cases: Array<[Partial<AppendAnimationRequest>, RegExp]> = [
+    [{ name: "walk" }, /고유/],
+    [{ name: "WALK?" }, /AnimationClip.*충돌/],
+    [{ baseFrameId: "missing" }, /기준 프레임/],
+    [{ targetLayerId: "missing" }, /대상 레이어/],
+    [{ cellWidth: project.document.width + 1 }, /캔버스/],
+    [{ direction: "sideways" as AppendAnimationRequest["direction"] }, /재생 방향/],
+  ];
+  for (const [patch, error] of cases) {
+    assert.throws(() => assertAppendAnimationRequest(project, { ...valid, ...patch }), error);
+  }
+
+  const missingCel = structuredClone(project);
+  delete missingCel.document.cels[celKey(valid.baseFrameId, valid.targetLayerId)];
+  assert.throws(() => assertAppendAnimationRequest(missingCel, valid), /대상 레이어 셀/);
+
+  const noTag = structuredClone(project);
+  noTag.document.tags = [];
+  assert.throws(() => assertAppendAnimationRequest(noTag, valid), /먼저 타임라인/);
+
+  for (const patch of [
+    { visible: false },
+    { locked: true },
+    { blendMode: "multiply" as const },
+    { opacity: 0.5 },
+  ]) {
+    const invalidLayer = structuredClone(project);
+    Object.assign(invalidLayer.document.layers[0], patch);
+    assert.throws(() => assertAppendAnimationRequest(invalidLayer, valid), /보이고 잠기지 않은/);
+  }
+
+  const indexedWithoutTransparency = structuredClone(project);
+  indexedWithoutTransparency.document.colorMode = "indexed";
+  for (const image of Object.values(indexedWithoutTransparency.document.images)) {
+    for (let offset = 0; offset < image.data.length; offset += 4) image.data.set([0, 0, 0, 255], offset);
+  }
+  assert.throws(() => assertAppendAnimationRequest(indexedWithoutTransparency, valid), /투명 팔레트/);
 });
 
 test("선택 프레임 프롬프트는 태그 진행률과 역할별 참조를 포함한다", () => {
