@@ -30,10 +30,14 @@ import {
   type CellEditSummary,
 } from "./cell-edit-log.ts";
 import {
+  appendAnimationSheet,
+  assertAppendAnimationRequest,
+  buildAppendAnimationPrompt,
   buildFrameRegenerationPrompt,
   buildSpriteSheetPrompt,
   importRegeneratedFrame,
   importSpriteSheet,
+  type AppendAnimationRequest,
   type FrameReferencePaths,
   type FrameRegenerationRequest,
   type SpriteSheetRequest,
@@ -59,7 +63,7 @@ type JobBase = {
 };
 type GenerationJob = JobBase & {
   kind: "generation";
-  request: SpriteSheetRequest | FrameRegenerationRequest;
+  request: SpriteSheetRequest | FrameRegenerationRequest | AppendAnimationRequest;
   frameId?: string;
   outputPath: string;
   relativeOutputPath: string;
@@ -650,7 +654,9 @@ export function createPixelForgeServer({
       }
       job.project = job.frameId !== undefined
         ? importRegeneratedFrame(project, png, job.request as FrameRegenerationRequest, job.relativeOutputPath)
-        : importSpriteSheet(project, png, job.request as SpriteSheetRequest, job.relativeOutputPath);
+        : "baseFrameId" in job.request
+          ? appendAnimationSheet(project, png, job.request, job.relativeOutputPath)
+          : importSpriteSheet(project, png, job.request as SpriteSheetRequest, job.relativeOutputPath);
       await saveProject(root, job.project);
     } catch (error) {
       failure = error;
@@ -903,10 +909,18 @@ export function createPixelForgeServer({
       }
 
       if (request.method === "POST" && url.pathname === "/api/generations") {
-        const input = await body(request) as { projectId?: unknown; frameId?: unknown; request?: SpriteSheetRequest };
+        const input = await body(request) as {
+          projectId?: unknown;
+          frameId?: unknown;
+          appendAnimation?: unknown;
+          request?: SpriteSheetRequest;
+        };
         const projectId = safeProjectId(String(input.projectId ?? ""));
         const generationRequest = { ...input.request } as SpriteSheetRequest;
         if (input.frameId !== undefined && typeof input.frameId !== "string") throw new Error("프레임 ID는 문자열이어야 합니다.");
+        if (input.frameId !== undefined && input.appendAnimation !== undefined) {
+          throw new Error("frameId와 appendAnimation은 동시에 지정할 수 없습니다.");
+        }
         const frameId = input.frameId;
         const jobId = randomUUID();
         if (!lockProject(projectId, jobId)) return send(response, 409, { error: "이미 생성 중인 프로젝트입니다." });
@@ -918,11 +932,13 @@ export function createPixelForgeServer({
             if (!(await stat(reference)).isFile()) throw new Error("참조 이미지를 찾을 수 없습니다.");
             generationRequest.referencePath = reference;
           }
-          const relativeOutputPath = `generated/${jobId}/${frameId !== undefined ? "frame.png" : "sheet.png"}`;
+          const relativeOutputPath = `generated/${jobId}/${frameId !== undefined
+            ? "frame.png"
+            : input.appendAnimation !== undefined ? "animation.png" : "sheet.png"}`;
           const outputPath = resolveInside(root, relativeOutputPath);
           await mkdir(resolve(outputPath, ".."), { recursive: true });
           let prompt: string;
-          let jobRequest: SpriteSheetRequest | FrameRegenerationRequest = generationRequest;
+          let jobRequest: SpriteSheetRequest | FrameRegenerationRequest | AppendAnimationRequest = generationRequest;
           if (frameId !== undefined) {
             const frameIndex = project.document.frames.findIndex((frame) => frame.id === frameId);
             if (frameIndex < 0) throw new Error("선택한 프레임을 찾을 수 없습니다.");
@@ -947,6 +963,36 @@ export function createPixelForgeServer({
               referencePath: generationRequest.referencePath,
             };
             prompt = buildFrameRegenerationPrompt(project, jobRequest, referencePaths, outputPath);
+          } else if (input.appendAnimation !== undefined) {
+            if (!input.appendAnimation || typeof input.appendAnimation !== "object" || Array.isArray(input.appendAnimation)) {
+              throw new Error("appendAnimation 메타데이터가 올바르지 않습니다.");
+            }
+            const appendInput = input.appendAnimation as Record<string, unknown>;
+            if (typeof appendInput.name !== "string"
+              || typeof appendInput.baseFrameId !== "string"
+              || typeof appendInput.targetLayerId !== "string"
+              || typeof appendInput.direction !== "string") {
+              throw new Error("appendAnimation의 이름, 기준 프레임, 대상 레이어와 재생 방향은 문자열이어야 합니다.");
+            }
+            const appendRequest: AppendAnimationRequest = {
+              name: appendInput.name,
+              baseFrameId: appendInput.baseFrameId,
+              targetLayerId: appendInput.targetLayerId,
+              direction: appendInput.direction as AppendAnimationRequest["direction"],
+              prompt: generationRequest.prompt,
+              frameCount: generationRequest.frameCount,
+              columns: generationRequest.columns,
+              cellWidth: generationRequest.cellWidth,
+              cellHeight: generationRequest.cellHeight,
+              parentId: generationRequest.parentId,
+              referencePath: generationRequest.referencePath,
+            };
+            assertAppendAnimationRequest(project, appendRequest);
+            const baseReferencePath = resolveInside(root, `generated/${jobId}/base.png`);
+            const base = compositeFrame(project.document, appendRequest.baseFrameId);
+            await writeFile(baseReferencePath, encodePng(base.width, base.height, base.data));
+            jobRequest = appendRequest;
+            prompt = buildAppendAnimationPrompt(appendRequest, baseReferencePath, outputPath);
           } else {
             prompt = buildSpriteSheetPrompt(generationRequest, outputPath);
           }

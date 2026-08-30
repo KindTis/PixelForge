@@ -380,6 +380,126 @@ test("선택 프레임 생성은 역할별 PNG를 제공하고 선택 프레임�
   }
 });
 
+test("추가 애니메이션 작업은 기준 합성을 참조하고 완성 프로젝트를 한 번 저장한다", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pixelforge-append-generation-"));
+  const project = threeFrameProject();
+  const projectRoot = join(root, project.id);
+  await createProject(projectRoot, project);
+  const codex = new FakeCodex();
+  const { server, base, token } = await startGenerationServer(root, codex);
+
+  try {
+    const response = await fetch(`${base}/api/generations`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-pixelforge-token": token },
+      body: JSON.stringify({
+        projectId: project.id,
+        appendAnimation: {
+          name: "attack",
+          baseFrameId: project.document.frames[0].id,
+          targetLayerId: project.document.layers[0].id,
+          direction: "reverse",
+        },
+        request: {
+          prompt: "검 공격",
+          frameCount: 3,
+          columns: 3,
+          cellWidth: 2,
+          cellHeight: 1,
+          durationMs: 999,
+        },
+      }),
+    });
+    assert.equal(response.status, 202);
+    assert.match(codex.lastPrompt, /기준 프레임 참조:/);
+    assert.deepEqual(
+      Array.from(decodePng(await readFile(pathFromPrompt(codex.lastPrompt, "기준 프레임 참조"))).data),
+      Array.from(compositeFrame(project.document, project.document.frames[0].id).data),
+    );
+
+    const job = await response.json() as { id: string };
+    await writeFile(
+      pathFromPrompt(codex.lastPrompt, "결과를 반드시 다음 경로에 저장하세요"),
+      encodePng(6, 1, new Uint8ClampedArray(24)),
+    );
+    codex.event({ type: "completed", runId: codex.lastRunId, status: "completed" });
+    const completed = await waitForJob(base, job.id);
+    assert.equal(completed.status, "completed");
+    const saved = await loadProject(projectRoot);
+    assert.equal(saved.document.frames.length, project.document.frames.length + 4);
+    assert.deepEqual(
+      saved.document.frames.slice(-4).map((frame) => frame.durationMs),
+      new Array(4).fill(project.document.frames[0].durationMs),
+    );
+    assert.equal(saved.document.tags.at(-1)?.name, "attack");
+    assert.deepEqual(saved.exportSettings, project.exportSettings);
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("추가 애니메이션 요청은 배타성과 사전 조건을 지키고 잘못된 완료 결과를 저장하지 않는다", async () => {
+  const root = await mkdtemp(join(tmpdir(), "pixelforge-append-validation-"));
+  const project = threeFrameProject();
+  const projectRoot = join(root, project.id);
+  await createProject(projectRoot, project);
+  const codex = new FakeCodex();
+  const { server, base, token } = await startGenerationServer(root, codex);
+  const request = {
+    prompt: "검 공격",
+    frameCount: 3,
+    columns: 3,
+    cellWidth: 2,
+    cellHeight: 1,
+    durationMs: 100,
+  };
+  const appendAnimation = {
+    name: "attack",
+    baseFrameId: project.document.frames[0].id,
+    targetLayerId: project.document.layers[0].id,
+    direction: "forward",
+  };
+  const post = (body: unknown) => fetch(`${base}/api/generations`, {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-pixelforge-token": token },
+    body: JSON.stringify(body),
+  });
+
+  try {
+    for (const requestBody of [
+      { projectId: project.id, frameId: project.document.frames[0].id, appendAnimation, request },
+      {
+        projectId: project.id,
+        appendAnimation: { ...appendAnimation, targetLayerId: "missing" },
+        request,
+      },
+      { projectId: project.id, appendAnimation: { ...appendAnimation, name: "공격?" }, request },
+    ]) {
+      const response = await post(requestBody);
+      assert.equal(response.status, 400);
+      assert.equal(codex.lastPrompt, "");
+    }
+
+    const before = JSON.stringify(await loadProject(projectRoot));
+    const started = await post({ projectId: project.id, appendAnimation, request });
+    assert.equal(started.status, 202);
+    const job = await started.json() as { id: string };
+    await writeFile(
+      pathFromPrompt(codex.lastPrompt, "결과를 반드시 다음 경로에 저장하세요"),
+      encodePng(1, 1, new Uint8ClampedArray(4)),
+    );
+    codex.event({ type: "completed", runId: codex.lastRunId, status: "completed" });
+    const failed = await waitForJob(base, job.id);
+    assert.equal(failed.status, "failed");
+    assert.match(failed.error ?? "", /격자/);
+    assert.equal(JSON.stringify(await loadProject(projectRoot)), before);
+  } finally {
+    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("첫·마지막 프레임은 존재하는 참조만 만들고 취소 시 프로젝트를 보존한다", async () => {
   const root = await mkdtemp(join(tmpdir(), "pixelforge-frame-boundary-"));
   const project = threeFrameProject();
