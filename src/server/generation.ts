@@ -1,5 +1,6 @@
 import { assertUniqueUnityAnimationClipFileNames } from "../core/animation.ts";
-import type { AnimationDirection, Cel, Frame, Layer, PixelBuffer, SpriteProject } from "../core/types.ts";
+import { addTag, duplicateFrame, moveFrame } from "../core/timeline.ts";
+import type { AnimationDirection, Cel, Frame, Layer, PixelBuffer, RGBA, SpriteProject } from "../core/types.ts";
 import { celKey } from "../core/types.ts";
 import { validateDocument } from "../core/document.ts";
 import { indexedToRgba, quantizeToPalette } from "../core/palette.ts";
@@ -269,6 +270,31 @@ function alignFrame(data: Uint8ClampedArray, width: number, height: number): Uin
   return aligned;
 }
 
+function extractSheetFrame(
+  sheet: PixelBuffer,
+  index: number,
+  request: Pick<SpriteSheetRequest, "columns" | "cellWidth" | "cellHeight">,
+): PixelBuffer {
+  const data = new Uint8ClampedArray(request.cellWidth * request.cellHeight * 4);
+  const originX = (index % request.columns) * request.cellWidth;
+  const originY = Math.floor(index / request.columns) * request.cellHeight;
+  for (let y = 0; y < request.cellHeight; y += 1) {
+    const source = ((originY + y) * sheet.width + originX) * 4;
+    data.set(sheet.data.subarray(source, source + request.cellWidth * 4), y * request.cellWidth * 4);
+  }
+  return {
+    width: request.cellWidth,
+    height: request.cellHeight,
+    data: alignFrame(data, request.cellWidth, request.cellHeight),
+  };
+}
+
+function transparentFrame(width: number, height: number, color?: RGBA): PixelBuffer {
+  const data = new Uint8ClampedArray(width * height * 4);
+  if (color) for (let offset = 0; offset < data.length; offset += 4) data.set(color, offset);
+  return { width, height, data };
+}
+
 function offsetFrame(data: Uint8ClampedArray, width: number, height: number, x: number, y: number): Uint8ClampedArray {
   if (x === 0 && y === 0) return data;
   const offset = new Uint8ClampedArray(data.length);
@@ -315,16 +341,8 @@ export function importSpriteSheet(
   for (let index = 0; index < request.frameCount; index += 1) {
     const frame: Frame = { id: crypto.randomUUID(), durationMs: request.durationMs };
     const imageId = crypto.randomUUID();
-    const data = new Uint8ClampedArray(request.cellWidth * request.cellHeight * 4);
-    const originX = (index % request.columns) * request.cellWidth;
-    const originY = Math.floor(index / request.columns) * request.cellHeight;
-    for (let y = 0; y < request.cellHeight; y += 1) {
-      const source = ((originY + y) * sheet.width + originX) * 4;
-      const target = y * request.cellWidth * 4;
-      data.set(sheet.data.subarray(source, source + request.cellWidth * 4), target);
-    }
     frames.push(frame);
-    images[imageId] = { width: request.cellWidth, height: request.cellHeight, data: alignFrame(data, request.cellWidth, request.cellHeight) };
+    images[imageId] = extractSheetFrame(sheet, index, request);
     cels[celKey(frame.id, layer.id)] = { id: crypto.randomUUID(), imageId, x: 0, y: 0, opacity: 1 };
   }
 
@@ -349,6 +367,68 @@ export function importSpriteSheet(
       parentId: request.parentId,
     }],
     exportSettings: { ...project.exportSettings, columns: request.columns },
+  };
+}
+
+export function appendAnimationSheet(
+  project: SpriteProject,
+  png: Uint8Array,
+  request: AppendAnimationRequest,
+  outputPath: string,
+): SpriteProject {
+  assertAppendAnimationRequest(project, request);
+  if (!outputPath.trim()) throw new Error("출력 파일 경로가 필요합니다.");
+  const sheet = decodePng(png);
+  const rows = Math.ceil(request.frameCount / request.columns);
+  if (sheet.width !== request.columns * request.cellWidth || sheet.height !== rows * request.cellHeight) {
+    throw new Error("생성된 시트 크기가 요청한 격자와 다릅니다.");
+  }
+
+  const baseIndex = project.document.frames.findIndex((frame) => frame.id === request.baseFrameId);
+  let document = duplicateFrame(project.document, request.baseFrameId);
+  const baseCloneId = document.frames[baseIndex + 1].id;
+  document = moveFrame(document, baseCloneId, document.frames.length - 1);
+  const durationMs = project.document.frames[baseIndex].durationMs;
+  const palette = document.palette.map((entry) => entry.color);
+  const transparent = palette.find((color) => color[3] === 0);
+
+  for (let index = 0; index < request.frameCount; index += 1) {
+    const frame: Frame = { id: crypto.randomUUID(), durationMs };
+    document.frames.push(frame);
+    for (const layer of document.layers) {
+      const imageId = crypto.randomUUID();
+      const rgba = layer.id === request.targetLayerId
+        ? extractSheetFrame(sheet, index, request)
+        : transparentFrame(request.cellWidth, request.cellHeight, document.colorMode === "indexed" ? transparent : undefined);
+      document.images[imageId] = document.colorMode === "indexed"
+        ? indexedToRgba(quantizeToPalette(rgba, palette), rgba.width, rgba.height, palette)
+        : rgba;
+      document.cels[celKey(frame.id, layer.id)] = {
+        id: crypto.randomUUID(),
+        imageId,
+        x: 0,
+        y: 0,
+        opacity: 1,
+      };
+    }
+  }
+
+  document = addTag(document, {
+    name: request.name,
+    fromFrameId: baseCloneId,
+    toFrameId: document.frames.at(-1)!.id,
+    direction: request.direction,
+  });
+  return {
+    ...project,
+    document,
+    generationHistory: [...project.generationHistory, {
+      id: crypto.randomUUID(),
+      prompt: request.prompt.trim(),
+      createdAt: new Date().toISOString(),
+      outputPath,
+      parentId: request.parentId,
+    }],
   };
 }
 
