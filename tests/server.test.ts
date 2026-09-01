@@ -769,7 +769,19 @@ test("로컬 API는 세션 토큰으로 프로젝트 생성과 Codex 결과 가�
     assert.equal(completed?.status, "completed");
     assert.equal(completed?.project?.document.frames.length, 2);
 
-    const savedProject = await fetch(`${base}/api/projects/${project.id}`).then((response) => response.json());
+    const savedProject = await fetch(`${base}/api/projects/${project.id}`).then((response) => response.json()) as Record<string, unknown>;
+    const { format: _format, ...legacyWireProject } = savedProject;
+    const legacySave = await fetch(`${base}/api/projects/${project.id}`, {
+      method: "PUT",
+      headers: { "content-type": "application/json", "x-pixelforge-token": session.token },
+      body: JSON.stringify(legacyWireProject),
+    });
+    assert.equal(legacySave.status, 400);
+    assert.deepEqual(
+      await fetch(`${base}/api/projects/${project.id}`).then((response) => response.json()),
+      savedProject,
+    );
+
     const invalidExport = await fetch(`${base}/api/exports`, {
       method: "POST",
       headers: { "content-type": "application/json", "x-pixelforge-token": session.token },

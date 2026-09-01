@@ -44,6 +44,7 @@ export function createProject(name: string, document: SpriteDocument): SpritePro
   if (!trimmed) throw new Error("프로젝트 이름이 필요합니다.");
   validateDocument(document);
   return {
+    format: "pixelforge-project",
     version: 1,
     id: id(),
     name: trimmed,

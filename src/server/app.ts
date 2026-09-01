@@ -167,7 +167,9 @@ function wireJob(job: Job): Record<string, unknown> {
 function projectFromWire(value: unknown): SpriteProject {
   if (!value || typeof value !== "object") throw new Error("프로젝트 데이터가 올바르지 않습니다.");
   const project = value as SpriteProject & { document?: { images?: Record<string, PixelBuffer & { data: unknown }> } };
-  if (project.version !== 1 || !project.document?.images) throw new Error("프로젝트 데이터가 올바르지 않습니다.");
+  if (project.format !== "pixelforge-project" || project.version !== 1 || !project.document?.images) {
+    throw new Error("프로젝트 데이터의 형식 또는 버전이 올바르지 않습니다.");
+  }
   const images = Object.fromEntries(Object.entries(project.document.images).map(([id, image]) => {
     if (!Array.isArray(image.data)) throw new Error("픽셀 데이터가 올바르지 않습니다.");
     return [id, { ...image, data: new Uint8ClampedArray(image.data) }];

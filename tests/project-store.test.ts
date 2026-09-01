@@ -38,7 +38,17 @@ test("손상되거나 지원하지 않는 프로젝트를 구분한다", async (
   try {
     await writeFile(join(root, "pixelforge.json"), "{");
     await assert.rejects(loadProject(root), /손상/);
-    await writeFile(join(root, "pixelforge.json"), JSON.stringify({ version: 9 }));
+
+    const legacyJson = JSON.stringify({ version: 1 });
+    const manifestPath = join(root, "pixelforge.json");
+    await writeFile(manifestPath, legacyJson);
+    await assert.rejects(
+      loadProject(root),
+      /이전 PixelForge 프로젝트 형식.*원본은 변경되지.*새 프로젝트/,
+    );
+    assert.equal(await readFile(manifestPath, "utf8"), legacyJson);
+
+    await writeFile(manifestPath, JSON.stringify({ format: "pixelforge-project", version: 9 }));
     await assert.rejects(loadProject(root), /지원하지 않는 프로젝트 버전/);
   } finally {
     await rm(root, { recursive: true, force: true });

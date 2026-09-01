@@ -12,6 +12,13 @@ test("새 문서는 한 프레임과 한 레이어를 가진다", () => {
   assert.doesNotThrow(() => validateDocument(document));
 });
 
+test("새 프로젝트는 새 형식 식별자와 다시 시작한 버전을 가진다", () => {
+  const project = createProject("기사", createDocument({ width: 1, height: 1 }));
+
+  assert.equal(project.format, "pixelforge-project");
+  assert.equal(project.version, 1);
+});
+
 test("0 크기 캔버스는 거부한다", () => {
   assert.throws(() => createDocument({ width: 0, height: 32 }), /캔버스 크기/);
 });

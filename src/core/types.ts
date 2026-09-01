@@ -76,6 +76,7 @@ export type ExportSettings = {
 };
 
 export type SpriteProject = {
+  format: "pixelforge-project";
   version: 1;
   id: string;
   name: string;
