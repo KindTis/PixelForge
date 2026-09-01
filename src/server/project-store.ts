@@ -66,7 +66,12 @@ function parseManifest(source: string): StoredProject {
     throw new Error("프로젝트 파일이 손상되었습니다.");
   }
   if (!value || typeof value !== "object") throw new Error("프로젝트 파일이 손상되었습니다.");
-  if ((value as { version?: unknown }).version !== 1) throw new Error("지원하지 않는 프로젝트 버전입니다.");
+  const header = value as { format?: unknown; version?: unknown };
+  if (header.format === undefined) {
+    throw new Error("이전 PixelForge 프로젝트 형식은 지원하지 않습니다. 원본은 변경되지 않았습니다. 새 프로젝트를 만들어 주세요.");
+  }
+  if (header.format !== "pixelforge-project") throw new Error("지원하지 않는 프로젝트 형식입니다.");
+  if (header.version !== 1) throw new Error("지원하지 않는 프로젝트 버전입니다.");
   const project = value as StoredProject;
   if (!project.document || !project.document.images || typeof project.name !== "string") {
     throw new Error("프로젝트 파일이 손상되었습니다.");

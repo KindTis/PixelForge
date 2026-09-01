@@ -1,6 +1,7 @@
 import type { AiEditReadyResult, AiEditRequest, AiEditTarget } from "../core/ai-edit.ts";
-import { conflictingUnityAnimationTagNames, frameSequence } from "../core/animation.ts";
-import type { AnimationDirection, Layer, PixelBuffer, SpriteProject } from "../core/types.ts";
+import { conflictingUnityAnimationTagNames, UNCLASSIFIED_NAME } from "../core/animation.ts";
+import type { UndoableProjectField } from "../core/commands.ts";
+import type { AnimationSetInput, Layer, PixelBuffer, PngImportDestination, SpriteProject } from "../core/types.ts";
 
 export type WireProject = Omit<SpriteProject, "document"> & {
   document: Omit<SpriteProject["document"], "images"> & {
@@ -45,16 +46,10 @@ export type CodexJob = GenerationJob | CellEditJob;
 export type ProjectLifetime = { projectId: string; epoch: number };
 export type ProjectJobOwnership = ProjectLifetime & { jobId: string };
 
-export type AppendAnimationTarget = {
-  name: string;
-  baseFrameId: string;
-  targetLayerId: string;
-  direction: AnimationDirection;
-};
-
 export type GenerationTarget =
-  | { frameId: string; appendAnimation?: never }
-  | { appendAnimation: AppendAnimationTarget; frameId?: never };
+  | { kind: "sheet"; animationSet: AnimationSetInput }
+  | { kind: "frame"; frameId: string }
+  | { kind: "append"; animationSet: AnimationSetInput; baseFrameId: string; targetLayerId: string };
 
 export function decodeProject(value: SpriteProject | WireProject): SpriteProject {
   const images = Object.fromEntries(Object.entries(value.document.images).map(([id, image]) => [id, {
@@ -77,12 +72,12 @@ export function generationPayload(
   prompt: string,
   frameCount: number,
   columns: number,
+  target: GenerationTarget,
   referencePath?: string,
-  target?: GenerationTarget,
 ) {
   return {
     projectId: project.id,
-    ...target,
+    target,
     request: {
       prompt,
       frameCount,
@@ -92,6 +87,27 @@ export function generationPayload(
       durationMs: 100,
       parentId: project.generationHistory.at(-1)?.id,
       referencePath,
+    },
+  };
+}
+
+export function pngImportPayload(
+  project: SpriteProject,
+  pngBase64: string,
+  frameCount: number,
+  columns: number,
+  destination: PngImportDestination,
+) {
+  return {
+    projectId: project.id,
+    pngBase64,
+    request: {
+      frameCount,
+      columns,
+      cellWidth: project.document.width,
+      cellHeight: project.document.height,
+      durationMs: 100,
+      destination,
     },
   };
 }
@@ -113,12 +129,10 @@ export function appendAnimationIssue(
 ): string | undefined {
   const name = nameInput.trim();
   if (!prompt.trim()) return "생성 프롬프트가 필요합니다.";
-  if (!name) return "애니메이션 태그 이름이 필요합니다.";
-  if (project.document.tags.length === 0) {
-    return "먼저 타임라인에서 현재 전체 구간의 애니메이션 태그를 추가하세요.";
-  }
+  if (!name) return "애니메이션 세트 이름이 필요합니다.";
+  if (name === UNCLASSIFIED_NAME) return "미분류는 예약 이름입니다.";
   if (project.document.tags.some((tag) => tag.name === name)) {
-    return "애니메이션 태그 이름은 비어 있지 않고 고유해야 합니다.";
+    return "애니메이션 세트 이름은 비어 있지 않고 고유해야 합니다.";
   }
   const conflicts = conflictingUnityAnimationTagNames([...project.document.tags, { name }]);
   if (conflicts.length) {
@@ -129,6 +143,12 @@ export function appendAnimationIssue(
     return "대상 레이어는 보이고 잠기지 않은 normal·불투명도 1 레이어여야 합니다.";
   }
   return undefined;
+}
+
+export function generationHistoryFields(target: GenerationTarget): UndoableProjectField[] {
+  if (target.kind === "sheet") return ["document", "generationHistory", "exportSettings"];
+  if (target.kind === "append") return ["document", "generationHistory"];
+  return ["document"];
 }
 
 export function cellEditPayload(projectId: string, request: AiEditRequest): { projectId: string; request: AiEditRequest } {
@@ -212,25 +232,24 @@ export function completedFrameIndex(project: SpriteProject | undefined, requeste
 
 export function completedGenerationSelection(
   project: SpriteProject | undefined,
-  target?: GenerationTarget,
+  target: GenerationTarget,
   responseFrameId?: string,
 ) {
-  if (target?.appendAnimation) {
+  if (target.kind !== "frame") {
     if (!project) throw new Error("완료된 생성 결과가 없습니다.");
-    const tag = project.document.tags.find((candidate) => candidate.name === target.appendAnimation.name.trim());
-    if (!tag) throw new Error("완료 결과에서 추가된 애니메이션 태그를 찾을 수 없습니다.");
-    const firstId = frameSequence(tag, project.document.frames)[0];
-    const from = project.document.frames.findIndex((frame) => frame.id === tag.fromFrameId);
-    const to = project.document.frames.findIndex((frame) => frame.id === tag.toFrameId);
+    const tag = project.document.tags.find((candidate) => candidate.name === target.animationSet.name.trim());
+    if (!tag) throw new Error("완료 결과에서 생성된 애니메이션 세트를 찾을 수 없습니다.");
+    const firstId = tag.frameIds[0];
+    const frameIndex = project.document.frames.findIndex((frame) => frame.id === firstId);
+    if (frameIndex < 0) throw new Error("생성된 애니메이션 세트의 첫 프레임을 찾을 수 없습니다.");
     return {
-      frameIndex: project.document.frames.findIndex((frame) => frame.id === firstId),
+      frameIndex,
       tag,
-      frameCount: to - from + 1,
+      frameCount: tag.frameIds.length,
     };
   }
-  const requestedFrameId = target?.frameId;
   return {
-    frameIndex: completedFrameIndex(project, requestedFrameId, responseFrameId),
+    frameIndex: completedFrameIndex(project, target.frameId, responseFrameId),
     tag: undefined,
     frameCount: undefined,
   };

@@ -1,5 +1,5 @@
 import { parseAiEditResult, type AiEditAttempt, type AiEditResult, type AiEditSettings, type AiEditTarget, type AiSelectionRun } from "./ai-edit.ts";
-import { History } from "./commands.ts";
+import { applyCommand } from "./commands.ts";
 import { nearestPaletteColor } from "./palette.ts";
 import { ToolController } from "./tool-controller.ts";
 import { celKey, type Cel, type PixelBuffer, type SpriteDocument } from "./types.ts";
@@ -40,7 +40,7 @@ export function runAiEdit(state: AiEditExecutionState, target: AiEditTarget, res
   const parsed = parseAiEditResult(result, state.document.width, state.document.height);
   targetCel(state.document, target);
 
-  const temporary = new History(structuredClone(state.document));
+  let document = structuredClone(state.document);
   const settings: AiEditorSettings = {
     tool: state.tool,
     color: state.color,
@@ -57,10 +57,10 @@ export function runAiEdit(state: AiEditExecutionState, target: AiEditTarget, res
   const historySteps: SpriteDocument[] = [];
 
   for (const action of parsed.actions) {
-    const { cel, image } = targetCel(temporary.document, target);
+    const { cel, image } = targetCel(document, target);
     settings.tool = action.tool;
-    const palette = temporary.document.palette.map((entry) => entry.color);
-    const editColor = (color: typeof settings.color) => temporary.document.colorMode === "indexed" ? nearestPaletteColor(color, palette) : color;
+    const palette = document.palette.map((entry) => entry.color);
+    const editColor = (color: typeof settings.color) => document.colorMode === "indexed" ? nearestPaletteColor(color, palette) : color;
     if (action.color !== undefined) settings.color = editColor(action.color);
     if (action.secondaryColor !== undefined) settings.secondaryColor = editColor(action.secondaryColor);
     if (action.brushSize !== undefined) settings.brushSize = action.brushSize;
@@ -79,18 +79,19 @@ export function runAiEdit(state: AiEditExecutionState, target: AiEditTarget, res
     const toolResult = controller.pointerUp(points.at(-1)!);
 
     if (toolResult.command) {
-      const before = temporary.document;
+      const before = document;
       const command = before.colorMode === "indexed"
         ? { ...toolResult.command, pixels: toolResult.command.pixels.map((pixel) => ({ ...pixel, rgba: nearestPaletteColor(pixel.rgba, palette) })) }
         : toolResult.command;
-      const after = temporary.execute(command);
+      const after = applyCommand(before, command);
+      document = after;
       if (after !== before) historySteps.push(after);
     }
     if (toolResult.color) settings.color = toolResult.color;
     if (toolResult.selection) settings.selection = toolResult.selection;
   }
 
-  return { document: temporary.document, historySteps, settings, actionCount: parsed.actions.length };
+  return { document, historySteps, settings, actionCount: parsed.actions.length };
 }
 
 export function runAiEditAttempts(state: AiEditExecutionState, target: AiEditTarget, attempts: readonly AiEditAttempt[]): AiEditApplication {

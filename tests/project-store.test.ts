@@ -38,7 +38,17 @@ test("손상되거나 지원하지 않는 프로젝트를 구분한다", async (
   try {
     await writeFile(join(root, "pixelforge.json"), "{");
     await assert.rejects(loadProject(root), /손상/);
-    await writeFile(join(root, "pixelforge.json"), JSON.stringify({ version: 9 }));
+
+    const legacyJson = JSON.stringify({ version: 1 });
+    const manifestPath = join(root, "pixelforge.json");
+    await writeFile(manifestPath, legacyJson);
+    await assert.rejects(
+      loadProject(root),
+      /이전 PixelForge 프로젝트 형식.*원본은 변경되지.*새 프로젝트/,
+    );
+    assert.equal(await readFile(manifestPath, "utf8"), legacyJson);
+
+    await writeFile(manifestPath, JSON.stringify({ format: "pixelforge-project", version: 9 }));
     await assert.rejects(loadProject(root), /지원하지 않는 프로젝트 버전/);
   } finally {
     await rm(root, { recursive: true, force: true });
@@ -65,7 +75,7 @@ test("선택 프레임 재생성 결과를 저장 왕복해 전체 프로젝트�
     document = addFrame(addFrame(document));
     document = addLayer(document, "효과");
     for (const [index, cel] of Object.values(document.cels).entries()) document.images[cel.imageId].data.fill(index + 1);
-    document.tags.push({ id: crypto.randomUUID(), name: "공격", fromFrameId: document.frames[0].id, toFrameId: document.frames[2].id, direction: "pingPong" });
+    document.tags.push({ id: crypto.randomUUID(), name: "공격", frameIds: document.frames.map((frame) => frame.id), direction: "pingPong" });
     const project = makeProject("기사", document);
     project.generationHistory.push({ id: crypto.randomUUID(), prompt: "기존 생성", createdAt: "2026-08-09T00:00:00.000Z", outputPath: "old.png" });
     const selectedFrame = project.document.frames[1];

@@ -1,12 +1,23 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
-import type { AnimationDirection, SpriteProject } from "../core/types.ts";
+import type { AnimationDirection, PngImportDestination, SpriteProject } from "../core/types.ts";
+import { defaultAnimationSelection, reconcileAnimationSelection, unclassifiedFrameIds, UNCLASSIFIED_NAME, type AnimationSelection } from "../core/animation.ts";
+import { History } from "../core/commands.ts";
 import { renameProject } from "../core/document.ts";
-import { api, appendAnimationIssue, cellEditApplicationDisposition, cellEditApplicationRequestTimeout, cellEditCompletionNotice, cellEditPayload, codexJobStatusTitle, completedGenerationSelection, decodeProject, encodeProject, failedCodexJob, generationPayload, isInitialBlankProject, isRetryablePollingError, pollingErrorCodexJob, projectJobOwnershipMatches, projectLifetimeMatches, releaseProjectJobOwnership, type CellEditJob, type CodexJob, type GenerationJob, type GenerationTarget, type ProjectJobOwnership, type ProjectLifetime, type Session } from "./api.ts";
+import { api, appendAnimationIssue, cellEditApplicationDisposition, cellEditApplicationRequestTimeout, cellEditCompletionNotice, cellEditPayload, codexJobStatusTitle, completedGenerationSelection, decodeProject, encodeProject, failedCodexJob, generationHistoryFields, generationPayload, isInitialBlankProject, isRetryablePollingError, pngImportPayload, pollingErrorCodexJob, projectJobOwnershipMatches, projectLifetimeMatches, releaseProjectJobOwnership, type CellEditJob, type CodexJob, type GenerationJob, type GenerationTarget, type ProjectJobOwnership, type ProjectLifetime, type Session } from "./api.ts";
 import { EditorWorkspace, type EditorWorkspaceHandle } from "./editor/EditorWorkspace.tsx";
 import { ExportDialog, type ExportResponse, type ExportResult, type ExportTarget } from "./ExportDialog.tsx";
+import { ImportSpriteSheetDialog } from "./ImportSpriteSheetDialog.tsx";
 
 type ProjectSummary = { id: string; name: string };
 const CELL_EDIT_UNAVAILABLE = "설치된 Codex App Server에서 현재 셀 편집을 사용할 수 없습니다.";
+
+function animationSetIssue(nameInput: string, direction: AnimationDirection): string | undefined {
+  const name = nameInput.trim();
+  if (!name) return "애니메이션 세트 이름이 필요합니다.";
+  if (name === UNCLASSIFIED_NAME) return "미분류는 예약 이름입니다.";
+  if (!(["forward", "reverse", "pingPong"] as const).includes(direction)) return "재생 방향이 올바르지 않습니다.";
+  return undefined;
+}
 
 async function rgbaPngBase64(file: File): Promise<string> {
   const image = await createImageBitmap(file);
@@ -84,8 +95,8 @@ export function App() {
   const projectLifetime = useRef<ProjectLifetime | undefined>(undefined);
   const activeJobOwnership = useRef<ProjectJobOwnership | undefined>(undefined);
   const editor = useRef<EditorWorkspaceHandle>(null);
-  const [frameIndex, setFrameIndex] = useState(0);
-  const [selectedAnimationTagId, setSelectedAnimationTagId] = useState<string>();
+  const projectHistory = useRef<History | undefined>(undefined);
+  const [animationSelection, setAnimationSelection] = useState<AnimationSelection>({ tagId: null, frameId: null });
   const [dirty, setDirty] = useState(false);
   const [prompt, setPrompt] = useState("칼을 휘두르는 2D 기사 캐릭터, 선명한 실루엣, 제한된 판타지 팔레트");
   const [frameCount, setFrameCount] = useState(8);
@@ -99,6 +110,7 @@ export function App() {
   const cellEditApplicationPending = useRef<ProjectJobOwnership | undefined>(undefined);
   const [cellEditUnavailable, setCellEditUnavailable] = useState("");
   const [reference, setReference] = useState<{ name: string; path: string }>();
+  const [importFile, setImportFile] = useState<File>();
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
   const [showExport, setShowExport] = useState(false);
@@ -113,6 +125,12 @@ export function App() {
     }).catch((reason) => setError(reason instanceof Error ? reason.message : String(reason)));
   }, []);
 
+  const selectedAnimationTag = project?.document.tags.find((candidate) => candidate.id === animationSelection.tagId);
+  useEffect(() => {
+    setAnimationName(selectedAnimationTag?.name ?? "");
+    setAnimationDirection(selectedAnimationTag?.direction ?? "forward");
+  }, [project?.id, animationSelection.tagId, selectedAnimationTag?.name, selectedAnimationTag?.direction]);
+
   latestProject.current = project;
   const codexBusy = Boolean(startingKind) || job?.status === "running" || job?.status === "awaitingApproval" || job?.status === "cancelling" || job?.status === "finalizing";
 
@@ -121,13 +139,18 @@ export function App() {
     setProject(next);
   };
 
+  const syncProject = (next: SpriteProject) => {
+    if (projectHistory.current) projectHistory.current.project = next;
+    setCurrentProject(next);
+  };
+
   const commitProjectName = () => {
     if (!project || projectNameDraft === undefined) return;
     try {
       const renamed = renameProject(project, projectNameDraft);
       setProjectNameDraft(undefined);
       if (renamed.name === project.name) return;
-      setCurrentProject(renamed);
+      syncProject(renamed);
       setProjects((current) => current.map((item) => item.id === renamed.id ? { ...item, name: renamed.name } : item));
       setDirty(true);
     } catch (reason) {
@@ -300,23 +323,28 @@ export function App() {
         }
 
         if (next.kind === "generation" && next.status === "completed") {
+          if (!target) throw new Error("완료된 생성 작업의 target이 없습니다.");
           if (!next.project) {
             completedGenerationSelection(undefined, target, next.frameId);
           } else {
             const completedProject = decodeProject(next.project);
             const selection = completedGenerationSelection(completedProject, target, next.frameId);
             setJob({ ...next, project: completedProject });
-            beginProjectLifetime(completedProject.id);
-            setCurrentProject(completedProject);
+            const tracked = projectHistory.current
+              ? projectHistory.current.replaceProject(completedProject, generationHistoryFields(target))
+              : completedProject;
+            setCurrentProject(tracked);
             setDirty(false);
-            setFrameIndex(selection.frameIndex);
-            if (selection.tag) setSelectedAnimationTagId(selection.tag.id);
-            else if (!target) setSelectedAnimationTagId(undefined);
-            setNotice(selection.tag
-              ? `${selection.tag.name} 애니메이션 ${selection.frameCount}프레임을 추가했습니다.`
-              : target && "frameId" in target
+            const selectedFrame = tracked.document.frames[selection.frameIndex];
+            setAnimationSelection(reconcileAnimationSelection(tracked.document, {
+              tagId: selection.tag?.id ?? null,
+              frameId: selectedFrame?.id ?? null,
+            }));
+            setNotice(target.kind === "append"
+              ? `${selection.tag!.name} 애니메이션 ${selection.frameCount}프레임을 추가했습니다.`
+              : target.kind === "frame"
                 ? "선택 프레임을 재생성해 저장했습니다."
-                : "생성 결과를 프레임으로 가져와 저장했습니다.");
+                : "생성 결과를 이름 세트로 가져와 저장했습니다.");
           }
           return;
         }
@@ -332,10 +360,21 @@ export function App() {
     }
   };
 
-  const generate = async (target?: GenerationTarget) => {
+  const generate = async (target: GenerationTarget) => {
     if (!session || !project) return;
-    if (!target && !isInitialBlankProject(project)
-      && !window.confirm("기존 프레임과 애니메이션 태그를 모두 교체합니다. 전체 시트를 다시 생성할까요?")) return;
+    if (!prompt.trim()) {
+      setError("생성 프롬프트가 필요합니다.");
+      return;
+    }
+    if (target.kind === "sheet") {
+      const issue = animationSetIssue(target.animationSet.name, target.animationSet.direction);
+      if (issue) {
+        setError(issue);
+        return;
+      }
+      if (!isInitialBlankProject(project)
+        && !window.confirm("기존 프레임, 세트와 편집 결과를 모두 교체합니다")) return;
+    }
     const lifetime = beginProjectLifetime(project.id);
     setError("");
     setNotice("");
@@ -344,7 +383,7 @@ export function App() {
       if (!(await save(lifetime)) || !projectLifetimeMatches(projectLifetime.current, lifetime)) return;
       const started = await api<GenerationJob>("/api/generations", session.token, {
         method: "POST",
-        body: JSON.stringify(generationPayload(project, prompt, frameCount, Math.min(columns, frameCount), reference?.path, target)),
+        body: JSON.stringify(generationPayload(project, prompt, frameCount, Math.min(columns, frameCount), target, reference?.path)),
       });
       if (!projectLifetimeMatches(projectLifetime.current, lifetime)) {
         await api(`/api/generations/${started.id}`, session.token, { method: "DELETE" }).catch(() => undefined);
@@ -481,8 +520,13 @@ export function App() {
     }
   };
 
-  const importSheet = async (file?: File) => {
-    if (!file || !session || !project || codexBusy) return;
+  const importSheet = async (file: File, destination: PngImportDestination) => {
+    if (!session || !project || codexBusy) return;
+    if (!isInitialBlankProject(project)
+      && !window.confirm("기존 프레임, 세트와 편집 결과를 모두 교체합니다")) {
+      setImportFile(undefined);
+      return;
+    }
     const lifetime = beginProjectLifetime(project.id);
     setStartingKind("import");
     setError("");
@@ -491,20 +535,22 @@ export function App() {
       if (!projectLifetimeMatches(projectLifetime.current, lifetime)) return;
       const imported = decodeProject(await api<SpriteProject>("/api/imports", session.token, {
         method: "POST",
-        body: JSON.stringify({
-          projectId: project.id,
-          pngBase64,
-          request: { prompt: `직접 가져오기: ${file.name}`, frameCount, columns: Math.min(columns, frameCount), cellWidth: project.document.width, cellHeight: project.document.height, durationMs: 100 },
-        }),
+        body: JSON.stringify(pngImportPayload(project, pngBase64, frameCount, Math.min(columns, frameCount), destination)),
       }));
       if (!projectLifetimeMatches(projectLifetime.current, lifetime)) return;
-      setCurrentProject(imported);
+      const tracked = projectHistory.current
+        ? projectHistory.current.replaceProject(imported, ["document"])
+        : imported;
+      setCurrentProject(tracked);
       setDirty(false);
-      setFrameIndex(0);
-      setSelectedAnimationTagId(undefined);
+      setAnimationSelection(destination.kind === "set"
+        ? { tagId: tracked.document.tags[0].id, frameId: tracked.document.tags[0].frameIds[0] ?? null }
+        : { tagId: null, frameId: unclassifiedFrameIds(tracked.document)[0] ?? null });
+      setImportFile(undefined);
       setNotice("PNG 시트를 프레임으로 가져왔습니다.");
     } catch (reason) {
       if (projectLifetimeMatches(projectLifetime.current, lifetime)) setError(reason instanceof Error ? reason.message : String(reason));
+      throw reason;
     } finally {
       if (projectLifetimeMatches(projectLifetime.current, lifetime)) {
         setStartingKind((current) => current === "import" ? undefined : current);
@@ -517,14 +563,15 @@ export function App() {
     activeJobOwnership.current = undefined;
     cellEditApplicationPending.current = undefined;
     cellEditCancelRequested.current = false;
+    projectHistory.current = new History(next);
     setCurrentProject(next);
+    setAnimationSelection(defaultAnimationSelection(next.document));
     setProjectNameDraft(undefined);
     setStartingKind(undefined);
     setJob(undefined);
     setReference(undefined);
+    setImportFile(undefined);
     setDirty(false);
-    setFrameIndex(0);
-    setSelectedAnimationTagId(undefined);
     const generatedFrames = next.generationHistory.length ? next.document.frames.length : 8;
     setFrameCount(generatedFrames);
     setColumns(Math.min(next.exportSettings.columns, generatedFrames));
@@ -564,9 +611,12 @@ export function App() {
     projectLifetime.current = undefined;
     activeJobOwnership.current = undefined;
     cellEditApplicationPending.current = undefined;
+    projectHistory.current = undefined;
     setCurrentProject(undefined);
+    setAnimationSelection({ tagId: null, frameId: null });
     setJob(undefined);
     setReference(undefined);
+    setImportFile(undefined);
   };
 
   const runExport = async (
@@ -589,7 +639,7 @@ export function App() {
     });
     if (response.status === "cancelled") return undefined;
     if (!current()) throw new Error("프로젝트가 변경되어 내보내기 결과를 반영하지 않았습니다.");
-    setCurrentProject({ ...project, exportSettings: settings });
+    syncProject({ ...project, exportSettings: settings });
     setDirty(false);
     return response;
   };
@@ -597,6 +647,11 @@ export function App() {
   if (!session) return <main className="loading-screen"><span className="brand-mark">PF</span><p>{error || "작업실을 여는 중…"}</p></main>;
   const account = session.account.account;
   const startingCellEdit = startingKind === "cellEdit";
+  const exportSummary = project && {
+    exportableSetCount: project.document.tags.filter((tag) => tag.frameIds.length > 0).length,
+    unclassifiedFrameCount: unclassifiedFrameIds(project.document).length,
+    emptySetNames: project.document.tags.filter((tag) => tag.frameIds.length === 0).map((tag) => tag.name),
+  };
 
   return (
     <main className="app-shell">
@@ -619,48 +674,54 @@ export function App() {
         </div>
       </header>
 
-      {!project ? <NewProject projects={projects} onOpen={openProject} onCreate={createNewProject} /> : <EditorWorkspace ref={editor} project={project} frameIndex={frameIndex} readOnly={codexBusy} onFrameIndex={setFrameIndex} selectedAnimationTagId={selectedAnimationTagId} onSelectedAnimationTagId={setSelectedAnimationTagId} onChange={(next) => {
+      {!project ? <NewProject projects={projects} onOpen={openProject} onCreate={createNewProject} /> : <EditorWorkspace ref={editor} project={project} history={projectHistory.current!} selection={animationSelection} readOnly={codexBusy} onSelection={setAnimationSelection} onChange={(next) => {
         setCurrentProject(next);
         const pending = cellEditApplicationPending.current;
         if (!pending || !projectJobOwnershipMatches(projectLifetime.current, activeJobOwnership.current, pending)) setDirty(true);
       }} onSave={() => void save()} saveState={dirty ? "저장 대기" : "저장됨"} onError={setError} generationPanel={({ activeFrameId, activeFrameNumber, activeLayer, hasActiveCel }) => {
         const name = animationName.trim();
-        const issue = appendAnimationIssue(project, prompt, name, activeLayer, hasActiveCel);
-        const appendDisabled = account?.type !== "chatgpt" || codexBusy || Boolean(issue);
+        const appendIssue = appendAnimationIssue(project, prompt, name, activeLayer, hasActiveCel);
+        const sheetIssue = !prompt.trim() ? "생성 프롬프트가 필요합니다." : animationSetIssue(name, animationDirection);
+        const issue = generationMode === "append" ? appendIssue : sheetIssue;
+        const generationDisabled = account?.type !== "chatgpt" || codexBusy || Boolean(issue);
         return <section className="generation-panel">
             <div className="panel-title"><span>CODEX FORGE</span><b>{account?.type === "chatgpt" ? "연결됨" : "로그인 필요"}</b></div>
-            <form onSubmit={(event) => { event.preventDefault(); if (generationMode === "sheet") void generate(); }}>
+            <form onSubmit={(event) => { event.preventDefault(); if (generationMode === "sheet") void generate({ kind: "sheet", animationSet: { name, direction: animationDirection } }); }}>
               <label className="generation-mode">생성 방식<select disabled={codexBusy} value={generationMode} onChange={(event) => setGenerationMode(event.target.value as "sheet" | "append")}><option value="sheet">전체 시트</option><option value="append">추가 애니메이션</option></select></label>
               <label>프롬프트<textarea rows={6} disabled={codexBusy} value={prompt} onChange={(event) => setPrompt(event.target.value)} /></label>
               <div className="form-grid">
                 <label>{generationMode === "append" ? "추가 생성 프레임 수 (기준 제외)" : "총 프레임 수"}<input type="number" min="1" max="256" disabled={codexBusy} value={frameCount} onChange={(event) => setFrameCount(Number(event.target.value))} /></label>
                 <label>열<input type="number" min="1" max={frameCount} disabled={codexBusy} value={columns} onChange={(event) => setColumns(Number(event.target.value))} /></label>
               </div>
+              <div className="form-grid append-fields">
+                <label>애니메이션 이름<input disabled={codexBusy} value={animationName} onChange={(event) => setAnimationName(event.target.value)} /></label>
+                <label>재생 방향<select disabled={codexBusy} value={animationDirection} onChange={(event) => setAnimationDirection(event.target.value as AnimationDirection)}><option value="forward">정방향</option><option value="reverse">역방향</option><option value="pingPong">핑퐁</option></select></label>
+              </div>
               {generationMode === "append" && <>
-                <div className="form-grid append-fields">
-                  <label>애니메이션 이름<input disabled={codexBusy} value={animationName} onChange={(event) => setAnimationName(event.target.value)} /></label>
-                  <label>재생 방향<select disabled={codexBusy} value={animationDirection} onChange={(event) => setAnimationDirection(event.target.value as AnimationDirection)}><option value="forward">정방향</option><option value="reverse">역방향</option><option value="pingPong">핑퐁</option></select></label>
-                </div>
-                <p className="hint append-context">현재 기준 F{activeFrameNumber} · 대상 레이어 {activeLayer?.name ?? "없음"}</p>
-                {issue && <p className="error append-issue" role="status">{issue}</p>}
+                <p className="hint append-context">현재 기준 {activeFrameNumber ? `F${activeFrameNumber}` : "없음"} · 대상 레이어 {activeLayer?.name ?? "없음"}</p>
               </>}
+              {issue && <p className="error append-issue" role="status">{issue}</p>}
               <p className="hint">{project.document.width} × {project.document.height}px · 투명 배경 · PNG</p>
               <div className="asset-inputs">
                 <label>참조 PNG<input type="file" accept="image/png" disabled={codexBusy} onChange={(event) => void uploadReference(event.target.files?.[0])} /></label>
-                <label>시트 가져오기<input type="file" accept="image/png" disabled={codexBusy} onChange={(event) => void importSheet(event.target.files?.[0])} /></label>
+                <label>시트 가져오기<input type="file" accept="image/png" disabled={codexBusy} onChange={(event) => {
+                  const file = event.currentTarget.files?.[0];
+                  event.currentTarget.value = "";
+                  if (file) setImportFile(file);
+                }} /></label>
               </div>
               {reference && <p className="reference-file"><span>{reference.name}</span><button type="button" disabled={codexBusy} onClick={() => setReference(undefined)}>제거</button></p>}
               {generationMode === "append"
-                ? <button className="forge-button" type="button" disabled={appendDisabled} onClick={() => void generate({ appendAnimation: {
-                    name,
-                    baseFrameId: activeFrameId,
+                ? <button className="forge-button" type="button" disabled={generationDisabled} onClick={() => void generate({
+                    kind: "append",
+                    animationSet: { name, direction: animationDirection },
+                    baseFrameId: activeFrameId!,
                     targetLayerId: activeLayer!.id,
-                    direction: animationDirection,
-                  } })}><span>애니메이션 추가</span><b>⌘ ↗</b></button>
-                : <button className="forge-button" type="submit" disabled={!account || codexBusy}>
+                  })}><span>애니메이션 추가</span><b>⌘ ↗</b></button>
+                : <button className="forge-button" type="submit" disabled={generationDisabled}>
                     <span>{isInitialBlankProject(project) ? "스프라이트 생성" : "전체 시트 다시 생성"}</span><b>⌘ ↗</b>
                   </button>}
-              <button className="forge-button" type="button" disabled={!account || codexBusy || !project.document.frames[frameIndex]} onClick={() => void generate({ frameId: project.document.frames[frameIndex].id })}>
+              <button className="forge-button" type="button" disabled={account?.type !== "chatgpt" || codexBusy || !prompt.trim() || !animationSelection.frameId} onClick={() => animationSelection.frameId && void generate({ kind: "frame", frameId: animationSelection.frameId })}>
                 <span>선택 프레임 재생성</span><b>⌘ ↗</b>
               </button>
               <button className="forge-button" type="button" disabled={account?.type !== "chatgpt" || !prompt.trim() || !hasActiveCel || activeLayer?.locked || codexBusy || Boolean(cellEditUnavailable)} onClick={() => void editCurrentCell()}>
@@ -689,7 +750,14 @@ export function App() {
           </section>;
       }} />}
       {(notice || error || session.account.error) && <div className={`toast ${error || session.account.error ? "error" : ""}`} role="status">{error || session.account.error || notice}</div>}
-      {project && showExport && <ExportDialog settings={project.exportSettings} onClose={() => setShowExport(false)} onExport={runExport} />}
+      {project && importFile && <ImportSpriteSheetDialog
+        fileName={importFile.name}
+        initialName={animationName}
+        initialDirection={animationDirection}
+        onClose={() => setImportFile(undefined)}
+        onConfirm={(destination) => importSheet(importFile, destination)}
+      />}
+      {project && exportSummary && showExport && <ExportDialog settings={project.exportSettings} summary={exportSummary} onClose={() => setShowExport(false)} onExport={runExport} />}
     </main>
   );
 }

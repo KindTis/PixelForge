@@ -4,6 +4,8 @@ import type { PixelBuffer, SpriteDocument } from "../../core/types.ts";
 
 export type CanvasView = {
   frameId: string;
+  onionPreviousFrameId?: string;
+  onionNextFrameId?: string;
   zoom: number;
   panX: number;
   panY: number;
@@ -40,13 +42,12 @@ export class CanvasRenderer {
     context.fillRect(0, 0, width, height);
     context.clearRect(view.panX, view.panY, sprite.width * view.zoom, sprite.height * view.zoom);
 
-    const frameIndex = sprite.frames.findIndex((frame) => frame.id === view.frameId);
     const current = compositeFrame(sprite, view.frameId);
     if (view.tilePreview) for (let y = -1; y <= 1; y += 1) for (let x = -1; x <= 1; x += 1) {
       if (x || y) this.drawBuffer(context, current, { ...view, panX: view.panX + x * sprite.width * view.zoom, panY: view.panY + y * sprite.height * view.zoom }, 0.3);
     }
-    if (view.onionSkin && frameIndex > 0) this.drawBuffer(context, compositeFrame(sprite, sprite.frames[frameIndex - 1].id), view, 0.18, "#ff5577");
-    if (view.onionSkin && frameIndex < sprite.frames.length - 1) this.drawBuffer(context, compositeFrame(sprite, sprite.frames[frameIndex + 1].id), view, 0.18, "#55bbee");
+    if (view.onionSkin && view.onionPreviousFrameId) this.drawBuffer(context, compositeFrame(sprite, view.onionPreviousFrameId), view, 0.18, "#ff5577");
+    if (view.onionSkin && view.onionNextFrameId) this.drawBuffer(context, compositeFrame(sprite, view.onionNextFrameId), view, 0.18, "#55bbee");
     this.drawBuffer(context, current, view, 1);
 
     if (view.showGrid && view.zoom >= 8) {

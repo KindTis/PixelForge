@@ -126,8 +126,7 @@ function threeFrameProject() {
   document.tags.push({
     id: crypto.randomUUID(),
     name: "공격",
-    fromFrameId: document.frames[0].id,
-    toFrameId: document.frames[2].id,
+    frameIds: document.frames.map((frame) => frame.id),
     direction: "forward",
   });
   const project = makeProject("기사", document);
@@ -338,7 +337,7 @@ test("선택 프레임 생성은 역할별 PNG를 제공하고 선택 프레임�
       headers: { "content-type": "application/json", "x-pixelforge-token": token },
       body: JSON.stringify({
         projectId: project.id,
-        frameId,
+        target: { kind: "frame", frameId },
         request: { prompt: "검 공격", frameCount: 3, columns: 3, cellWidth: 2, cellHeight: 1, durationMs: 100, referencePath: "references/hero.png" },
       }),
     });
@@ -394,11 +393,11 @@ test("추가 애니메이션 작업은 기준 합성을 참조하고 완성 프�
       headers: { "content-type": "application/json", "x-pixelforge-token": token },
       body: JSON.stringify({
         projectId: project.id,
-        appendAnimation: {
-          name: "attack",
+        target: {
+          kind: "append",
+          animationSet: { name: "attack", direction: "reverse" },
           baseFrameId: project.document.frames[0].id,
           targetLayerId: project.document.layers[0].id,
-          direction: "reverse",
         },
         request: {
           prompt: "검 공격",
@@ -454,11 +453,11 @@ test("추가 애니메이션 요청은 배타성과 사전 조건을 지키고 �
     cellHeight: 1,
     durationMs: 100,
   };
-  const appendAnimation = {
-    name: "attack",
+  const appendTarget = {
+    kind: "append",
+    animationSet: { name: "attack", direction: "forward" },
     baseFrameId: project.document.frames[0].id,
     targetLayerId: project.document.layers[0].id,
-    direction: "forward",
   };
   const post = (body: unknown) => fetch(`${base}/api/generations`, {
     method: "POST",
@@ -468,13 +467,15 @@ test("추가 애니메이션 요청은 배타성과 사전 조건을 지키고 �
 
   try {
     for (const requestBody of [
-      { projectId: project.id, frameId: project.document.frames[0].id, appendAnimation, request },
+      { projectId: project.id, target: { ...appendTarget, frameId: project.document.frames[0].id }, request },
+      { projectId: project.id, target: { kind: "unknown" }, request },
+      { projectId: project.id, target: { ...appendTarget, targetLayerId: 42 }, request },
       {
         projectId: project.id,
-        appendAnimation: { ...appendAnimation, targetLayerId: "missing" },
+        target: { ...appendTarget, targetLayerId: "missing" },
         request,
       },
-      { projectId: project.id, appendAnimation: { ...appendAnimation, name: "공격?" }, request },
+      { projectId: project.id, target: { ...appendTarget, animationSet: { name: "공격?", direction: "forward" } }, request },
     ]) {
       const response = await post(requestBody);
       assert.equal(response.status, 400);
@@ -482,7 +483,7 @@ test("추가 애니메이션 요청은 배타성과 사전 조건을 지키고 �
     }
 
     const before = JSON.stringify(await loadProject(projectRoot));
-    const started = await post({ projectId: project.id, appendAnimation, request });
+    const started = await post({ projectId: project.id, target: appendTarget, request });
     assert.equal(started.status, 202);
     const job = await started.json() as { id: string };
     await writeFile(
@@ -513,7 +514,7 @@ test("첫·마지막 프레임은 존재하는 참조만 만들고 취소 시 �
     headers: { "content-type": "application/json", "x-pixelforge-token": token },
     body: JSON.stringify({
       projectId: project.id,
-      frameId,
+      target: { kind: "frame", frameId },
       request: { prompt: "경계 검사", frameCount: 3, columns: 3, cellWidth: 2, cellHeight: 1, durationMs: 100 },
     }),
   });
@@ -553,7 +554,7 @@ test("잘못된 선택 프레임 결과는 실패하고 저장 프로젝트를 �
       headers: { "content-type": "application/json", "x-pixelforge-token": token },
       body: JSON.stringify({
         projectId: project.id,
-        frameId: project.document.frames[1].id,
+        target: { kind: "frame", frameId: project.document.frames[1].id },
         request: { prompt: "실패 검사", frameCount: 3, columns: 3, cellWidth: 2, cellHeight: 1, durationMs: 100 },
       }),
     });
@@ -584,6 +585,7 @@ test("완료된 생성의 결과 파일이 없으면 Codex 메시지를 포함�
     headers: { "content-type": "application/json", "x-pixelforge-token": token },
     body: JSON.stringify({
       projectId: project.id,
+      target: { kind: "sheet", animationSet: { name: "idle", direction: "forward" } },
       request: { prompt: "전체 재생성", frameCount: 3, columns: 3, cellWidth: 2, cellHeight: 1, durationMs: 100 },
     }),
   });
@@ -626,7 +628,7 @@ test("빈 frameId는 전체 시트 생성으로 폴백하지 않는다", async (
       headers: { "content-type": "application/json", "x-pixelforge-token": token },
       body: JSON.stringify({
         projectId: project.id,
-        frameId: "",
+        target: { kind: "frame", frameId: "" },
         request: { prompt: "잘못된 선택", frameCount: 3, columns: 3, cellWidth: 2, cellHeight: 1, durationMs: 100 },
       }),
     });
@@ -651,7 +653,7 @@ test("배열 frameId는 문자열 선택으로 변환하지 않고 거부한다"
       headers: { "content-type": "application/json", "x-pixelforge-token": token },
       body: JSON.stringify({
         projectId: project.id,
-        frameId: [project.document.frames[1].id],
+        target: { kind: "frame", frameId: [project.document.frames[1].id] },
         request: { prompt: "잘못된 타입", frameCount: 3, columns: 3, cellWidth: 2, cellHeight: 1, durationMs: 100 },
       }),
     });
@@ -712,24 +714,46 @@ test("로컬 API는 세션 토큰으로 프로젝트 생성과 Codex 결과 가�
     assert.equal(referenceResponse.status, 201);
     assert.match(((await referenceResponse.json()) as { path: string }).path, /^references\//);
 
-    const importResponse = await fetch(`${base}/api/imports`, {
+    const importPngBase64 = encodePng(2, 1, new Uint8ClampedArray(8)).toString("base64");
+    const importShape = { frameCount: 2, columns: 2, cellWidth: 1, cellHeight: 1, durationMs: 100 };
+    const postImport = (request: unknown) => fetch(`${base}/api/imports`, {
       method: "POST",
       headers: { "content-type": "application/json", "x-pixelforge-token": session.token },
-      body: JSON.stringify({
-        projectId: project.id,
-        pngBase64: encodePng(2, 1, new Uint8ClampedArray(8)).toString("base64"),
-        request: { prompt: "직접 가져오기", frameCount: 2, columns: 2, cellWidth: 1, cellHeight: 1, durationMs: 100 },
-      }),
+      body: JSON.stringify({ projectId: project.id, pngBase64: importPngBase64, request }),
     });
-    assert.equal(importResponse.status, 200);
-    assert.equal(((await importResponse.json()) as { document: { frames: unknown[] } }).document.frames.length, 2);
+
+    const unclassifiedResponse = await postImport({ ...importShape, destination: { kind: "unclassified" } });
+    assert.equal(unclassifiedResponse.status, 200);
+    const unclassified = await unclassifiedResponse.json() as { document: { frames: unknown[]; tags: unknown[] } };
+    assert.equal(unclassified.document.frames.length, 2);
+    assert.deepEqual(unclassified.document.tags, []);
+    assert.deepEqual(await fetch(`${base}/api/projects/${project.id}`).then((response) => response.json()), unclassified);
+
+    const namedResponse = await postImport({ ...importShape, destination: { kind: "set", animationSet: { name: "idle", direction: "forward" } } });
+    assert.equal(namedResponse.status, 200);
+    const named = await namedResponse.json() as { document: { frames: Array<{ id: string }>; tags: Array<{ name: string; frameIds: string[] }> } };
+    assert.equal(named.document.tags.length, 1);
+    assert.equal(named.document.tags[0].name, "idle");
+    assert.deepEqual(named.document.tags[0].frameIds, named.document.frames.map((frame) => frame.id));
+    assert.deepEqual(await fetch(`${base}/api/projects/${project.id}`).then((response) => response.json()), named);
+
+    const beforeInvalidImport = await fetch(`${base}/api/projects/${project.id}`).then((response) => response.json());
+    for (const invalidRequest of [
+      importShape,
+      { ...importShape, destination: { kind: "unknown" } },
+      { ...importShape, destination: { kind: "set", animationSet: { name: "", direction: "forward" } } },
+      { ...importShape, columns: 3, destination: { kind: "unclassified" } },
+    ]) {
+      assert.equal((await postImport(invalidRequest)).status, 400);
+    }
+    assert.deepEqual(await fetch(`${base}/api/projects/${project.id}`).then((response) => response.json()), beforeInvalidImport);
 
     const exportResponse = await fetch(`${base}/api/exports`, {
       method: "POST",
       headers: { "content-type": "application/json", "x-pixelforge-token": session.token },
       body: JSON.stringify({
         projectId: project.id,
-        project,
+        project: named,
         target: "common",
         options: exportOptions,
       }),
@@ -746,6 +770,7 @@ test("로컬 API는 세션 토큰으로 프로젝트 생성과 Codex 결과 가�
       headers: { "content-type": "application/json", "x-pixelforge-token": session.token },
       body: JSON.stringify({
         projectId: project.id,
+        target: { kind: "sheet", animationSet: { name: "attack", direction: "forward" } },
         request: { prompt: "검 휘두르기", frameCount: 2, columns: 2, cellWidth: 1, cellHeight: 1, durationMs: 90 },
       }),
     });
@@ -769,7 +794,19 @@ test("로컬 API는 세션 토큰으로 프로젝트 생성과 Codex 결과 가�
     assert.equal(completed?.status, "completed");
     assert.equal(completed?.project?.document.frames.length, 2);
 
-    const savedProject = await fetch(`${base}/api/projects/${project.id}`).then((response) => response.json());
+    const savedProject = await fetch(`${base}/api/projects/${project.id}`).then((response) => response.json()) as Record<string, unknown>;
+    const { format: _format, ...legacyWireProject } = savedProject;
+    const legacySave = await fetch(`${base}/api/projects/${project.id}`, {
+      method: "PUT",
+      headers: { "content-type": "application/json", "x-pixelforge-token": session.token },
+      body: JSON.stringify(legacyWireProject),
+    });
+    assert.equal(legacySave.status, 400);
+    assert.deepEqual(
+      await fetch(`${base}/api/projects/${project.id}`).then((response) => response.json()),
+      savedProject,
+    );
+
     const invalidExport = await fetch(`${base}/api/exports`, {
       method: "POST",
       headers: { "content-type": "application/json", "x-pixelforge-token": session.token },
@@ -787,7 +824,7 @@ test("로컬 API는 세션 토큰으로 프로젝트 생성과 Codex 결과 가�
     const startGeneration = () => fetch(`${base}/api/generations`, {
       method: "POST",
       headers: { "content-type": "application/json", "x-pixelforge-token": session.token },
-      body: JSON.stringify({ projectId: project.id, request: { prompt: "연결 종료 검사", frameCount: 1, columns: 1, cellWidth: 1, cellHeight: 1, durationMs: 100 } }),
+      body: JSON.stringify({ projectId: project.id, target: { kind: "sheet", animationSet: { name: "idle", direction: "forward" } }, request: { prompt: "연결 종료 검사", frameCount: 1, columns: 1, cellWidth: 1, cellHeight: 1, durationMs: 100 } }),
     });
     const generationResponses = await Promise.all([startGeneration(), startGeneration()]);
     assert.deepEqual(generationResponses.map((response) => response.status).sort(), [202, 409]);
@@ -806,7 +843,7 @@ test("로컬 API는 세션 토큰으로 프로젝트 생성과 Codex 결과 가�
     const lockedImport = await fetch(`${base}/api/imports`, {
       method: "POST",
       headers: { "content-type": "application/json", "x-pixelforge-token": session.token },
-      body: JSON.stringify({ projectId: project.id, pngBase64: encodePng(1, 1, new Uint8ClampedArray(4)).toString("base64"), request: { prompt: "잠금 검사", frameCount: 1, columns: 1, cellWidth: 1, cellHeight: 1, durationMs: 100 } }),
+      body: JSON.stringify({ projectId: project.id, pngBase64: encodePng(1, 1, new Uint8ClampedArray(4)).toString("base64"), request: { frameCount: 1, columns: 1, cellWidth: 1, cellHeight: 1, durationMs: 100, destination: { kind: "unclassified" } } }),
     });
     assert.equal(lockedImport.status, 409);
 
@@ -893,7 +930,11 @@ test("내보내기 폴더 취소와 교체 거절은 아무것도 저장하지 �
       method: "POST",
       headers: { "content-type": "application/json", "x-pixelforge-token": fixture.token },
       body: JSON.stringify({ name: "기사", width: 1, height: 1 }),
-    }).then((response) => response.json()) as { id: string; exportSettings: { columns: number } };
+    }).then((response) => response.json()) as {
+      id: string;
+      exportSettings: { columns: number };
+      document: { frames: Array<{ id: string }>; tags: Array<{ id: string; name: string; direction: "forward"; frameIds: string[] }> };
+    };
     const manifestPath = join(root, created.id, "pixelforge.json");
     const originalManifest = await readFile(manifestPath, "utf8");
 
@@ -916,6 +957,12 @@ test("내보내기 폴더 취소와 교체 거절은 아무것도 저장하지 �
     assert.equal(await readFile(manifestPath, "utf8"), originalManifest);
 
     replace = true;
+    const unexportable = await requestExport(fixture.base, fixture.token, created);
+    assert.equal(unexportable.status, 400);
+    assert.match(((await unexportable.json()) as { error: string }).error, /내보낼 애니메이션 세트가 없습니다/);
+    assert.equal(await readFile(join(destination, "common", "old.txt"), "utf8"), "보존");
+
+    created.document.tags.push({ id: "idle", name: "idle", direction: "forward", frameIds: [created.document.frames[0].id] });
     const completed = await requestExport(fixture.base, fixture.token, created);
     assert.equal(completed.status, 201);
     assert.deepEqual(await completed.json(), {
@@ -955,7 +1002,11 @@ test("내보내기 폴더의 대상이 없거나 비어 있으면 교체 확인�
       method: "POST",
       headers: { "content-type": "application/json", "x-pixelforge-token": fixture.token },
       body: JSON.stringify({ name: "기사", width: 1, height: 1 }),
-    }).then((response) => response.json()) as { id: string };
+    }).then((response) => response.json()) as {
+      id: string;
+      document: { frames: Array<{ id: string }>; tags: Array<{ id: string; name: string; direction: "forward"; frameIds: string[] }> };
+    };
+    project.document.tags.push({ id: "idle", name: "idle", direction: "forward", frameIds: [project.document.frames[0].id] });
     await mkdir(withoutTarget);
     const withoutTargetResponse = await requestExport(fixture.base, fixture.token, project);
     assert.equal(withoutTargetResponse.status, 201);
@@ -1450,7 +1501,7 @@ test("첫 편집 실행 실패는 추적 가능한 기술 실패로 남고 일�
     const generation = await fetch(`${base}/api/generations`, {
       method: "POST",
       headers: { "content-type": "application/json", "x-pixelforge-token": token },
-      body: JSON.stringify({ projectId: project.id, request: { prompt: "일반 생성", frameCount: 1, columns: 1, cellWidth: 2, cellHeight: 1, durationMs: 100 } }),
+      body: JSON.stringify({ projectId: project.id, target: { kind: "sheet", animationSet: { name: "idle", direction: "forward" } }, request: { prompt: "일반 생성", frameCount: 1, columns: 1, cellWidth: 2, cellHeight: 1, durationMs: 100 } }),
     });
     assert.equal(generation.status, 202);
     assert.match(codex.lastPrompt, /일반 생성/);
@@ -1476,7 +1527,7 @@ test("분리된 bridge의 동일 run ID 이벤트와 중단은 각 작업에만 
     const generation = await (await fetch(`${base}/api/generations`, {
       method: "POST",
       headers: { "content-type": "application/json", "x-pixelforge-token": token },
-      body: JSON.stringify({ projectId: generationProject.id, request: { prompt: "충돌 검사", frameCount: 1, columns: 1, cellWidth: 2, cellHeight: 1, durationMs: 100 } }),
+      body: JSON.stringify({ projectId: generationProject.id, target: { kind: "sheet", animationSet: { name: "idle", direction: "forward" } }, request: { prompt: "충돌 검사", frameCount: 1, columns: 1, cellWidth: 2, cellHeight: 1, durationMs: 100 } }),
     })).json() as { id: string };
     const edit = await (await fetch(`${base}/api/edits`, {
       method: "POST",
@@ -1579,7 +1630,7 @@ test("셀 편집은 잘못된 대상과 잠금을 시작 전에 거부하고 프
     assert.equal((await fetch(`${base}/api/generations`, {
       method: "POST",
       headers: { "content-type": "application/json", "x-pixelforge-token": token },
-      body: JSON.stringify({ projectId: project.id, request: { prompt: "생성", frameCount: 1, columns: 1, cellWidth: 2, cellHeight: 1, durationMs: 100 } }),
+      body: JSON.stringify({ projectId: project.id, target: { kind: "sheet", animationSet: { name: "idle", direction: "forward" } }, request: { prompt: "생성", frameCount: 1, columns: 1, cellWidth: 2, cellHeight: 1, durationMs: 100 } }),
     })).status, 409);
     await fetch(`${base}/api/edits/${first.id}`, { method: "DELETE", headers: { "x-pixelforge-token": token } });
   } finally {

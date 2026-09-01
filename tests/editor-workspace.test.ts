@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import * as React from "react";
+import { defaultAnimationSelection, type AnimationSelection } from "../src/core/animation.ts";
+import { History } from "../src/core/commands.ts";
 import { createDocument, createProject } from "../src/core/document.ts";
-import { duplicateFrame } from "../src/core/timeline.ts";
-import { celKey } from "../src/core/types.ts";
-import { EditorWorkspace, type GenerationPanelContext } from "../src/client/editor/EditorWorkspace.tsx";
+import { addFrame } from "../src/core/timeline.ts";
+import { updateFrameStripSelection } from "../src/client/editor/AnimationFrameStrip.tsx";
+import { EditorWorkspace } from "../src/client/editor/EditorWorkspace.tsx";
 
 type CanvasProps = Record<string, (event: PointerEventLike) => void>;
 type ElementNode = { type?: unknown; props?: Record<string, unknown> & { children?: unknown } };
@@ -42,6 +44,18 @@ function renderedText(node: unknown): string {
   return (Array.isArray(children) ? children : [children]).map(renderedText).join(" ");
 }
 
+function renderNestedComponents(node: unknown): unknown {
+  if (Array.isArray(node)) return node.map(renderNestedComponents);
+  if (!node || typeof node !== "object") return node;
+  const value = node as ElementNode;
+  if (typeof value.type === "function") {
+    return renderNestedComponents(value.type(value.props ?? {}));
+  }
+  return value.props
+    ? { ...value, props: { ...value.props, children: renderNestedComponents(value.props.children) } }
+    : value;
+}
+
 function workspaceCanvas(
   project: ReturnType<typeof createProject>,
   captures: number[],
@@ -63,7 +77,7 @@ function workspaceCanvas(
   const previous = internals.H;
   let refIndex = 0;
   internals.H = {
-    useRef(initial: unknown) { return { current: refIndex++ === 2 ? canvas : initial }; },
+    useRef(initial: unknown) { return { current: refIndex++ === 0 ? canvas : initial }; },
     useState(initial: unknown) { return [initial, () => {}]; },
     useEffect() {},
     useImperativeHandle() {},
@@ -71,11 +85,10 @@ function workspaceCanvas(
   try {
     const element = (EditorWorkspace as unknown as { render: (props: Record<string, unknown>, ref: null) => { props: { children: unknown } } }).render({
       project,
-      frameIndex: 0,
+      history: overrides.history ?? new History(project),
+      selection: overrides.selection ?? defaultAnimationSelection(project.document),
       readOnly: false,
-      onFrameIndex() {},
-      selectedAnimationTagId: undefined,
-      onSelectedAnimationTagId() {},
+      onSelection() {},
       onChange() {},
       onSave() {},
       generationPanel: () => null,
@@ -83,11 +96,12 @@ function workspaceCanvas(
       onError() {},
       ...overrides,
     }, null);
-    const canvasElement = elements(element).find((value) => value.type === "canvas");
+    const rendered = renderNestedComponents(element);
+    const canvasElement = elements(rendered).find((value) => value.type === "canvas");
     return {
-      props: canvasElement?.props as CanvasProps ?? (() => { throw new Error("캔버스를 찾지 못했습니다."); })(),
+      props: canvasElement?.props as CanvasProps ?? {},
       canvas,
-      element,
+      element: rendered,
     };
   } finally {
     internals.H = previous;
@@ -97,6 +111,47 @@ function workspaceCanvas(
 function pointerEvent(canvas: CanvasLike): PointerEventLike {
   return { button: 0, clientX: 5, clientY: 5, currentTarget: canvas, pointerId: 1, preventDefault() {} };
 }
+
+test("프레임 선택 수정키는 활성 프레임과 다중 선택을 분리한다", () => {
+  const order = ["a", "b", "c", "d"];
+  const cases = [
+    [{ type: "click", frameId: "b", ctrl: false, shift: false }, { activeFrameId: "b", selection: { ids: ["b"], anchorId: "b" } }],
+    [{ type: "click", frameId: "c", ctrl: true, shift: false }, { activeFrameId: "a", selection: { ids: ["c"], anchorId: "c" } }],
+    [{ type: "click", frameId: "d", ctrl: false, shift: true }, { activeFrameId: "a", selection: { ids: ["b", "c", "d"], anchorId: "b" } }],
+    [{ type: "all" }, { activeFrameId: "a", selection: { ids: order, anchorId: "b" } }],
+    [{ type: "clear" }, { activeFrameId: "a", selection: { ids: [], anchorId: undefined } }],
+  ] as const;
+  for (const [action, expected] of cases) {
+    assert.deepEqual(updateFrameStripSelection(order, "a", { ids: [], anchorId: "b" }, action), expected);
+  }
+});
+
+test("세트 관리자는 고정 작업 바와 접근 가능한 순서 동작을 제공한다", () => {
+  let document = createDocument({ width: 1, height: 1 });
+  for (let index = 0; index < 2; index += 1) document = addFrame(document);
+  const ids = document.frames.map((frame) => frame.id);
+  document.tags = [
+    { id: "idle", name: "idle", direction: "forward", frameIds: ids.slice(0, 2) },
+    { id: "walk", name: "walk", direction: "forward", frameIds: ids.slice(2) },
+  ];
+  const project = createProject("기사", document);
+  const changes: ReturnType<typeof createProject>[] = [];
+  const rendered = workspaceCanvas(project, [], {
+    selection: { tagId: "idle", frameId: ids[0] },
+    onChange: (next: ReturnType<typeof createProject>) => changes.push(next),
+  }).element;
+
+  assert.match(renderedText(rendered), /선택된 프레임 없음/);
+  const moveSet = elements(rendered).find((node) => node.type === "button" && node.props?.["aria-label"] === "idle 애니메이션 세트 아래로 이동");
+  assert.ok(moveSet);
+  (moveSet.props?.onClick as () => void)();
+  assert.deepEqual(changes.at(-1)?.document.tags.map((tag) => tag.id), ["walk", "idle"]);
+
+  const moveFrame = elements(rendered).find((node) => node.type === "button" && node.props?.["aria-label"] === "1번 프레임 뒤로 이동");
+  assert.ok(moveFrame);
+  (moveFrame.props?.onClick as (event: { stopPropagation(): void }) => void)({ stopPropagation() {} });
+  assert.deepEqual(changes.at(-1)?.document.tags[0].frameIds, [ids[1], ids[0]]);
+});
 
 test("포인터 종료는 부모 갱신 전에도 커밋된 도형 문서를 렌더링한다", () => {
   const previousWindow = globalThis.window;
@@ -148,54 +203,59 @@ test("잠긴 레이어는 포인터 편집을 시작하거나 커밋하지 않�
   }
 });
 
-test("태그 선택은 aria-pressed와 재생 첫 프레임을 갱신하고 삭제는 전체 범위로 돌아간다", () => {
+test("세트 선택은 표시 프레임과 현재 편집 프레임을 함께 바꾼다", () => {
   let document = createDocument({ width: 1, height: 1 });
-  document = duplicateFrame(document, document.frames[0].id);
-  const layer = document.layers[0];
-  document.cels[celKey(document.frames[1].id, layer.id)].imageId = document.cels[celKey(document.frames[0].id, layer.id)].imageId;
-  const tagId = crypto.randomUUID();
-  document.tags.push({
-    id: tagId,
-    name: "attack",
-    fromFrameId: document.frames[0].id,
-    toFrameId: document.frames[1].id,
-    direction: "reverse",
-  });
+  for (let index = 0; index < 3; index += 1) document = addFrame(document);
+  const ids = document.frames.map((frame) => frame.id);
+  const idleId = "idle";
+  const walkId = "walk";
+  document.tags = [
+    { id: idleId, name: "idle", direction: "forward", frameIds: ids.slice(0, 2) },
+    { id: walkId, name: "walk", direction: "reverse", frameIds: ids.slice(2) },
+  ];
   const project = createProject("기사", document);
-  const selected: Array<string | undefined> = [];
-  const frameIndexes: number[] = [];
+  const changes: AnimationSelection[] = [];
   const rendered = workspaceCanvas(project, [], {
-    selectedAnimationTagId: undefined,
-    onSelectedAnimationTagId: (id: string | undefined) => selected.push(id),
-    onFrameIndex: (index: number) => frameIndexes.push(index),
+    selection: { tagId: idleId, frameId: ids[0] },
+    onSelection: (selection: AnimationSelection) => changes.push(selection),
   }).element;
-  const attack = elements(rendered).find((value) => value.type === "button" && value.props?.children === "attack");
-  assert.ok(attack);
-  assert.equal(attack.props?.["aria-pressed"], false);
-  (attack.props?.onClick as () => void)();
-  assert.deepEqual(Array.from(selected), [tagId]);
-  assert.deepEqual(frameIndexes, [1]);
-  assert.match(renderedText(rendered), /연결된 셀 · 편집하면 현재 레이어의 셀만 자동 분리됩니다/);
+  const walk = elements(rendered).find((node) => node.type === "button" && node.props?.["aria-label"] === "walk 애니메이션 세트 선택");
+  assert.ok(walk);
+  (walk.props?.onClick as () => void)();
+  assert.deepEqual(changes.at(-1), { tagId: walkId, frameId: ids[2] });
+  assert.match(renderedText(rendered), /애니메이션 세트/);
+  assert.doesNotMatch(renderedText(rendered), /전체 구간 추가|태그/);
+});
 
-  const selectedRendered = workspaceCanvas(project, [], {
-    selectedAnimationTagId: tagId,
-    onSelectedAnimationTagId: (id: string | undefined) => selected.push(id),
-    onFrameIndex: (index: number) => frameIndexes.push(index),
+test("빈 세트와 미분류는 재생 불가 이유와 다음 행동을 표시한다", () => {
+  const emptyDocument = createDocument({ width: 1, height: 1 });
+  emptyDocument.tags = [{ id: "empty", name: "attack", direction: "forward", frameIds: [] }];
+  const emptyProject = createProject("기사", emptyDocument);
+  const emptyRendered = workspaceCanvas(emptyProject, [], {
+    selection: { tagId: "empty", frameId: null },
   }).element;
-  const remove = elements(selectedRendered).find((value) => value.type === "button"
-    && value.props?.["aria-label"] === "attack 애니메이션 태그 삭제");
-  assert.ok(remove);
-  (remove.props?.onClick as () => void)();
-  assert.equal(selected.at(-1), undefined);
+  assert.match(renderedText(emptyRendered), /＋로 첫 프레임을 만드세요/);
 
-  let context: GenerationPanelContext | undefined;
-  workspaceCanvas(project, [], {
-    generationPanel: (value: GenerationPanelContext) => { context = value; return null; },
-  });
-  assert.deepEqual(context, {
-    activeFrameId: project.document.frames[0].id,
-    activeFrameNumber: 1,
-    activeLayer: project.document.layers[0],
-    hasActiveCel: true,
-  });
+  const unclassifiedProject = createProject("기사", createDocument({ width: 1, height: 1 }));
+  const unclassifiedRendered = workspaceCanvas(unclassifiedProject, [], {
+    selection: { tagId: null, frameId: unclassifiedProject.document.frames[0].id },
+  }).element;
+  assert.match(renderedText(unclassifiedRendered), /프레임을 선택해 새 세트로 등록하거나 CODEX FORGE·PNG 가져오기/);
+});
+
+test("이전 셀 연결은 물리 프레임이 아니라 활성 세트의 이전 프레임만 사용한다", () => {
+  let document = createDocument({ width: 1, height: 1 });
+  document = addFrame(addFrame(document));
+  const ids = document.frames.map((frame) => frame.id);
+  document.tags = [
+    { id: "other", name: "other", direction: "forward", frameIds: [ids[0]] },
+    { id: "active", name: "active", direction: "forward", frameIds: ids.slice(1) },
+  ];
+  const project = createProject("기사", document);
+  const linkButton = (frameId: string) => elements(workspaceCanvas(project, [], {
+    selection: { tagId: "active", frameId },
+  }).element).find((node) => node.type === "button" && renderedText(node) === "이전 셀 연결");
+
+  assert.equal(linkButton(ids[1])?.props?.disabled, true);
+  assert.equal(linkButton(ids[2])?.props?.disabled, false);
 });
