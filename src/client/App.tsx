@@ -1,11 +1,12 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
-import type { AnimationDirection, SpriteProject } from "../core/types.ts";
-import { defaultAnimationSelection, reconcileAnimationSelection, UNCLASSIFIED_NAME, type AnimationSelection } from "../core/animation.ts";
+import type { AnimationDirection, PngImportDestination, SpriteProject } from "../core/types.ts";
+import { defaultAnimationSelection, reconcileAnimationSelection, unclassifiedFrameIds, UNCLASSIFIED_NAME, type AnimationSelection } from "../core/animation.ts";
 import { History } from "../core/commands.ts";
 import { renameProject } from "../core/document.ts";
-import { api, appendAnimationIssue, cellEditApplicationDisposition, cellEditApplicationRequestTimeout, cellEditCompletionNotice, cellEditPayload, codexJobStatusTitle, completedGenerationSelection, decodeProject, encodeProject, failedCodexJob, generationHistoryFields, generationPayload, isInitialBlankProject, isRetryablePollingError, pollingErrorCodexJob, projectJobOwnershipMatches, projectLifetimeMatches, releaseProjectJobOwnership, type CellEditJob, type CodexJob, type GenerationJob, type GenerationTarget, type ProjectJobOwnership, type ProjectLifetime, type Session } from "./api.ts";
+import { api, appendAnimationIssue, cellEditApplicationDisposition, cellEditApplicationRequestTimeout, cellEditCompletionNotice, cellEditPayload, codexJobStatusTitle, completedGenerationSelection, decodeProject, encodeProject, failedCodexJob, generationHistoryFields, generationPayload, isInitialBlankProject, isRetryablePollingError, pngImportPayload, pollingErrorCodexJob, projectJobOwnershipMatches, projectLifetimeMatches, releaseProjectJobOwnership, type CellEditJob, type CodexJob, type GenerationJob, type GenerationTarget, type ProjectJobOwnership, type ProjectLifetime, type Session } from "./api.ts";
 import { EditorWorkspace, type EditorWorkspaceHandle } from "./editor/EditorWorkspace.tsx";
 import { ExportDialog, type ExportResponse, type ExportResult, type ExportTarget } from "./ExportDialog.tsx";
+import { ImportSpriteSheetDialog } from "./ImportSpriteSheetDialog.tsx";
 
 type ProjectSummary = { id: string; name: string };
 const CELL_EDIT_UNAVAILABLE = "설치된 Codex App Server에서 현재 셀 편집을 사용할 수 없습니다.";
@@ -109,6 +110,7 @@ export function App() {
   const cellEditApplicationPending = useRef<ProjectJobOwnership | undefined>(undefined);
   const [cellEditUnavailable, setCellEditUnavailable] = useState("");
   const [reference, setReference] = useState<{ name: string; path: string }>();
+  const [importFile, setImportFile] = useState<File>();
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
   const [showExport, setShowExport] = useState(false);
@@ -518,11 +520,11 @@ export function App() {
     }
   };
 
-  const importSheet = async (file?: File) => {
-    if (!file || !session || !project || codexBusy) return;
-    const setIssue = animationSetIssue(animationName, animationDirection);
-    if (setIssue) {
-      setError(setIssue);
+  const importSheet = async (file: File, destination: PngImportDestination) => {
+    if (!session || !project || codexBusy) return;
+    if (!isInitialBlankProject(project)
+      && !window.confirm("기존 프레임, 세트와 편집 결과를 모두 교체합니다")) {
+      setImportFile(undefined);
       return;
     }
     const lifetime = beginProjectLifetime(project.id);
@@ -533,22 +535,22 @@ export function App() {
       if (!projectLifetimeMatches(projectLifetime.current, lifetime)) return;
       const imported = decodeProject(await api<SpriteProject>("/api/imports", session.token, {
         method: "POST",
-        body: JSON.stringify({
-          projectId: project.id,
-          pngBase64,
-          request: { prompt: `직접 가져오기: ${file.name}`, frameCount, columns: Math.min(columns, frameCount), cellWidth: project.document.width, cellHeight: project.document.height, durationMs: 100, animationSet: { name: animationName.trim(), direction: animationDirection } },
-        }),
+        body: JSON.stringify(pngImportPayload(project, pngBase64, frameCount, Math.min(columns, frameCount), destination)),
       }));
       if (!projectLifetimeMatches(projectLifetime.current, lifetime)) return;
       const tracked = projectHistory.current
-        ? projectHistory.current.replaceProject(imported, ["document", "generationHistory", "exportSettings"])
+        ? projectHistory.current.replaceProject(imported, ["document"])
         : imported;
       setCurrentProject(tracked);
       setDirty(false);
-      setAnimationSelection(defaultAnimationSelection(tracked.document));
+      setAnimationSelection(destination.kind === "set"
+        ? { tagId: tracked.document.tags[0].id, frameId: tracked.document.tags[0].frameIds[0] ?? null }
+        : { tagId: null, frameId: unclassifiedFrameIds(tracked.document)[0] ?? null });
+      setImportFile(undefined);
       setNotice("PNG 시트를 프레임으로 가져왔습니다.");
     } catch (reason) {
       if (projectLifetimeMatches(projectLifetime.current, lifetime)) setError(reason instanceof Error ? reason.message : String(reason));
+      throw reason;
     } finally {
       if (projectLifetimeMatches(projectLifetime.current, lifetime)) {
         setStartingKind((current) => current === "import" ? undefined : current);
@@ -568,6 +570,7 @@ export function App() {
     setStartingKind(undefined);
     setJob(undefined);
     setReference(undefined);
+    setImportFile(undefined);
     setDirty(false);
     const generatedFrames = next.generationHistory.length ? next.document.frames.length : 8;
     setFrameCount(generatedFrames);
@@ -613,6 +616,7 @@ export function App() {
     setAnimationSelection({ tagId: null, frameId: null });
     setJob(undefined);
     setReference(undefined);
+    setImportFile(undefined);
   };
 
   const runExport = async (
@@ -695,7 +699,11 @@ export function App() {
               <p className="hint">{project.document.width} × {project.document.height}px · 투명 배경 · PNG</p>
               <div className="asset-inputs">
                 <label>참조 PNG<input type="file" accept="image/png" disabled={codexBusy} onChange={(event) => void uploadReference(event.target.files?.[0])} /></label>
-                <label>시트 가져오기<input type="file" accept="image/png" disabled={codexBusy || Boolean(animationSetIssue(name, animationDirection))} onChange={(event) => void importSheet(event.target.files?.[0])} /></label>
+                <label>시트 가져오기<input type="file" accept="image/png" disabled={codexBusy} onChange={(event) => {
+                  const file = event.currentTarget.files?.[0];
+                  event.currentTarget.value = "";
+                  if (file) setImportFile(file);
+                }} /></label>
               </div>
               {reference && <p className="reference-file"><span>{reference.name}</span><button type="button" disabled={codexBusy} onClick={() => setReference(undefined)}>제거</button></p>}
               {generationMode === "append"
@@ -737,6 +745,13 @@ export function App() {
           </section>;
       }} />}
       {(notice || error || session.account.error) && <div className={`toast ${error || session.account.error ? "error" : ""}`} role="status">{error || session.account.error || notice}</div>}
+      {project && importFile && <ImportSpriteSheetDialog
+        fileName={importFile.name}
+        initialName={animationName}
+        initialDirection={animationDirection}
+        onClose={() => setImportFile(undefined)}
+        onConfirm={(destination) => importSheet(importFile, destination)}
+      />}
       {project && showExport && <ExportDialog settings={project.exportSettings} onClose={() => setShowExport(false)} onExport={runExport} />}
     </main>
   );

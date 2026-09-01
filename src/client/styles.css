@@ -135,6 +135,26 @@ textarea { resize: vertical; color: var(--paper); font-size: 12px; line-height: 
 .export-dialog footer { display: grid; grid-template-columns: 100px 1fr; gap: 8px; margin-top: 16px; }
 .export-dialog footer > button:first-child { border: 1px solid var(--line); background: var(--raised); }
 
+.import-sheet-dialog { width: min(500px, calc(100vw - 32px)); padding: 0; border: 1px solid var(--line); background: var(--panel); color: var(--paper); box-shadow: 18px 18px 0 #0009; }
+.import-sheet-dialog::backdrop { background: #050709cc; backdrop-filter: blur(3px); }
+.import-sheet-dialog form { display: grid; gap: 14px; padding: 20px; }
+.import-sheet-dialog header { display: flex; align-items: flex-start; justify-content: space-between; padding-bottom: 14px; border-bottom: 1px solid var(--line); }
+.import-sheet-dialog header span, .import-destinations legend { color: var(--forge); font: 9px Consolas, monospace; letter-spacing: .12em; }
+.import-sheet-dialog h2 { margin: 5px 0 0; font: 700 22px "Bahnschrift Condensed", "Arial Narrow", sans-serif; }
+.import-sheet-dialog header button { border: 0; background: none; color: var(--muted); font-size: 24px; }
+.import-file { margin: 0; overflow: hidden; color: var(--cool); font: 10px Consolas, monospace; text-overflow: ellipsis; white-space: nowrap; }
+.import-destinations { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; margin: 0; padding: 0; border: 0; }
+.import-destinations legend { margin-bottom: 8px; }
+.import-destinations label { padding: 12px; border: 1px solid var(--line); background: var(--raised); cursor: pointer; }
+.import-destinations label.selected { border-color: var(--forge); box-shadow: inset 0 -2px var(--forge); }
+.import-destinations input { position: absolute; width: 1px; height: 1px; opacity: 0; }
+.import-set-fields { display: grid; grid-template-columns: 1fr 160px; gap: 9px; }
+.import-set-fields label { display: grid; gap: 6px; color: var(--muted); font-size: 10px; }
+.import-set-fields p { grid-column: 1 / -1; margin: 0; }
+.import-warning { margin: 0; padding: 11px; border-left: 2px solid var(--forge); background: #201b14; color: var(--paper); font-size: 10px; }
+.import-sheet-dialog footer { display: grid; grid-template-columns: 90px 1fr; gap: 8px; }
+.import-sheet-dialog footer > button:first-child { border: 1px solid var(--line); background: var(--raised); }
+
 .resize-dialog { width: min(460px, calc(100vw - 32px)); }
 .resize-modes { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; margin: 16px 0; }
 .resize-modes button { display: grid; gap: 4px; padding: 11px; border: 1px solid var(--line); background: var(--raised); text-align: left; }

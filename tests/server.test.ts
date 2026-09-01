@@ -714,17 +714,39 @@ test("로컬 API는 세션 토큰으로 프로젝트 생성과 Codex 결과 가�
     assert.equal(referenceResponse.status, 201);
     assert.match(((await referenceResponse.json()) as { path: string }).path, /^references\//);
 
-    const importResponse = await fetch(`${base}/api/imports`, {
+    const importPngBase64 = encodePng(2, 1, new Uint8ClampedArray(8)).toString("base64");
+    const importShape = { frameCount: 2, columns: 2, cellWidth: 1, cellHeight: 1, durationMs: 100 };
+    const postImport = (request: unknown) => fetch(`${base}/api/imports`, {
       method: "POST",
       headers: { "content-type": "application/json", "x-pixelforge-token": session.token },
-      body: JSON.stringify({
-        projectId: project.id,
-        pngBase64: encodePng(2, 1, new Uint8ClampedArray(8)).toString("base64"),
-        request: { prompt: "직접 가져오기", frameCount: 2, columns: 2, cellWidth: 1, cellHeight: 1, durationMs: 100, animationSet: { name: "idle", direction: "forward" } },
-      }),
+      body: JSON.stringify({ projectId: project.id, pngBase64: importPngBase64, request }),
     });
-    assert.equal(importResponse.status, 200);
-    assert.equal(((await importResponse.json()) as { document: { frames: unknown[] } }).document.frames.length, 2);
+
+    const unclassifiedResponse = await postImport({ ...importShape, destination: { kind: "unclassified" } });
+    assert.equal(unclassifiedResponse.status, 200);
+    const unclassified = await unclassifiedResponse.json() as { document: { frames: unknown[]; tags: unknown[] } };
+    assert.equal(unclassified.document.frames.length, 2);
+    assert.deepEqual(unclassified.document.tags, []);
+    assert.deepEqual(await fetch(`${base}/api/projects/${project.id}`).then((response) => response.json()), unclassified);
+
+    const namedResponse = await postImport({ ...importShape, destination: { kind: "set", animationSet: { name: "idle", direction: "forward" } } });
+    assert.equal(namedResponse.status, 200);
+    const named = await namedResponse.json() as { document: { frames: Array<{ id: string }>; tags: Array<{ name: string; frameIds: string[] }> } };
+    assert.equal(named.document.tags.length, 1);
+    assert.equal(named.document.tags[0].name, "idle");
+    assert.deepEqual(named.document.tags[0].frameIds, named.document.frames.map((frame) => frame.id));
+    assert.deepEqual(await fetch(`${base}/api/projects/${project.id}`).then((response) => response.json()), named);
+
+    const beforeInvalidImport = await fetch(`${base}/api/projects/${project.id}`).then((response) => response.json());
+    for (const invalidRequest of [
+      importShape,
+      { ...importShape, destination: { kind: "unknown" } },
+      { ...importShape, destination: { kind: "set", animationSet: { name: "", direction: "forward" } } },
+      { ...importShape, columns: 3, destination: { kind: "unclassified" } },
+    ]) {
+      assert.equal((await postImport(invalidRequest)).status, 400);
+    }
+    assert.deepEqual(await fetch(`${base}/api/projects/${project.id}`).then((response) => response.json()), beforeInvalidImport);
 
     const exportResponse = await fetch(`${base}/api/exports`, {
       method: "POST",
@@ -821,7 +843,7 @@ test("로컬 API는 세션 토큰으로 프로젝트 생성과 Codex 결과 가�
     const lockedImport = await fetch(`${base}/api/imports`, {
       method: "POST",
       headers: { "content-type": "application/json", "x-pixelforge-token": session.token },
-      body: JSON.stringify({ projectId: project.id, pngBase64: encodePng(1, 1, new Uint8ClampedArray(4)).toString("base64"), request: { prompt: "잠금 검사", frameCount: 1, columns: 1, cellWidth: 1, cellHeight: 1, durationMs: 100, animationSet: { name: "idle", direction: "forward" } } }),
+      body: JSON.stringify({ projectId: project.id, pngBase64: encodePng(1, 1, new Uint8ClampedArray(4)).toString("base64"), request: { frameCount: 1, columns: 1, cellWidth: 1, cellHeight: 1, durationMs: 100, destination: { kind: "unclassified" } } }),
     });
     assert.equal(lockedImport.status, 409);
 

@@ -3,8 +3,8 @@ import test from "node:test";
 import type { AiEditReadyResult, AiEditRequest } from "../src/core/ai-edit.ts";
 import { createDocument, createProject } from "../src/core/document.ts";
 import { addFrame } from "../src/core/timeline.ts";
-import type { AnimationDirection } from "../src/core/types.ts";
-import { api, appendAnimationIssue, cellEditApplicationDisposition, cellEditApplicationRequestTimeout, cellEditCompletionNotice, cellEditPayload, codexJobStatusTitle, completedFrameIndex, completedGenerationSelection, decodeProject, encodeProject, failedCodexJob, generationHistoryFields, generationPayload, isInitialBlankProject, isRetryablePollingError, pollingErrorCodexJob, projectJobOwnershipMatches, projectLifetimeMatches, releaseProjectJobOwnership, type CellEditJob, type GenerationJob, type GenerationTarget, type WireProject } from "../src/client/api.ts";
+import type { AnimationDirection, PngImportDestination } from "../src/core/types.ts";
+import { api, appendAnimationIssue, cellEditApplicationDisposition, cellEditApplicationRequestTimeout, cellEditCompletionNotice, cellEditPayload, codexJobStatusTitle, completedFrameIndex, completedGenerationSelection, decodeProject, encodeProject, failedCodexJob, generationHistoryFields, generationPayload, isInitialBlankProject, isRetryablePollingError, pngImportPayload, pollingErrorCodexJob, projectJobOwnershipMatches, projectLifetimeMatches, releaseProjectJobOwnership, type CellEditJob, type GenerationJob, type GenerationTarget, type WireProject } from "../src/client/api.ts";
 
 test("프로젝트 픽셀을 JSON 배열로 보내고 Uint8ClampedArray로 복원한다", () => {
   const project = createProject("저장", createDocument({ width: 1, height: 1 }));
@@ -151,6 +151,23 @@ test("생성 target은 결과가 실제로 바꾼 프로젝트 필드를 선언�
   assert.deepEqual(generationHistoryFields({ kind: "sheet", animationSet: { name: "idle", direction: "forward" } }), ["document", "generationHistory", "exportSettings"]);
   assert.deepEqual(generationHistoryFields({ kind: "append", animationSet: { name: "run", direction: "forward" }, baseFrameId: "f", targetLayerId: "l" }), ["document", "generationHistory"]);
   assert.deepEqual(generationHistoryFields({ kind: "frame", frameId: "f" }), ["document"]);
+});
+
+test("PNG 가져오기 payload는 destination을 직접 전달한다", () => {
+  const project = createProject("기사", createDocument({ width: 16, height: 24 }));
+  const destination: PngImportDestination = { kind: "set", animationSet: { name: "idle", direction: "forward" } };
+  assert.deepEqual(pngImportPayload(project, "png", 8, 4, destination), {
+    projectId: project.id,
+    pngBase64: "png",
+    request: {
+      frameCount: 8,
+      columns: 4,
+      cellWidth: 16,
+      cellHeight: 24,
+      durationMs: 100,
+      destination,
+    },
+  });
 });
 
 test("현재 셀 편집 요청 본문을 그대로 조립한다", () => {

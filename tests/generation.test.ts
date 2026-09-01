@@ -10,6 +10,7 @@ import {
   buildAppendAnimationPrompt,
   buildFrameRegenerationPrompt,
   buildSpriteSheetPrompt,
+  importPngSpriteSheet,
   importRegeneratedFrame,
   importSpriteSheet,
   type AppendAnimationRequest,
@@ -501,6 +502,34 @@ test("스프라이트 시트를 프레임과 생성 이력으로 가져온다", 
   assert.equal(imported.generationHistory.at(-1)?.prompt, request.prompt);
   assert.equal(imported.generationHistory.at(-1)?.outputPath, "generated/sheet.png");
   assert.equal(imported.exportSettings.columns, 2);
+});
+
+test("PNG 시트 가져오기는 이름 세트 또는 미분류로 문서만 교체한다", () => {
+  const project = createProject("기사", createDocument({ width: 4, height: 4 }));
+  project.generationHistory.push({ id: "old", prompt: "기존", createdAt: "2026-08-31T00:00:00.000Z", outputPath: "old.png" });
+  project.exportSettings = { ...project.exportSettings, columns: 7, padding: 3 };
+  const before = structuredClone(project);
+  const png = encodePng(2, 1, new Uint8ClampedArray([
+    255, 0, 0, 255,
+    0, 255, 0, 255,
+  ]));
+  const shape = { frameCount: 2, columns: 2, cellWidth: 1, cellHeight: 1, durationMs: 100 };
+
+  const named = importPngSpriteSheet(project, png, {
+    ...shape,
+    destination: { kind: "set", animationSet: { name: "idle", direction: "forward" } },
+  });
+  assert.equal(named.document.tags.length, 1);
+  assert.deepEqual(named.document.tags[0].frameIds, named.document.frames.map((frame) => frame.id));
+
+  const unclassified = importPngSpriteSheet(project, png, {
+    ...shape,
+    destination: { kind: "unclassified" },
+  });
+  assert.deepEqual(unclassified.document.tags, []);
+  assert.deepEqual(unclassified.generationHistory, project.generationHistory);
+  assert.deepEqual(unclassified.exportSettings, project.exportSettings);
+  assert.deepEqual(project, before);
 });
 
 test("가져온 캐릭터 프레임의 지면과 하체 기준점을 정렬한다", () => {

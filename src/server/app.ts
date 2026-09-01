@@ -18,7 +18,7 @@ import { runAiEdit, selectionMask, type AiEditExecutionState } from "../core/ai-
 import { editingFrameContext, UNCLASSIFIED_NAME } from "../core/animation.ts";
 import { createDocument, createProject as makeProject, validateDocument } from "../core/document.ts";
 import { compositeFrame } from "../core/render.ts";
-import { celKey, type AnimationSetInput, type PixelBuffer, type SpriteProject } from "../core/types.ts";
+import { celKey, type AnimationSetInput, type PixelBuffer, type PngImportDestination, type SpriteProject } from "../core/types.ts";
 import type { AccountState, CodexBridge, CodexEvent } from "./codex-bridge.ts";
 import {
   createCellEditLog,
@@ -36,11 +36,13 @@ import {
   buildAppendAnimationPrompt,
   buildFrameRegenerationPrompt,
   buildSpriteSheetPrompt,
+  importPngSpriteSheet,
   importRegeneratedFrame,
   importSpriteSheet,
   type AppendAnimationRequest,
   type FrameReferencePaths,
   type FrameRegenerationRequest,
+  type PngImportRequest,
   type SpriteSheetRequest,
 } from "./generation.ts";
 import { createProject, loadProject, resolveInside, saveProject } from "./project-store.ts";
@@ -164,6 +166,19 @@ function parseAnimationSetInput(value: unknown): AnimationSetInput {
     throw new Error("재생 방향이 올바르지 않습니다.");
   }
   return { name: input.name, direction: input.direction as AnimationSetInput["direction"] };
+}
+
+function parsePngImportDestination(value: unknown): PngImportDestination {
+  const input = inputRecord(value, "PNG 가져오기 대상");
+  if (input.kind === "unclassified") {
+    assertOnlyFields(input, ["kind"], "미분류 가져오기 대상");
+    return { kind: "unclassified" };
+  }
+  if (input.kind === "set") {
+    assertOnlyFields(input, ["kind", "animationSet"], "세트 가져오기 대상");
+    return { kind: "set", animationSet: parseAnimationSetInput(input.animationSet) };
+  }
+  throw new Error("지원하지 않는 PNG 가져오기 대상입니다.");
 }
 
 function parseGenerationTarget(value: unknown): GenerationTarget {
@@ -902,18 +917,28 @@ export function createPixelForgeServer({
       }
 
       if (request.method === "POST" && url.pathname === "/api/imports") {
-        const input = await body(request) as { projectId?: unknown; pngBase64?: unknown; request?: SpriteSheetRequest };
+        const input = await body(request) as { projectId?: unknown; pngBase64?: unknown; request?: unknown };
         const projectId = safeProjectId(String(input.projectId ?? ""));
+        if (typeof input.pngBase64 !== "string") throw new Error("가져올 PNG가 필요합니다.");
+        const requestInput = inputRecord(input.request, "PNG 가져오기 요청");
+        assertOnlyFields(requestInput, ["frameCount", "columns", "cellWidth", "cellHeight", "durationMs", "destination"], "PNG 가져오기 요청");
+        const importRequest: PngImportRequest = {
+          frameCount: requestInput.frameCount as number,
+          columns: requestInput.columns as number,
+          cellWidth: requestInput.cellWidth as number,
+          cellHeight: requestInput.cellHeight as number,
+          durationMs: requestInput.durationMs as number,
+          destination: parsePngImportDestination(requestInput.destination),
+        };
         const operationId = randomUUID();
         if (!lockProject(projectId, operationId)) return send(response, 409, { error: "프로젝트가 다른 작업에서 사용 중입니다." });
         try {
           const root = resolveInside(projectsRoot, projectId);
           const project = await loadProject(root);
-          if (typeof input.pngBase64 !== "string") throw new Error("가져올 PNG가 필요합니다.");
           const png = Buffer.from(input.pngBase64, "base64");
           const relativePath = `imports/${randomUUID()}/sheet.png`;
           const path = resolveInside(root, relativePath);
-          const imported = importSpriteSheet(project, png, input.request as SpriteSheetRequest, relativePath);
+          const imported = importPngSpriteSheet(project, png, importRequest);
           await mkdir(resolve(path, ".."), { recursive: true });
           await writeFile(path, png);
           await saveProject(root, imported);

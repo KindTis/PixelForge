@@ -1,6 +1,6 @@
 import { addAnimationTag, assertUniqueUnityAnimationClipFileNames, editingFrameContext, UNCLASSIFIED_NAME } from "../core/animation.ts";
 import { duplicateFrame, moveFrame } from "../core/timeline.ts";
-import type { AnimationSetInput, Cel, Frame, Layer, PixelBuffer, RGBA, SpriteProject, SpriteSheetShape } from "../core/types.ts";
+import type { AnimationSetInput, Cel, Frame, Layer, PixelBuffer, PngImportDestination, RGBA, SpriteProject, SpriteSheetShape } from "../core/types.ts";
 import { celKey } from "../core/types.ts";
 import { validateDocument } from "../core/document.ts";
 import { indexedToRgba, quantizeToPalette } from "../core/palette.ts";
@@ -35,8 +35,17 @@ export type AppendAnimationRequest = SpriteSheetShape & AnimationSetInput & {
   referencePath?: string;
 };
 
+export type PngImportRequest = SpriteSheetShape & {
+  durationMs: number;
+  destination: PngImportDestination;
+};
+
 function validateSheetShape(request: Pick<SpriteSheetRequest, "prompt" | "frameCount" | "columns" | "cellWidth" | "cellHeight">): void {
   if (!request.prompt.trim()) throw new Error("생성 프롬프트가 필요합니다.");
+  validateSpriteSheetShape(request);
+}
+
+function validateSpriteSheetShape(request: SpriteSheetShape): void {
   if (!Number.isInteger(request.frameCount) || request.frameCount < 1 || request.frameCount > 256) {
     throw new Error("프레임 수는 1~256 사이의 정수여야 합니다.");
   }
@@ -54,12 +63,14 @@ function validateSheetShape(request: Pick<SpriteSheetRequest, "prompt" | "frameC
   }
 }
 
+function validateDuration(durationMs: number): void {
+  if (!Number.isFinite(durationMs) || durationMs < 1) throw new Error("프레임 시간은 1ms 이상이어야 합니다.");
+}
+
 function validate(request: SpriteSheetRequest): void {
   validateSheetShape(request);
   validateAnimationSetInput(request.animationSet);
-  if (!Number.isFinite(request.durationMs) || request.durationMs < 1) {
-    throw new Error("프레임 시간은 1ms 이상이어야 합니다.");
-  }
+  validateDuration(request.durationMs);
 }
 
 function validateAnimationSetInput(input: AnimationSetInput): void {
@@ -251,7 +262,7 @@ function alignFrame(data: Uint8ClampedArray, width: number, height: number): Uin
 function extractSheetFrame(
   sheet: PixelBuffer,
   index: number,
-  request: Pick<SpriteSheetRequest, "columns" | "cellWidth" | "cellHeight">,
+  request: Pick<SpriteSheetShape, "columns" | "cellWidth" | "cellHeight">,
 ): PixelBuffer {
   const data = new Uint8ClampedArray(request.cellWidth * request.cellHeight * 4);
   const originX = (index % request.columns) * request.cellWidth;
@@ -265,6 +276,37 @@ function extractSheetFrame(
     height: request.cellHeight,
     data: alignFrame(data, request.cellWidth, request.cellHeight),
   };
+}
+
+function decodeSpriteSheet(
+  png: Uint8Array,
+  request: SpriteSheetShape & { durationMs: number },
+  layerName: string,
+): { layer: Layer; frames: Frame[]; cels: Record<string, Cel>; images: Record<string, PixelBuffer> } {
+  const sheet = decodePng(png);
+  const rows = Math.ceil(request.frameCount / request.columns);
+  if (sheet.width !== request.columns * request.cellWidth || sheet.height !== rows * request.cellHeight) {
+    throw new Error("생성된 시트 크기가 요청한 격자와 다릅니다.");
+  }
+  const layer: Layer = {
+    id: crypto.randomUUID(),
+    name: layerName,
+    visible: true,
+    locked: false,
+    opacity: 1,
+    blendMode: "normal",
+  };
+  const frames: Frame[] = [];
+  const cels: Record<string, Cel> = {};
+  const images: Record<string, PixelBuffer> = {};
+  for (let index = 0; index < request.frameCount; index += 1) {
+    const frame: Frame = { id: crypto.randomUUID(), durationMs: request.durationMs };
+    const imageId = crypto.randomUUID();
+    frames.push(frame);
+    images[imageId] = extractSheetFrame(sheet, index, request);
+    cels[celKey(frame.id, layer.id)] = { id: crypto.randomUUID(), imageId, x: 0, y: 0, opacity: 1 };
+  }
+  return { layer, frames, cels, images };
 }
 
 function transparentFrame(width: number, height: number, color?: RGBA): PixelBuffer {
@@ -299,31 +341,7 @@ export function importSpriteSheet(
 ): SpriteProject {
   validate(request);
   if (!outputPath.trim()) throw new Error("출력 파일 경로가 필요합니다.");
-  const sheet = decodePng(png);
-  const rows = Math.ceil(request.frameCount / request.columns);
-  if (sheet.width !== request.columns * request.cellWidth || sheet.height !== rows * request.cellHeight) {
-    throw new Error("생성된 시트 크기가 요청한 격자와 다릅니다.");
-  }
-
-  const layer: Layer = {
-    id: crypto.randomUUID(),
-    name: "생성 결과",
-    visible: true,
-    locked: false,
-    opacity: 1,
-    blendMode: "normal",
-  };
-  const frames: Frame[] = [];
-  const cels: Record<string, Cel> = {};
-  const images: Record<string, PixelBuffer> = {};
-
-  for (let index = 0; index < request.frameCount; index += 1) {
-    const frame: Frame = { id: crypto.randomUUID(), durationMs: request.durationMs };
-    const imageId = crypto.randomUUID();
-    frames.push(frame);
-    images[imageId] = extractSheetFrame(sheet, index, request);
-    cels[celKey(frame.id, layer.id)] = { id: crypto.randomUUID(), imageId, x: 0, y: 0, opacity: 1 };
-  }
+  const decoded = decodeSpriteSheet(png, request, "생성 결과");
 
   const result: SpriteProject = {
     ...project,
@@ -331,16 +349,16 @@ export function importSpriteSheet(
       width: request.cellWidth,
       height: request.cellHeight,
       colorMode: "rgba",
-      frames,
-      layers: [layer],
-      cels,
-      images,
+      frames: decoded.frames,
+      layers: [decoded.layer],
+      cels: decoded.cels,
+      images: decoded.images,
       palette: project.document.palette,
       tags: [{
         id: crypto.randomUUID(),
         name: request.animationSet.name.trim(),
         direction: request.animationSet.direction,
-        frameIds: frames.map((frame) => frame.id),
+        frameIds: decoded.frames.map((frame) => frame.id),
       }],
     },
     generationHistory: [...project.generationHistory, {
@@ -414,6 +432,40 @@ export function appendAnimationSheet(
       outputPath,
       parentId: request.parentId,
     }],
+  };
+  validateDocument(result.document);
+  return result;
+}
+
+export function importPngSpriteSheet(
+  project: SpriteProject,
+  png: Uint8Array,
+  request: PngImportRequest,
+): SpriteProject {
+  validateSpriteSheetShape(request);
+  validateDuration(request.durationMs);
+  if (!request.destination || typeof request.destination !== "object") throw new Error("PNG 가져오기 대상이 필요합니다.");
+  if (request.destination.kind === "set") validateAnimationSetInput(request.destination.animationSet);
+  else if (request.destination.kind !== "unclassified") throw new Error("PNG 가져오기 대상이 올바르지 않습니다.");
+  const decoded = decodeSpriteSheet(png, request, "가져온 시트");
+  const result: SpriteProject = {
+    ...project,
+    document: {
+      width: request.cellWidth,
+      height: request.cellHeight,
+      colorMode: "rgba",
+      frames: decoded.frames,
+      layers: [decoded.layer],
+      cels: decoded.cels,
+      images: decoded.images,
+      palette: project.document.palette,
+      tags: request.destination.kind === "set" ? [{
+        id: crypto.randomUUID(),
+        name: request.destination.animationSet.name.trim(),
+        direction: request.destination.animationSet.direction,
+        frameIds: decoded.frames.map((frame) => frame.id),
+      }] : [],
+    },
   };
   validateDocument(result.document);
   return result;

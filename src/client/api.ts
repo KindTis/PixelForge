@@ -1,7 +1,7 @@
 import type { AiEditReadyResult, AiEditRequest, AiEditTarget } from "../core/ai-edit.ts";
 import { conflictingUnityAnimationTagNames, UNCLASSIFIED_NAME } from "../core/animation.ts";
 import type { UndoableProjectField } from "../core/commands.ts";
-import type { AnimationSetInput, Layer, PixelBuffer, SpriteProject } from "../core/types.ts";
+import type { AnimationSetInput, Layer, PixelBuffer, PngImportDestination, SpriteProject } from "../core/types.ts";
 
 export type WireProject = Omit<SpriteProject, "document"> & {
   document: Omit<SpriteProject["document"], "images"> & {
@@ -87,6 +87,27 @@ export function generationPayload(
       durationMs: 100,
       parentId: project.generationHistory.at(-1)?.id,
       referencePath,
+    },
+  };
+}
+
+export function pngImportPayload(
+  project: SpriteProject,
+  pngBase64: string,
+  frameCount: number,
+  columns: number,
+  destination: PngImportDestination,
+) {
+  return {
+    projectId: project.id,
+    pngBase64,
+    request: {
+      frameCount,
+      columns,
+      cellWidth: project.document.width,
+      cellHeight: project.document.height,
+      durationMs: 100,
+      destination,
     },
   };
 }

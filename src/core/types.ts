@@ -44,6 +44,10 @@ export type SpriteSheetShape = {
   cellHeight: number;
 };
 
+export type PngImportDestination =
+  | { kind: "set"; animationSet: AnimationSetInput }
+  | { kind: "unclassified" };
+
 export type AnimationTag = {
   id: string;
   name: string;
