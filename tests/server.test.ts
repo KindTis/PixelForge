@@ -753,7 +753,7 @@ test("로컬 API는 세션 토큰으로 프로젝트 생성과 Codex 결과 가�
       headers: { "content-type": "application/json", "x-pixelforge-token": session.token },
       body: JSON.stringify({
         projectId: project.id,
-        project,
+        project: named,
         target: "common",
         options: exportOptions,
       }),
@@ -930,7 +930,11 @@ test("내보내기 폴더 취소와 교체 거절은 아무것도 저장하지 �
       method: "POST",
       headers: { "content-type": "application/json", "x-pixelforge-token": fixture.token },
       body: JSON.stringify({ name: "기사", width: 1, height: 1 }),
-    }).then((response) => response.json()) as { id: string; exportSettings: { columns: number } };
+    }).then((response) => response.json()) as {
+      id: string;
+      exportSettings: { columns: number };
+      document: { frames: Array<{ id: string }>; tags: Array<{ id: string; name: string; direction: "forward"; frameIds: string[] }> };
+    };
     const manifestPath = join(root, created.id, "pixelforge.json");
     const originalManifest = await readFile(manifestPath, "utf8");
 
@@ -953,6 +957,12 @@ test("내보내기 폴더 취소와 교체 거절은 아무것도 저장하지 �
     assert.equal(await readFile(manifestPath, "utf8"), originalManifest);
 
     replace = true;
+    const unexportable = await requestExport(fixture.base, fixture.token, created);
+    assert.equal(unexportable.status, 400);
+    assert.match(((await unexportable.json()) as { error: string }).error, /내보낼 애니메이션 세트가 없습니다/);
+    assert.equal(await readFile(join(destination, "common", "old.txt"), "utf8"), "보존");
+
+    created.document.tags.push({ id: "idle", name: "idle", direction: "forward", frameIds: [created.document.frames[0].id] });
     const completed = await requestExport(fixture.base, fixture.token, created);
     assert.equal(completed.status, 201);
     assert.deepEqual(await completed.json(), {
@@ -992,7 +1002,11 @@ test("내보내기 폴더의 대상이 없거나 비어 있으면 교체 확인�
       method: "POST",
       headers: { "content-type": "application/json", "x-pixelforge-token": fixture.token },
       body: JSON.stringify({ name: "기사", width: 1, height: 1 }),
-    }).then((response) => response.json()) as { id: string };
+    }).then((response) => response.json()) as {
+      id: string;
+      document: { frames: Array<{ id: string }>; tags: Array<{ id: string; name: string; direction: "forward"; frameIds: string[] }> };
+    };
+    project.document.tags.push({ id: "idle", name: "idle", direction: "forward", frameIds: [project.document.frames[0].id] });
     await mkdir(withoutTarget);
     const withoutTargetResponse = await requestExport(fixture.base, fixture.token, project);
     assert.equal(withoutTargetResponse.status, 201);

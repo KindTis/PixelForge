@@ -1,36 +1,37 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { addAnimationTag } from "../src/core/animation.ts";
+import { applyCommand } from "../src/core/commands.ts";
 import { createDocument } from "../src/core/document.ts";
-import { duplicateFrame } from "../src/core/timeline.ts";
+import { addFrame, duplicateFrame } from "../src/core/timeline.ts";
 import { celKey } from "../src/core/types.ts";
-import { exportCommon } from "../src/server/exporters/common.ts";
-import { decodePng } from "../src/server/png.ts";
+import { buildCommon } from "../src/server/exporters/common.ts";
 
-test("공통 묶음은 PNG와 프레임·태그 JSON을 보존한다", async () => {
-  let document = createDocument({ width: 2, height: 1 });
-  const frame = document.frames[0];
-  const layer = document.layers[0];
-  document.images[document.cels[celKey(frame.id, layer.id)].imageId].data.set([255, 0, 0, 255, 0, 0, 0, 0]);
-  document = duplicateFrame(document, frame.id);
+test("공통 아틀라스는 동일 RGBA를 공유하고 편집되면 분리하며 단계 시간은 유지한다", () => {
+  const options = { columns: 2, padding: 0, margin: 0, trim: false };
+  let document = createDocument({ width: 1, height: 1 });
+  const originalId = document.frames[0].id;
+  document = duplicateFrame(document, originalId);
+  const duplicateId = document.frames[1].id;
+  document.frames[0].durationMs = 100;
   document.frames[1].durationMs = 180;
-  document = duplicateFrame(document, document.frames[1].id);
-  document = duplicateFrame(document, document.frames[2].id);
-  document = addAnimationTag(document, { name: "walk", frameIds: document.frames.slice(0, 2).map((frame) => frame.id), direction: "pingPong" });
-  document = addAnimationTag(document, { name: "attack", frameIds: document.frames.slice(2).map((frame) => frame.id), direction: "forward" });
+  document = addAnimationTag(document, { name: "idle", direction: "forward", frameIds: [originalId] });
+  document = addAnimationTag(document, { name: "walk", direction: "forward", frameIds: [duplicateId] });
+  document = addAnimationTag(document, { name: "empty", direction: "forward", frameIds: [] });
+  document = addFrame(document);
 
-  const files = await exportCommon(document, { columns: 2, padding: 1, margin: 1, trim: true });
-  assert.deepEqual(files.map((file) => file.path), ["spritesheet.png", "spritesheet.json"]);
-  const png = decodePng(files[0].data as Uint8Array);
-  assert.deepEqual({ width: png.width, height: png.height }, { width: 5, height: 5 });
-  const metadata = JSON.parse(files[1].data as string);
-  assert.equal(metadata.frames[0].filename, "walk_000");
-  assert.deepEqual(metadata.frames[0].frame, { x: 1, y: 1, w: 1, h: 1 });
-  assert.deepEqual(metadata.frames[0].spriteSourceSize, { x: 0, y: 0, w: 1, h: 1 });
-  assert.deepEqual(metadata.frames[0].sourceSize, { w: 2, h: 1 });
-  assert.equal(metadata.frames[1].duration, 180);
-  assert.deepEqual(Object.keys(metadata.animations), ["walk", "attack"]);
-  assert.deepEqual(metadata.animations.walk.frames, ["walk_000", "walk_001"]);
-  assert.deepEqual(metadata.animations.attack.frames, ["attack_002", "attack_003"]);
-  assert.ok((files[1].data as string).endsWith("\n"));
+  const shared = buildCommon(document, options);
+  assert.equal(shared.metadata.frames.length, 1);
+  assert.deepEqual(shared.metadata.animations.map((animation) => animation.name), ["idle", "walk"]);
+  assert.equal(shared.metadata.animations[0].steps[0].sprite, "sprite_000");
+  assert.equal(shared.metadata.animations[1].steps[0].sprite, "sprite_000");
+  assert.deepEqual(shared.metadata.animations[1].steps[0], { frameId: duplicateId, sprite: "sprite_000", duration: 180 });
+
+  const cel = document.cels[celKey(duplicateId, document.layers[0].id)];
+  document = applyCommand(document, { type: "setPixels", celId: cel.id, pixels: [{ x: 0, y: 0, rgba: [1, 2, 3, 255] }] });
+  assert.equal(buildCommon(document, options).metadata.frames.length, 2);
+
+  assert.throws(() => buildCommon(createDocument({ width: 1, height: 1 }), options), /내보낼 애니메이션 세트가 없습니다/);
+  const emptyOnly = addAnimationTag(createDocument({ width: 1, height: 1 }), { name: "empty", direction: "forward", frameIds: [] });
+  assert.throws(() => buildCommon(emptyOnly, options), /내보낼 애니메이션 세트가 없습니다/);
 });
