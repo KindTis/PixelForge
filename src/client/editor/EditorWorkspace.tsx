@@ -1,6 +1,6 @@
 import { forwardRef, useEffect, useImperativeHandle, useRef, useState, type PointerEvent as ReactPointerEvent, type ReactNode, type WheelEvent } from "react";
 import type { AiEditReadyResult, AiEditRequest, AiEditTarget } from "../../core/ai-edit.ts";
-import { addAnimationTag, frameSequence } from "../../core/animation.ts";
+import { addAnimationTag, deleteAnimationFrame, deleteAnimationSet, frameSequence } from "../../core/animation.ts";
 import { applyCommand, History, type EditCommand, type PixelChange } from "../../core/commands.ts";
 import { compositeFrame } from "../../core/render.ts";
 import { convertDocumentToIndexed, indexedToRgba, nearestPaletteColor, quantizeToPalette, replaceColor, sameColor } from "../../core/palette.ts";
@@ -9,9 +9,7 @@ import { extractSelection, flipSelection, moveSelection, pasteSelection, rectang
 import {
   addFrame,
   addLayer,
-  deleteFrame,
   deleteLayer,
-  deleteTag,
   duplicateFrame,
   duplicateLayer,
   linkCel,
@@ -571,7 +569,7 @@ export const EditorWorkspace = forwardRef<EditorWorkspaceHandle, {
   const removeAnimationTag = (tagId: string) => {
     setPlaying(false);
     if (selectedAnimationTagId === tagId) onSelectedAnimationTagId(undefined);
-    replace((document) => deleteTag(document, tagId));
+    replace((document) => deleteAnimationSet(document, tagId));
   };
 
   const reorderFrame = (id: string, target: number) => {
@@ -691,7 +689,7 @@ export const EditorWorkspace = forwardRef<EditorWorkspaceHandle, {
     </section>
 
     <section className="timeline editor-timeline" aria-label="애니메이션 타임라인">
-      <div className="timeline-head"><span>타임라인</span><b>{project.document.frames.length} 프레임</b><small>{saveState}</small><div><button type="button" disabled={readOnly} onClick={() => replace((document) => addFrame(document, frame.id))}>＋</button><button type="button" disabled={readOnly} onClick={() => { const next = duplicateFrame(project.document, frame.id); replace(() => next); onFrameIndex(frameIndex + 1); }}>복제</button><button type="button" disabled={readOnly} onClick={() => { if (project.document.frames.length < 2) return; const nextIndex = Math.min(frameIndex, project.document.frames.length - 2); replace((document) => deleteFrame(document, frame.id)); onFrameIndex(nextIndex); }}>삭제</button></div></div>
+      <div className="timeline-head"><span>타임라인</span><b>{project.document.frames.length} 프레임</b><small>{saveState}</small><div><button type="button" disabled={readOnly} onClick={() => replace((document) => addFrame(document, frame.id))}>＋</button><button type="button" disabled={readOnly} onClick={() => { const next = duplicateFrame(project.document, frame.id); replace(() => next); onFrameIndex(frameIndex + 1); }}>복제</button><button type="button" disabled={readOnly} onClick={() => { if (project.document.frames.length < 2) return; const nextIndex = Math.min(frameIndex, project.document.frames.length - 2); replace((document) => deleteAnimationFrame(document, frame.id)); onFrameIndex(nextIndex); }}>삭제</button></div></div>
       <div className="frames">{project.document.frames.map((item, index) => <div className={`frame-card ${index === frameIndex ? "selected" : ""}`} key={item.id}>
         <button className="frame-image" type="button" disabled={readOnly} aria-label={`${index + 1}번 프레임 선택`} onClick={() => { setPlaying(false); onFrameIndex(index); }}><FrameCanvas project={project} index={index} /></button>
         <button className="frame-label" type="button" disabled={readOnly} onClick={() => { setPlaying(false); onFrameIndex(index); }}>F{String(index + 1).padStart(2, "0")}</button><input aria-label={`${index + 1}번 프레임 시간`} disabled={readOnly} type="number" min="1" max="60000" value={item.durationMs} onChange={(event) => replace((document) => setFrameDuration(document, item.id, Number(event.target.value)))} />

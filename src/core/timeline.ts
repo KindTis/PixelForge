@@ -1,5 +1,4 @@
-import { validateDocument } from "./document.ts";
-import { celKey, type AnimationTag, type SpriteDocument } from "./types.ts";
+import { celKey, type SpriteDocument } from "./types.ts";
 
 function copy(document: SpriteDocument): SpriteDocument {
   return structuredClone(document);
@@ -56,9 +55,7 @@ export function deleteFrame(document: SpriteDocument, id: string): SpriteDocumen
   const index = frameIndex(next, id);
   next.frames.splice(index, 1);
   for (const layer of next.layers) delete next.cels[celKey(id, layer.id)];
-  for (const tag of next.tags) tag.frameIds = tag.frameIds.filter((frameId) => frameId !== id);
   cleanImages(next);
-  validateDocument(next);
   return next;
 }
 
@@ -68,7 +65,6 @@ export function moveFrame(document: SpriteDocument, id: string, targetIndex: num
   const destination = Math.max(0, Math.min(next.frames.length - 1, Math.round(targetIndex)));
   const [frame] = next.frames.splice(index, 1);
   next.frames.splice(destination, 0, frame);
-  validateDocument(next);
   return next;
 }
 
@@ -141,24 +137,5 @@ export function unlinkCel(document: SpriteDocument, frameId: string, layerId: st
   const source = next.images[cel.imageId];
   next.images[imageId] = { ...source, data: new Uint8ClampedArray(source.data) };
   next.cels[key].imageId = imageId;
-  return next;
-}
-
-export function updateTag(document: SpriteDocument, id: string, patch: Partial<Omit<AnimationTag, "id">>): SpriteDocument {
-  const next = copy(document);
-  const tag = next.tags.find((candidate) => candidate.id === id);
-  if (!tag) throw new Error("태그를 찾을 수 없습니다.");
-  Object.assign(tag, patch);
-  tag.name = tag.name.trim();
-  if (!tag.name || next.tags.some((candidate) => candidate.id !== id && candidate.name === tag.name)) throw new Error("태그 이름은 비어 있지 않고 고유해야 합니다.");
-  validateDocument(next);
-  return next;
-}
-
-export function deleteTag(document: SpriteDocument, id: string): SpriteDocument {
-  const next = copy(document);
-  const index = next.tags.findIndex((tag) => tag.id === id);
-  if (index < 0) throw new Error("태그를 찾을 수 없습니다.");
-  next.tags.splice(index, 1);
   return next;
 }

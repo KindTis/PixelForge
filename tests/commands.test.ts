@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { addAnimationTag, createAnimationSet } from "../src/core/animation.ts";
 import { History, applyCommand } from "../src/core/commands.ts";
 import { createDocument } from "../src/core/document.ts";
 import { celKey } from "../src/core/types.ts";
@@ -53,16 +54,23 @@ test("문서 밖 픽셀만 있는 명령은 문서와 이력을 바꾸지 않는
 });
 
 test("연결 셀을 편집하면 대상 셀만 자동 분리한다", () => {
-  const document = createDocument({ width: 1, height: 1 });
+  let document = createDocument({ width: 1, height: 1 });
   const sourceFrame = document.frames[0];
   const layer = document.layers[0];
-  const sourceCel = document.cels[celKey(sourceFrame.id, layer.id)];
-  const nextFrame = { id: crypto.randomUUID(), durationMs: 100 };
-  const linkedCel = { ...sourceCel, id: crypto.randomUUID() };
-  document.frames.push(nextFrame);
-  document.cels[celKey(nextFrame.id, layer.id)] = linkedCel;
+  document = addAnimationTag(document, { name: "idle", direction: "forward", frameIds: [sourceFrame.id] });
+  const copied = createAnimationSet(document, {
+    sourceTagId: document.tags[0].id,
+    frameIds: [sourceFrame.id],
+    name: "walk",
+    direction: "forward",
+    mode: "copy",
+  });
+  const nextFrame = copied.document.frames.find((frame) => frame.id === copied.frameIds[0])!;
+  const sourceCel = copied.document.cels[celKey(sourceFrame.id, layer.id)];
+  const linkedCel = copied.document.cels[celKey(nextFrame.id, layer.id)];
+  assert.equal(linkedCel.imageId, sourceCel.imageId);
 
-  const result = applyCommand(document, { type: "setPixels", celId: linkedCel.id, pixels: [{ x: 0, y: 0, rgba: [1, 2, 3, 255] }] });
+  const result = applyCommand(copied.document, { type: "setPixels", celId: linkedCel.id, pixels: [{ x: 0, y: 0, rgba: [1, 2, 3, 255] }] });
   const edited = result.cels[celKey(nextFrame.id, layer.id)];
   assert.notEqual(edited.imageId, sourceCel.imageId);
   assert.deepEqual(Array.from(result.images[edited.imageId].data), [1, 2, 3, 255]);
