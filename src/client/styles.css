@@ -127,6 +127,9 @@ textarea { resize: vertical; color: var(--paper); font-size: 12px; line-height: 
 .export-grid label { display: grid; gap: 5px; color: var(--muted); font-size: 9px; }
 .trim-option { display: flex; align-items: center; gap: 7px; margin-top: 14px; color: var(--paper); font-size: 10px; }
 .trim-option input { width: auto; }
+.export-warnings { margin-top: 12px; padding: 9px 11px; border-left: 2px solid var(--forge); background: #0e1114; color: var(--muted); font-size: 9px; }
+.export-warnings p { margin: 0; }
+.export-warnings p + p { margin-top: 5px; }
 .export-hint { color: var(--muted); font-size: 9px; }
 .export-result { margin-top: 12px; padding: 10px; border-left: 2px solid var(--cool); background: #0e1114; }
 .export-result b, .export-result code { display: block; }

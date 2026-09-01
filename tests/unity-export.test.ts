@@ -3,33 +3,23 @@ import test from "node:test";
 import { addAnimationTag } from "../src/core/animation.ts";
 import { createDocument } from "../src/core/document.ts";
 import { duplicateFrame } from "../src/core/timeline.ts";
-import { celKey } from "../src/core/types.ts";
 import { exportUnity } from "../src/server/exporters/unity.ts";
 
-test("Unity 묶음은 스프라이트 분할과 AnimationClip 생성 정보를 포함한다", async () => {
-  let document = createDocument({ width: 16, height: 12 });
-  const cel = document.cels[celKey(document.frames[0].id, document.layers[0].id)];
-  document.images[cel.imageId].data.set([255, 255, 255, 255], (3 * 16 + 2) * 4);
-  document = duplicateFrame(document, document.frames[0].id);
-  document.frames[1].durationMs = 140;
-  document = duplicateFrame(document, document.frames[1].id);
-  document = duplicateFrame(document, document.frames[2].id);
-  document = addAnimationTag(document, {
-    name: "walk",
-    frameIds: document.frames.slice(0, 2).map((frame) => frame.id),
-    direction: "forward",
-  });
-  document = addAnimationTag(document, {
-    name: "attack",
-    frameIds: document.frames.slice(2).map((frame) => frame.id),
-    direction: "reverse",
-  });
+test("Unity 묶음은 공유 스프라이트를 한 번만 분할하고 단계별 시간을 사용한다", async () => {
+  let document = createDocument({ width: 1, height: 1 });
+  const idleId = document.frames[0].id;
+  document = duplicateFrame(document, idleId);
+  const walkId = document.frames[1].id;
+  document.frames[0].durationMs = 100;
+  document.frames[1].durationMs = 180;
+  document = addAnimationTag(document, { name: "idle", frameIds: [idleId], direction: "forward" });
+  document = addAnimationTag(document, { name: "walk", frameIds: [walkId], direction: "forward" });
 
   const files = await exportUnity(document, {
-    columns: 2,
+    columns: 1,
     padding: 0,
-    margin: 1,
-    trim: true,
+    margin: 0,
+    trim: false,
     pixelsPerUnit: 32,
     pivot: { x: 0.5, y: 0 },
   });
@@ -42,19 +32,13 @@ test("Unity 묶음은 스프라이트 분할과 AnimationClip 생성 정보를 �
   const metadata = JSON.parse(files[1].data as string);
   assert.equal(metadata.pixelsPerUnit, 32);
   assert.deepEqual(metadata.pivot, { x: 0.5, y: 0 });
-  assert.deepEqual(metadata.frames[0].frame, { x: 1, y: 1, w: 1, h: 1 });
-  assert.deepEqual(metadata.frames[0].spriteSourceSize, { x: 2, y: 3, w: 1, h: 1 });
-  assert.equal(metadata.frames[1].duration, 140);
+  assert.equal(metadata.frames.length, 1);
+  assert.deepEqual(metadata.animations[0].steps, [{ frameId: idleId, sprite: "sprite_000", duration: 100 }]);
+  assert.deepEqual(metadata.animations[1].steps, [{ frameId: walkId, sprite: "sprite_000", duration: 180 }]);
   assert.deepEqual(
     metadata.animations.map(({ name, clipFilename }: { name: string; clipFilename: string }) => ({ name, clipFilename })),
-    [{ name: "walk", clipFilename: "walk" }, { name: "attack", clipFilename: "attack" }],
+    [{ name: "idle", clipFilename: "idle" }, { name: "walk", clipFilename: "walk" }],
   );
-  assert.deepEqual(metadata.animations[1], {
-    name: "attack",
-    clipFilename: "attack",
-    frames: ["attack_002", "attack_003"],
-    direction: "reverse",
-  });
   assert.equal(files.filter((file) => file.path === "spritesheet.png").length, 1);
   const importer = files[2].data as string;
   assert.match(importer, /AssetPostprocessor/);
@@ -67,6 +51,10 @@ test("Unity 묶음은 스프라이트 분할과 AnimationClip 생성 정보를 �
   assert.doesNotMatch(importer, /importer\.spritesheet/);
   assert.match(importer, /AnimationUtility\.SetObjectReferenceCurve/);
   assert.match(importer, /animation\.clipFilename/);
+  assert.match(importer, /class AnimationStep/);
+  assert.match(importer, /step\.sprite/);
+  assert.match(importer, /step\.duration/);
+  assert.doesNotMatch(importer, /Expand\(animation\)/);
   assert.doesNotMatch(importer, /GetInvalidFileNameChars/);
   assert.ok((files[3].data as string).includes("Unity 프로젝트의 Assets"));
 });

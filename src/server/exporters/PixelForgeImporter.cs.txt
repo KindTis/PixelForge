@@ -11,8 +11,9 @@ public sealed class PixelForgeImporter : AssetPostprocessor
     [Serializable] private sealed class Bundle { public int pixelsPerUnit; public Pivot pivot; public Frame[] frames; public Animation[] animations; }
     [Serializable] private sealed class Pivot { public float x; public float y; }
     [Serializable] private sealed class RectData { public int x; public int y; public int w; public int h; }
-    [Serializable] private sealed class Frame { public string filename; public RectData frame; public RectData spriteSourceSize; public RectData sourceSize; public int duration; }
-    [Serializable] private sealed class Animation { public string name; public string clipFilename; public string[] frames; public string direction; }
+    [Serializable] private sealed class Frame { public string filename; public RectData frame; public RectData spriteSourceSize; public RectData sourceSize; }
+    [Serializable] private sealed class AnimationStep { public string frameId; public string sprite; public int duration; }
+    [Serializable] private sealed class Animation { public string name; public string clipFilename; public AnimationStep[] steps; public string direction; }
 
     [MenuItem("PixelForge/Import Selected Bundle")]
     private static void ImportSelectedBundle()
@@ -58,10 +59,9 @@ public sealed class PixelForgeImporter : AssetPostprocessor
         dataImporter.SaveAndReimport();
 
         var sprites = AssetDatabase.LoadAllAssetsAtPath(texturePath).OfType<Sprite>().ToDictionary(sprite => sprite.name);
-        var durations = data.frames.ToDictionary(frame => frame.filename, frame => frame.duration / 1000f);
         var animationFolder = assetFolder + "/PixelForgeAnimations";
         if (!AssetDatabase.IsValidFolder(animationFolder)) AssetDatabase.CreateFolder(assetFolder, "PixelForgeAnimations");
-        foreach (var animation in data.animations) CreateClip(animationFolder, animation, sprites, durations);
+        foreach (var animation in data.animations) CreateClip(animationFolder, animation, sprites);
         AssetDatabase.SaveAssets();
         Selection.activeObject = texture;
     }
@@ -74,16 +74,15 @@ public sealed class PixelForgeImporter : AssetPostprocessor
             (pivot.y * frame.sourceSize.h - sourceBottom) / frame.spriteSourceSize.h);
     }
 
-    private static void CreateClip(string folder, Animation animation, Dictionary<string, Sprite> sprites, Dictionary<string, float> durations)
+    private static void CreateClip(string folder, Animation animation, Dictionary<string, Sprite> sprites)
     {
-        var sequence = Expand(animation).ToArray();
         var keys = new List<ObjectReferenceKeyframe>();
         var time = 0f;
-        foreach (var name in sequence) {
-            keys.Add(new ObjectReferenceKeyframe { time = time, value = sprites[name] });
-            time += durations[name];
+        foreach (var step in animation.steps) {
+            keys.Add(new ObjectReferenceKeyframe { time = time, value = sprites[step.sprite] });
+            time += step.duration / 1000f;
         }
-        keys.Add(new ObjectReferenceKeyframe { time = time, value = sprites[sequence[0]] });
+        keys.Add(new ObjectReferenceKeyframe { time = time, value = sprites[animation.steps[0].sprite] });
         var clip = new AnimationClip { frameRate = 60, wrapMode = WrapMode.Loop };
         AnimationUtility.SetObjectReferenceCurve(clip, EditorCurveBinding.PPtrCurve("", typeof(SpriteRenderer), "m_Sprite"), keys.ToArray());
         var path = folder + "/" + animation.clipFilename + ".anim";
@@ -91,11 +90,4 @@ public sealed class PixelForgeImporter : AssetPostprocessor
         AssetDatabase.CreateAsset(clip, path);
     }
 
-    private static IEnumerable<string> Expand(Animation animation)
-    {
-        if (animation.direction == "reverse") return animation.frames.Reverse();
-        if (animation.direction == "pingPong" && animation.frames.Length > 2)
-            return animation.frames.Concat(animation.frames.Skip(1).Take(animation.frames.Length - 2).Reverse());
-        return animation.frames;
-    }
 }

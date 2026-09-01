@@ -5,8 +5,9 @@ export type ExportTarget = "common" | "godot" | "unity";
 export type ExportResult = { outputPath: string; files: string[] };
 export type ExportResponse = { status: "cancelled" } | ({ status: "completed" } & ExportResult);
 
-export function ExportDialog({ settings: initial, onClose, onExport }: {
+export function ExportDialog({ settings: initial, summary, onClose, onExport }: {
   settings: ExportSettings;
+  summary: { exportableSetCount: number; unclassifiedFrameCount: number; emptySetNames: string[] };
   onClose(): void;
   onExport(target: ExportTarget, settings: ExportSettings): Promise<ExportResult | undefined>;
 }) {
@@ -64,12 +65,17 @@ export function ExportDialog({ settings: initial, onClose, onExport }: {
         <label>피벗 Y<input type="number" min="0" max="1" step="0.05" disabled={target !== "unity"} value={settings.pivot.y} onChange={(event) => setSettings({ ...settings, pivot: { ...settings.pivot, y: Number(event.target.value) } })} /></label>
       </div>
       <label className="trim-option"><input type="checkbox" checked={settings.trim} onChange={(event) => setSettings({ ...settings, trim: event.target.checked })} /> 투명 여백 자르기</label>
+      {(summary.unclassifiedFrameCount > 0 || summary.emptySetNames.length > 0 || summary.exportableSetCount === 0) && <section className="export-warnings" aria-live="polite">
+        {summary.unclassifiedFrameCount > 0 && <p>미분류 프레임 {summary.unclassifiedFrameCount}개는 내보내기에서 제외됩니다.</p>}
+        {summary.emptySetNames.length > 0 && <p>빈 세트는 내보내기에서 제외됩니다: {summary.emptySetNames.join(", ")}</p>}
+        {summary.exportableSetCount === 0 && <p className="error">내보낼 비어 있지 않은 애니메이션 세트가 없습니다</p>}
+      </section>}
       <p className="export-hint" role="status" aria-live="polite">
-        {busy ? "내보내기 요청을 처리하는 중입니다." : "모든 애니메이션 태그와 프레임 시간이 함께 기록됩니다."}
+        {busy ? "내보내기 요청을 처리하는 중입니다." : "내보낼 애니메이션 세트와 프레임 시간이 함께 기록됩니다."}
       </p>
       {result && <section className="export-result" aria-live="polite"><b>내보내기 완료</b><code>{result.outputPath}</code><ul>{result.files.map((file) => <li key={file}>{file}</li>)}</ul></section>}
       {error && <p className="error" role="alert">{error}</p>}
-      <footer><button type="button" onClick={onClose} disabled={busy}>닫기</button><button ref={submitButton} className="primary" type="submit" disabled={busy}>{busy ? "내보내는 중…" : `${target === "common" ? "범용" : target === "godot" ? "Godot" : "Unity"} 묶음 만들기`}</button></footer>
+      <footer><button type="button" onClick={onClose} disabled={busy}>닫기</button><button ref={submitButton} className="primary" type="submit" disabled={busy || summary.exportableSetCount === 0}>{busy ? "내보내는 중…" : `${target === "common" ? "범용" : target === "godot" ? "Godot" : "Unity"} 묶음 만들기`}</button></footer>
     </form>
   </dialog>;
 }

@@ -647,6 +647,11 @@ export function App() {
   if (!session) return <main className="loading-screen"><span className="brand-mark">PF</span><p>{error || "작업실을 여는 중…"}</p></main>;
   const account = session.account.account;
   const startingCellEdit = startingKind === "cellEdit";
+  const exportSummary = project && {
+    exportableSetCount: project.document.tags.filter((tag) => tag.frameIds.length > 0).length,
+    unclassifiedFrameCount: unclassifiedFrameIds(project.document).length,
+    emptySetNames: project.document.tags.filter((tag) => tag.frameIds.length === 0).map((tag) => tag.name),
+  };
 
   return (
     <main className="app-shell">
@@ -752,7 +757,7 @@ export function App() {
         onClose={() => setImportFile(undefined)}
         onConfirm={(destination) => importSheet(importFile, destination)}
       />}
-      {project && showExport && <ExportDialog settings={project.exportSettings} onClose={() => setShowExport(false)} onExport={runExport} />}
+      {project && exportSummary && showExport && <ExportDialog settings={project.exportSettings} summary={exportSummary} onClose={() => setShowExport(false)} onExport={runExport} />}
     </main>
   );
 }

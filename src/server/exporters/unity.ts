@@ -19,10 +19,11 @@ export async function exportUnity(document: SpriteDocument, options: UnityOption
     pixelsPerUnit: options.pixelsPerUnit,
     pivot: options.pivot,
     frames: common.metadata.frames,
-    animations: Object.entries(common.metadata.animations).map(([name, animation]) => ({
-      name,
-      clipFilename: unityAnimationClipFileName(name),
-      ...animation,
+    animations: common.metadata.animations.map((animation) => ({
+      name: animation.name,
+      clipFilename: unityAnimationClipFileName(animation.name),
+      steps: animation.steps,
+      direction: animation.direction,
     })),
   };
   return [
