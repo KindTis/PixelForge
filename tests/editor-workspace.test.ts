@@ -5,6 +5,7 @@ import { defaultAnimationSelection, type AnimationSelection } from "../src/core/
 import { History } from "../src/core/commands.ts";
 import { createDocument, createProject } from "../src/core/document.ts";
 import { addFrame } from "../src/core/timeline.ts";
+import { updateFrameStripSelection } from "../src/client/editor/AnimationFrameStrip.tsx";
 import { EditorWorkspace } from "../src/client/editor/EditorWorkspace.tsx";
 
 type CanvasProps = Record<string, (event: PointerEventLike) => void>;
@@ -110,6 +111,47 @@ function workspaceCanvas(
 function pointerEvent(canvas: CanvasLike): PointerEventLike {
   return { button: 0, clientX: 5, clientY: 5, currentTarget: canvas, pointerId: 1, preventDefault() {} };
 }
+
+test("프레임 선택 수정키는 활성 프레임과 다중 선택을 분리한다", () => {
+  const order = ["a", "b", "c", "d"];
+  const cases = [
+    [{ type: "click", frameId: "b", ctrl: false, shift: false }, { activeFrameId: "b", selection: { ids: ["b"], anchorId: "b" } }],
+    [{ type: "click", frameId: "c", ctrl: true, shift: false }, { activeFrameId: "a", selection: { ids: ["c"], anchorId: "c" } }],
+    [{ type: "click", frameId: "d", ctrl: false, shift: true }, { activeFrameId: "a", selection: { ids: ["b", "c", "d"], anchorId: "b" } }],
+    [{ type: "all" }, { activeFrameId: "a", selection: { ids: order, anchorId: "b" } }],
+    [{ type: "clear" }, { activeFrameId: "a", selection: { ids: [], anchorId: undefined } }],
+  ] as const;
+  for (const [action, expected] of cases) {
+    assert.deepEqual(updateFrameStripSelection(order, "a", { ids: [], anchorId: "b" }, action), expected);
+  }
+});
+
+test("세트 관리자는 고정 작업 바와 접근 가능한 순서 동작을 제공한다", () => {
+  let document = createDocument({ width: 1, height: 1 });
+  for (let index = 0; index < 2; index += 1) document = addFrame(document);
+  const ids = document.frames.map((frame) => frame.id);
+  document.tags = [
+    { id: "idle", name: "idle", direction: "forward", frameIds: ids.slice(0, 2) },
+    { id: "walk", name: "walk", direction: "forward", frameIds: ids.slice(2) },
+  ];
+  const project = createProject("기사", document);
+  const changes: ReturnType<typeof createProject>[] = [];
+  const rendered = workspaceCanvas(project, [], {
+    selection: { tagId: "idle", frameId: ids[0] },
+    onChange: (next: ReturnType<typeof createProject>) => changes.push(next),
+  }).element;
+
+  assert.match(renderedText(rendered), /선택된 프레임 없음/);
+  const moveSet = elements(rendered).find((node) => node.type === "button" && node.props?.["aria-label"] === "idle 애니메이션 세트 아래로 이동");
+  assert.ok(moveSet);
+  (moveSet.props?.onClick as () => void)();
+  assert.deepEqual(changes.at(-1)?.document.tags.map((tag) => tag.id), ["walk", "idle"]);
+
+  const moveFrame = elements(rendered).find((node) => node.type === "button" && node.props?.["aria-label"] === "1번 프레임 뒤로 이동");
+  assert.ok(moveFrame);
+  (moveFrame.props?.onClick as (event: { stopPropagation(): void }) => void)({ stopPropagation() {} });
+  assert.deepEqual(changes.at(-1)?.document.tags[0].frameIds, [ids[1], ids[0]]);
+});
 
 test("포인터 종료는 부모 갱신 전에도 커밋된 도형 문서를 렌더링한다", () => {
   const previousWindow = globalThis.window;

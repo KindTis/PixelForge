@@ -24,6 +24,7 @@ import {
 } from "../../core/tool-controller.ts";
 import { CanvasRenderer } from "./CanvasRenderer.ts";
 import { AnimationSetManager } from "./AnimationSetManager.tsx";
+import type { FrameStripSelection } from "./AnimationFrameStrip.tsx";
 import { selectionOverlay, selectionReplayMask, selectionRuns } from "./ai-edit.ts";
 import { ResizeDialog, type ResizeRequest } from "./ResizeDialog.tsx";
 import { shortcutAction } from "./shortcuts.ts";
@@ -99,6 +100,7 @@ export const EditorWorkspace = forwardRef<EditorWorkspaceHandle, {
   const [mirrorX, setMirrorX] = useState(false);
   const [mirrorY, setMirrorY] = useState(false);
   const [selection, setSelection] = useState<Uint8Array>();
+  const [frameSelection, setFrameSelection] = useState<FrameStripSelection>({ ids: [] });
   const [zoom, setZoom] = useState(8);
   const [grid, setGrid] = useState(true);
   const [onion, setOnion] = useState(false);
@@ -111,6 +113,7 @@ export const EditorWorkspace = forwardRef<EditorWorkspaceHandle, {
 
   useEffect(() => {
     setSelection(undefined);
+    setFrameSelection({ ids: [], anchorId: undefined });
     setPlaying(false);
     playbackCursor.current = 0;
   }, [history]);
@@ -254,6 +257,7 @@ export const EditorWorkspace = forwardRef<EditorWorkspaceHandle, {
 
   const restoreHistory = (next: SpriteProject) => {
     setSelection(undefined);
+    setFrameSelection({ ids: [], anchorId: undefined });
     setPlaying(false);
     onSelection(reconcileAnimationSelection(next.document, animationSelection));
     emit(next);
@@ -665,9 +669,11 @@ export const EditorWorkspace = forwardRef<EditorWorkspaceHandle, {
     <AnimationSetManager
       document={project.document}
       selection={animationSelection}
+      frameSelection={frameSelection}
       disabled={readOnly}
       saveState={saveState}
       onSelection={(next) => { setPlaying(false); onSelection(next); }}
+      onFrameSelection={setFrameSelection}
       onReplace={(document, nextSelection) => {
         if (readOnly) return;
         const next = history.replaceDocument(document);
