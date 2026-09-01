@@ -657,7 +657,7 @@ export function App() {
                   <label>애니메이션 이름<input disabled={codexBusy} value={animationName} onChange={(event) => setAnimationName(event.target.value)} /></label>
                   <label>재생 방향<select disabled={codexBusy} value={animationDirection} onChange={(event) => setAnimationDirection(event.target.value as AnimationDirection)}><option value="forward">정방향</option><option value="reverse">역방향</option><option value="pingPong">핑퐁</option></select></label>
                 </div>
-                <p className="hint append-context">현재 기준 F{activeFrameNumber} · 대상 레이어 {activeLayer?.name ?? "없음"}</p>
+                <p className="hint append-context">현재 기준 {activeFrameNumber ? `F${activeFrameNumber}` : "없음"} · 대상 레이어 {activeLayer?.name ?? "없음"}</p>
                 {issue && <p className="error append-issue" role="status">{issue}</p>}
               </>}
               <p className="hint">{project.document.width} × {project.document.height}px · 투명 배경 · PNG</p>
@@ -669,7 +669,7 @@ export function App() {
               {generationMode === "append"
                 ? <button className="forge-button" type="button" disabled={appendDisabled} onClick={() => void generate({ appendAnimation: {
                     name,
-                    baseFrameId: activeFrameId,
+                    baseFrameId: activeFrameId!,
                     targetLayerId: activeLayer!.id,
                     direction: animationDirection,
                   } })}><span>애니메이션 추가</span><b>⌘ ↗</b></button>
