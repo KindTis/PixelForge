@@ -32,6 +32,18 @@ export type Cel = {
 
 export type AnimationDirection = "forward" | "reverse" | "pingPong";
 
+export type AnimationSetInput = {
+  name: string;
+  direction: AnimationDirection;
+};
+
+export type SpriteSheetShape = {
+  frameCount: number;
+  columns: number;
+  cellWidth: number;
+  cellHeight: number;
+};
+
 export type AnimationTag = {
   id: string;
   name: string;

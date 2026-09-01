@@ -15,9 +15,10 @@ import {
   type AiEditVerdict,
 } from "../core/ai-edit.ts";
 import { runAiEdit, selectionMask, type AiEditExecutionState } from "../core/ai-edit-runner.ts";
+import { editingFrameContext, UNCLASSIFIED_NAME } from "../core/animation.ts";
 import { createDocument, createProject as makeProject, validateDocument } from "../core/document.ts";
 import { compositeFrame } from "../core/render.ts";
-import { celKey, type PixelBuffer, type SpriteProject } from "../core/types.ts";
+import { celKey, type AnimationSetInput, type PixelBuffer, type SpriteProject } from "../core/types.ts";
 import type { AccountState, CodexBridge, CodexEvent } from "./codex-bridge.ts";
 import {
   createCellEditLog,
@@ -64,6 +65,7 @@ type JobBase = {
 type GenerationJob = JobBase & {
   kind: "generation";
   request: SpriteSheetRequest | FrameRegenerationRequest | AppendAnimationRequest;
+  targetKind: GenerationTarget["kind"];
   frameId?: string;
   outputPath: string;
   relativeOutputPath: string;
@@ -105,6 +107,13 @@ type CellEditJob = JobBase & {
 };
 type Job = GenerationJob | CellEditJob;
 
+type GenerationTarget =
+  | { kind: "sheet"; animationSet: AnimationSetInput }
+  | { kind: "frame"; frameId: string }
+  | { kind: "append"; animationSet: AnimationSetInput; baseFrameId: string; targetLayerId: string };
+
+type GenerationWireRequest = Omit<SpriteSheetRequest, "animationSet">;
+
 export type ServerOptions = {
   projectsRoot: string;
   codex: CodexClient;
@@ -134,6 +143,55 @@ async function body(request: IncomingMessage): Promise<unknown> {
   } catch {
     throw new Error("JSON 요청이 올바르지 않습니다.");
   }
+}
+
+function inputRecord(value: unknown, label: string): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${label}이 올바르지 않습니다.`);
+  return value as Record<string, unknown>;
+}
+
+function assertOnlyFields(value: Record<string, unknown>, fields: readonly string[], label: string): void {
+  const invalid = Object.keys(value).filter((key) => !fields.includes(key));
+  if (invalid.length) throw new Error(`${label}에 허용되지 않은 필드가 있습니다: ${invalid.join(", ")}`);
+}
+
+function parseAnimationSetInput(value: unknown): AnimationSetInput {
+  const input = inputRecord(value, "애니메이션 세트");
+  assertOnlyFields(input, ["name", "direction"], "애니메이션 세트");
+  if (typeof input.name !== "string" || !input.name.trim()) throw new Error("애니메이션 세트 이름은 비어 있지 않은 문자열이어야 합니다.");
+  if (input.name.trim() === UNCLASSIFIED_NAME) throw new Error("미분류는 예약 이름입니다.");
+  if (typeof input.direction !== "string" || !(["forward", "reverse", "pingPong"] as const).includes(input.direction as AnimationSetInput["direction"])) {
+    throw new Error("재생 방향이 올바르지 않습니다.");
+  }
+  return { name: input.name, direction: input.direction as AnimationSetInput["direction"] };
+}
+
+function parseGenerationTarget(value: unknown): GenerationTarget {
+  const input = inputRecord(value, "생성 target");
+  if (input.kind === "sheet") {
+    assertOnlyFields(input, ["kind", "animationSet"], "sheet target");
+    return { kind: "sheet", animationSet: parseAnimationSetInput(input.animationSet) };
+  }
+  if (input.kind === "frame") {
+    assertOnlyFields(input, ["kind", "frameId"], "frame target");
+    if (typeof input.frameId !== "string") throw new Error("프레임 ID는 문자열이어야 합니다.");
+    if (!input.frameId.trim()) throw new Error("프레임 ID가 필요합니다.");
+    return { kind: "frame", frameId: input.frameId };
+  }
+  if (input.kind === "append") {
+    assertOnlyFields(input, ["kind", "animationSet", "baseFrameId", "targetLayerId"], "append target");
+    if (typeof input.baseFrameId !== "string" || typeof input.targetLayerId !== "string") {
+      throw new Error("기준 프레임 ID와 대상 레이어 ID는 문자열이어야 합니다.");
+    }
+    if (!input.baseFrameId.trim() || !input.targetLayerId.trim()) throw new Error("기준 프레임 ID와 대상 레이어 ID가 필요합니다.");
+    return {
+      kind: "append",
+      animationSet: parseAnimationSetInput(input.animationSet),
+      baseFrameId: input.baseFrameId,
+      targetLayerId: input.targetLayerId,
+    };
+  }
+  throw new Error("지원하지 않는 생성 target입니다.");
 }
 
 function wireProject(project: SpriteProject): unknown {
@@ -654,11 +712,13 @@ export function createPixelForgeServer({
         const message = job.messages.join("").trim();
         throw new Error(`Codex가 결과 이미지를 생성하지 않았습니다.${message ? ` ${message}` : ""}`);
       }
-      job.project = job.frameId !== undefined
-        ? importRegeneratedFrame(project, png, job.request as FrameRegenerationRequest, job.relativeOutputPath)
-        : "baseFrameId" in job.request
-          ? appendAnimationSheet(project, png, job.request, job.relativeOutputPath)
-          : importSpriteSheet(project, png, job.request as SpriteSheetRequest, job.relativeOutputPath);
+      if (job.targetKind === "frame") {
+        job.project = importRegeneratedFrame(project, png, job.request as FrameRegenerationRequest, job.relativeOutputPath);
+      } else if (job.targetKind === "append") {
+        job.project = appendAnimationSheet(project, png, job.request as AppendAnimationRequest, job.relativeOutputPath);
+      } else {
+        job.project = importSpriteSheet(project, png, job.request as SpriteSheetRequest, job.relativeOutputPath);
+      }
       await saveProject(root, job.project);
     } catch (error) {
       failure = error;
@@ -913,17 +973,15 @@ export function createPixelForgeServer({
       if (request.method === "POST" && url.pathname === "/api/generations") {
         const input = await body(request) as {
           projectId?: unknown;
-          frameId?: unknown;
-          appendAnimation?: unknown;
-          request?: SpriteSheetRequest;
+          target?: unknown;
+          request?: unknown;
         };
         const projectId = safeProjectId(String(input.projectId ?? ""));
-        const generationRequest = { ...input.request } as SpriteSheetRequest;
-        if (input.frameId !== undefined && typeof input.frameId !== "string") throw new Error("프레임 ID는 문자열이어야 합니다.");
-        if (input.frameId !== undefined && input.appendAnimation !== undefined) {
-          throw new Error("frameId와 appendAnimation은 동시에 지정할 수 없습니다.");
-        }
-        const frameId = input.frameId;
+        const target = parseGenerationTarget(input.target);
+        const requestInput = inputRecord(input.request, "생성 요청");
+        assertOnlyFields(requestInput, ["prompt", "frameCount", "columns", "cellWidth", "cellHeight", "durationMs", "parentId", "referencePath"], "생성 요청");
+        const generationRequest = { ...requestInput } as GenerationWireRequest;
+        const frameId = target.kind === "frame" ? target.frameId : undefined;
         const jobId = randomUUID();
         if (!lockProject(projectId, jobId)) return send(response, 409, { error: "이미 생성 중인 프로젝트입니다." });
         try {
@@ -934,25 +992,24 @@ export function createPixelForgeServer({
             if (!(await stat(reference)).isFile()) throw new Error("참조 이미지를 찾을 수 없습니다.");
             generationRequest.referencePath = reference;
           }
-          const relativeOutputPath = `generated/${jobId}/${frameId !== undefined
+          const relativeOutputPath = `generated/${jobId}/${target.kind === "frame"
             ? "frame.png"
-            : input.appendAnimation !== undefined ? "animation.png" : "sheet.png"}`;
+            : target.kind === "append" ? "animation.png" : "sheet.png"}`;
           const outputPath = resolveInside(root, relativeOutputPath);
           await mkdir(resolve(outputPath, ".."), { recursive: true });
           let prompt: string;
-          let jobRequest: SpriteSheetRequest | FrameRegenerationRequest | AppendAnimationRequest = generationRequest;
-          if (frameId !== undefined) {
-            const frameIndex = project.document.frames.findIndex((frame) => frame.id === frameId);
-            if (frameIndex < 0) throw new Error("선택한 프레임을 찾을 수 없습니다.");
+          let jobRequest: SpriteSheetRequest | FrameRegenerationRequest | AppendAnimationRequest;
+          if (target.kind === "frame") {
+            const context = editingFrameContext(project.document, target.frameId);
             const referencePaths: FrameReferencePaths = {
               first: resolveInside(root, `generated/${jobId}/first.png`),
-              previous: frameIndex > 0 ? resolveInside(root, `generated/${jobId}/previous.png`) : undefined,
-              next: frameIndex < project.document.frames.length - 1 ? resolveInside(root, `generated/${jobId}/next.png`) : undefined,
+              previous: context.previousFrameId ? resolveInside(root, `generated/${jobId}/previous.png`) : undefined,
+              next: context.nextFrameId ? resolveInside(root, `generated/${jobId}/next.png`) : undefined,
             };
             const referenceFrames = [
-              { path: referencePaths.first, frameId: project.document.frames[0].id },
-              ...(referencePaths.previous ? [{ path: referencePaths.previous, frameId: project.document.frames[frameIndex - 1].id }] : []),
-              ...(referencePaths.next ? [{ path: referencePaths.next, frameId: project.document.frames[frameIndex + 1].id }] : []),
+              { path: referencePaths.first, frameId: context.firstFrameId },
+              ...(context.previousFrameId ? [{ path: referencePaths.previous!, frameId: context.previousFrameId }] : []),
+              ...(context.nextFrameId ? [{ path: referencePaths.next!, frameId: context.nextFrameId }] : []),
             ];
             for (const reference of referenceFrames) {
               const image = compositeFrame(project.document, reference.frameId);
@@ -960,27 +1017,16 @@ export function createPixelForgeServer({
             }
             jobRequest = {
               prompt: generationRequest.prompt,
-              frameId,
+              frameId: target.frameId,
               parentId: generationRequest.parentId,
               referencePath: generationRequest.referencePath,
             };
             prompt = buildFrameRegenerationPrompt(project, jobRequest, referencePaths, outputPath);
-          } else if (input.appendAnimation !== undefined) {
-            if (!input.appendAnimation || typeof input.appendAnimation !== "object" || Array.isArray(input.appendAnimation)) {
-              throw new Error("appendAnimation 메타데이터가 올바르지 않습니다.");
-            }
-            const appendInput = input.appendAnimation as Record<string, unknown>;
-            if (typeof appendInput.name !== "string"
-              || typeof appendInput.baseFrameId !== "string"
-              || typeof appendInput.targetLayerId !== "string"
-              || typeof appendInput.direction !== "string") {
-              throw new Error("appendAnimation의 이름, 기준 프레임, 대상 레이어와 재생 방향은 문자열이어야 합니다.");
-            }
+          } else if (target.kind === "append") {
             const appendRequest: AppendAnimationRequest = {
-              name: appendInput.name,
-              baseFrameId: appendInput.baseFrameId,
-              targetLayerId: appendInput.targetLayerId,
-              direction: appendInput.direction as AppendAnimationRequest["direction"],
+              ...target.animationSet,
+              baseFrameId: target.baseFrameId,
+              targetLayerId: target.targetLayerId,
               prompt: generationRequest.prompt,
               frameCount: generationRequest.frameCount,
               columns: generationRequest.columns,
@@ -996,9 +1042,11 @@ export function createPixelForgeServer({
             jobRequest = appendRequest;
             prompt = buildAppendAnimationPrompt(appendRequest, baseReferencePath, outputPath);
           } else {
-            prompt = buildSpriteSheetPrompt(generationRequest, outputPath);
+            const sheetRequest: SpriteSheetRequest = { ...generationRequest, animationSet: target.animationSet };
+            jobRequest = sheetRequest;
+            prompt = buildSpriteSheetPrompt(sheetRequest, outputPath);
           }
-          const job: GenerationJob = { id: jobId, kind: "generation", projectId, request: jobRequest, frameId, outputPath, relativeOutputPath, status: "running", messages: [] };
+          const job: GenerationJob = { id: jobId, kind: "generation", projectId, request: jobRequest, targetKind: target.kind, frameId, outputPath, relativeOutputPath, status: "running", messages: [] };
           jobs.set(jobId, job);
           const run = await codex.startGeneration({ cwd: root, prompt });
           connectRun(job, codex, run.id);

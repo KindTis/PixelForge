@@ -1,14 +1,22 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import type { AnimationDirection, SpriteProject } from "../core/types.ts";
-import { defaultAnimationSelection, reconcileAnimationSelection, type AnimationSelection } from "../core/animation.ts";
+import { defaultAnimationSelection, reconcileAnimationSelection, UNCLASSIFIED_NAME, type AnimationSelection } from "../core/animation.ts";
 import { History } from "../core/commands.ts";
 import { renameProject } from "../core/document.ts";
-import { api, appendAnimationIssue, cellEditApplicationDisposition, cellEditApplicationRequestTimeout, cellEditCompletionNotice, cellEditPayload, codexJobStatusTitle, completedGenerationSelection, decodeProject, encodeProject, failedCodexJob, generationPayload, isInitialBlankProject, isRetryablePollingError, pollingErrorCodexJob, projectJobOwnershipMatches, projectLifetimeMatches, releaseProjectJobOwnership, type CellEditJob, type CodexJob, type GenerationJob, type GenerationTarget, type ProjectJobOwnership, type ProjectLifetime, type Session } from "./api.ts";
+import { api, appendAnimationIssue, cellEditApplicationDisposition, cellEditApplicationRequestTimeout, cellEditCompletionNotice, cellEditPayload, codexJobStatusTitle, completedGenerationSelection, decodeProject, encodeProject, failedCodexJob, generationHistoryFields, generationPayload, isInitialBlankProject, isRetryablePollingError, pollingErrorCodexJob, projectJobOwnershipMatches, projectLifetimeMatches, releaseProjectJobOwnership, type CellEditJob, type CodexJob, type GenerationJob, type GenerationTarget, type ProjectJobOwnership, type ProjectLifetime, type Session } from "./api.ts";
 import { EditorWorkspace, type EditorWorkspaceHandle } from "./editor/EditorWorkspace.tsx";
 import { ExportDialog, type ExportResponse, type ExportResult, type ExportTarget } from "./ExportDialog.tsx";
 
 type ProjectSummary = { id: string; name: string };
 const CELL_EDIT_UNAVAILABLE = "설치된 Codex App Server에서 현재 셀 편집을 사용할 수 없습니다.";
+
+function animationSetIssue(nameInput: string, direction: AnimationDirection): string | undefined {
+  const name = nameInput.trim();
+  if (!name) return "애니메이션 세트 이름이 필요합니다.";
+  if (name === UNCLASSIFIED_NAME) return "미분류는 예약 이름입니다.";
+  if (!(["forward", "reverse", "pingPong"] as const).includes(direction)) return "재생 방향이 올바르지 않습니다.";
+  return undefined;
+}
 
 async function rgbaPngBase64(file: File): Promise<string> {
   const image = await createImageBitmap(file);
@@ -114,6 +122,12 @@ export function App() {
       setProjects(list.projects);
     }).catch((reason) => setError(reason instanceof Error ? reason.message : String(reason)));
   }, []);
+
+  const selectedAnimationTag = project?.document.tags.find((candidate) => candidate.id === animationSelection.tagId);
+  useEffect(() => {
+    setAnimationName(selectedAnimationTag?.name ?? "");
+    setAnimationDirection(selectedAnimationTag?.direction ?? "forward");
+  }, [project?.id, animationSelection.tagId, selectedAnimationTag?.name, selectedAnimationTag?.direction]);
 
   latestProject.current = project;
   const codexBusy = Boolean(startingKind) || job?.status === "running" || job?.status === "awaitingApproval" || job?.status === "cancelling" || job?.status === "finalizing";
@@ -307,15 +321,15 @@ export function App() {
         }
 
         if (next.kind === "generation" && next.status === "completed") {
+          if (!target) throw new Error("완료된 생성 작업의 target이 없습니다.");
           if (!next.project) {
             completedGenerationSelection(undefined, target, next.frameId);
           } else {
             const completedProject = decodeProject(next.project);
             const selection = completedGenerationSelection(completedProject, target, next.frameId);
             setJob({ ...next, project: completedProject });
-            beginProjectLifetime(completedProject.id);
             const tracked = projectHistory.current
-              ? projectHistory.current.replaceProject(completedProject, ["document", "generationHistory", "exportSettings"])
+              ? projectHistory.current.replaceProject(completedProject, generationHistoryFields(target))
               : completedProject;
             setCurrentProject(tracked);
             setDirty(false);
@@ -324,11 +338,11 @@ export function App() {
               tagId: selection.tag?.id ?? null,
               frameId: selectedFrame?.id ?? null,
             }));
-            setNotice(selection.tag
-              ? `${selection.tag.name} 애니메이션 ${selection.frameCount}프레임을 추가했습니다.`
-              : target && "frameId" in target
+            setNotice(target.kind === "append"
+              ? `${selection.tag!.name} 애니메이션 ${selection.frameCount}프레임을 추가했습니다.`
+              : target.kind === "frame"
                 ? "선택 프레임을 재생성해 저장했습니다."
-                : "생성 결과를 프레임으로 가져와 저장했습니다.");
+                : "생성 결과를 이름 세트로 가져와 저장했습니다.");
           }
           return;
         }
@@ -344,10 +358,21 @@ export function App() {
     }
   };
 
-  const generate = async (target?: GenerationTarget) => {
+  const generate = async (target: GenerationTarget) => {
     if (!session || !project) return;
-    if (!target && !isInitialBlankProject(project)
-      && !window.confirm("기존 프레임과 애니메이션 태그를 모두 교체합니다. 전체 시트를 다시 생성할까요?")) return;
+    if (!prompt.trim()) {
+      setError("생성 프롬프트가 필요합니다.");
+      return;
+    }
+    if (target.kind === "sheet") {
+      const issue = animationSetIssue(target.animationSet.name, target.animationSet.direction);
+      if (issue) {
+        setError(issue);
+        return;
+      }
+      if (!isInitialBlankProject(project)
+        && !window.confirm("기존 프레임, 세트와 편집 결과를 모두 교체합니다")) return;
+    }
     const lifetime = beginProjectLifetime(project.id);
     setError("");
     setNotice("");
@@ -356,7 +381,7 @@ export function App() {
       if (!(await save(lifetime)) || !projectLifetimeMatches(projectLifetime.current, lifetime)) return;
       const started = await api<GenerationJob>("/api/generations", session.token, {
         method: "POST",
-        body: JSON.stringify(generationPayload(project, prompt, frameCount, Math.min(columns, frameCount), reference?.path, target)),
+        body: JSON.stringify(generationPayload(project, prompt, frameCount, Math.min(columns, frameCount), target, reference?.path)),
       });
       if (!projectLifetimeMatches(projectLifetime.current, lifetime)) {
         await api(`/api/generations/${started.id}`, session.token, { method: "DELETE" }).catch(() => undefined);
@@ -495,6 +520,11 @@ export function App() {
 
   const importSheet = async (file?: File) => {
     if (!file || !session || !project || codexBusy) return;
+    const setIssue = animationSetIssue(animationName, animationDirection);
+    if (setIssue) {
+      setError(setIssue);
+      return;
+    }
     const lifetime = beginProjectLifetime(project.id);
     setStartingKind("import");
     setError("");
@@ -506,7 +536,7 @@ export function App() {
         body: JSON.stringify({
           projectId: project.id,
           pngBase64,
-          request: { prompt: `직접 가져오기: ${file.name}`, frameCount, columns: Math.min(columns, frameCount), cellWidth: project.document.width, cellHeight: project.document.height, durationMs: 100 },
+          request: { prompt: `직접 가져오기: ${file.name}`, frameCount, columns: Math.min(columns, frameCount), cellWidth: project.document.width, cellHeight: project.document.height, durationMs: 100, animationSet: { name: animationName.trim(), direction: animationDirection } },
         }),
       }));
       if (!projectLifetimeMatches(projectLifetime.current, lifetime)) return;
@@ -641,42 +671,44 @@ export function App() {
         if (!pending || !projectJobOwnershipMatches(projectLifetime.current, activeJobOwnership.current, pending)) setDirty(true);
       }} onSave={() => void save()} saveState={dirty ? "저장 대기" : "저장됨"} onError={setError} generationPanel={({ activeFrameId, activeFrameNumber, activeLayer, hasActiveCel }) => {
         const name = animationName.trim();
-        const issue = appendAnimationIssue(project, prompt, name, activeLayer, hasActiveCel);
-        const appendDisabled = account?.type !== "chatgpt" || codexBusy || Boolean(issue);
+        const appendIssue = appendAnimationIssue(project, prompt, name, activeLayer, hasActiveCel);
+        const sheetIssue = !prompt.trim() ? "생성 프롬프트가 필요합니다." : animationSetIssue(name, animationDirection);
+        const issue = generationMode === "append" ? appendIssue : sheetIssue;
+        const generationDisabled = account?.type !== "chatgpt" || codexBusy || Boolean(issue);
         return <section className="generation-panel">
             <div className="panel-title"><span>CODEX FORGE</span><b>{account?.type === "chatgpt" ? "연결됨" : "로그인 필요"}</b></div>
-            <form onSubmit={(event) => { event.preventDefault(); if (generationMode === "sheet") void generate(); }}>
+            <form onSubmit={(event) => { event.preventDefault(); if (generationMode === "sheet") void generate({ kind: "sheet", animationSet: { name, direction: animationDirection } }); }}>
               <label className="generation-mode">생성 방식<select disabled={codexBusy} value={generationMode} onChange={(event) => setGenerationMode(event.target.value as "sheet" | "append")}><option value="sheet">전체 시트</option><option value="append">추가 애니메이션</option></select></label>
               <label>프롬프트<textarea rows={6} disabled={codexBusy} value={prompt} onChange={(event) => setPrompt(event.target.value)} /></label>
               <div className="form-grid">
                 <label>{generationMode === "append" ? "추가 생성 프레임 수 (기준 제외)" : "총 프레임 수"}<input type="number" min="1" max="256" disabled={codexBusy} value={frameCount} onChange={(event) => setFrameCount(Number(event.target.value))} /></label>
                 <label>열<input type="number" min="1" max={frameCount} disabled={codexBusy} value={columns} onChange={(event) => setColumns(Number(event.target.value))} /></label>
               </div>
+              <div className="form-grid append-fields">
+                <label>애니메이션 이름<input disabled={codexBusy} value={animationName} onChange={(event) => setAnimationName(event.target.value)} /></label>
+                <label>재생 방향<select disabled={codexBusy} value={animationDirection} onChange={(event) => setAnimationDirection(event.target.value as AnimationDirection)}><option value="forward">정방향</option><option value="reverse">역방향</option><option value="pingPong">핑퐁</option></select></label>
+              </div>
               {generationMode === "append" && <>
-                <div className="form-grid append-fields">
-                  <label>애니메이션 이름<input disabled={codexBusy} value={animationName} onChange={(event) => setAnimationName(event.target.value)} /></label>
-                  <label>재생 방향<select disabled={codexBusy} value={animationDirection} onChange={(event) => setAnimationDirection(event.target.value as AnimationDirection)}><option value="forward">정방향</option><option value="reverse">역방향</option><option value="pingPong">핑퐁</option></select></label>
-                </div>
                 <p className="hint append-context">현재 기준 {activeFrameNumber ? `F${activeFrameNumber}` : "없음"} · 대상 레이어 {activeLayer?.name ?? "없음"}</p>
-                {issue && <p className="error append-issue" role="status">{issue}</p>}
               </>}
+              {issue && <p className="error append-issue" role="status">{issue}</p>}
               <p className="hint">{project.document.width} × {project.document.height}px · 투명 배경 · PNG</p>
               <div className="asset-inputs">
                 <label>참조 PNG<input type="file" accept="image/png" disabled={codexBusy} onChange={(event) => void uploadReference(event.target.files?.[0])} /></label>
-                <label>시트 가져오기<input type="file" accept="image/png" disabled={codexBusy} onChange={(event) => void importSheet(event.target.files?.[0])} /></label>
+                <label>시트 가져오기<input type="file" accept="image/png" disabled={codexBusy || Boolean(animationSetIssue(name, animationDirection))} onChange={(event) => void importSheet(event.target.files?.[0])} /></label>
               </div>
               {reference && <p className="reference-file"><span>{reference.name}</span><button type="button" disabled={codexBusy} onClick={() => setReference(undefined)}>제거</button></p>}
               {generationMode === "append"
-                ? <button className="forge-button" type="button" disabled={appendDisabled} onClick={() => void generate({ appendAnimation: {
-                    name,
+                ? <button className="forge-button" type="button" disabled={generationDisabled} onClick={() => void generate({
+                    kind: "append",
+                    animationSet: { name, direction: animationDirection },
                     baseFrameId: activeFrameId!,
                     targetLayerId: activeLayer!.id,
-                    direction: animationDirection,
-                  } })}><span>애니메이션 추가</span><b>⌘ ↗</b></button>
-                : <button className="forge-button" type="submit" disabled={!account || codexBusy}>
+                  })}><span>애니메이션 추가</span><b>⌘ ↗</b></button>
+                : <button className="forge-button" type="submit" disabled={generationDisabled}>
                     <span>{isInitialBlankProject(project) ? "스프라이트 생성" : "전체 시트 다시 생성"}</span><b>⌘ ↗</b>
                   </button>}
-              <button className="forge-button" type="button" disabled={!account || codexBusy || !animationSelection.frameId} onClick={() => animationSelection.frameId && void generate({ frameId: animationSelection.frameId })}>
+              <button className="forge-button" type="button" disabled={account?.type !== "chatgpt" || codexBusy || !prompt.trim() || !animationSelection.frameId} onClick={() => animationSelection.frameId && void generate({ kind: "frame", frameId: animationSelection.frameId })}>
                 <span>선택 프레임 재생성</span><b>⌘ ↗</b>
               </button>
               <button className="forge-button" type="button" disabled={account?.type !== "chatgpt" || !prompt.trim() || !hasActiveCel || activeLayer?.locked || codexBusy || Boolean(cellEditUnavailable)} onClick={() => void editCurrentCell()}>

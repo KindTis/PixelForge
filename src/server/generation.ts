@@ -1,18 +1,15 @@
-import { addAnimationTag, assertUniqueUnityAnimationClipFileNames } from "../core/animation.ts";
+import { addAnimationTag, assertUniqueUnityAnimationClipFileNames, editingFrameContext, UNCLASSIFIED_NAME } from "../core/animation.ts";
 import { duplicateFrame, moveFrame } from "../core/timeline.ts";
-import type { AnimationDirection, Cel, Frame, Layer, PixelBuffer, RGBA, SpriteProject } from "../core/types.ts";
+import type { AnimationSetInput, Cel, Frame, Layer, PixelBuffer, RGBA, SpriteProject, SpriteSheetShape } from "../core/types.ts";
 import { celKey } from "../core/types.ts";
 import { validateDocument } from "../core/document.ts";
 import { indexedToRgba, quantizeToPalette } from "../core/palette.ts";
 import { decodePng } from "./png.ts";
 
-export type SpriteSheetRequest = {
+export type SpriteSheetRequest = SpriteSheetShape & {
   prompt: string;
-  frameCount: number;
-  columns: number;
-  cellWidth: number;
-  cellHeight: number;
   durationMs: number;
+  animationSet: AnimationSetInput;
   parentId?: string;
   referencePath?: string;
 };
@@ -30,16 +27,10 @@ export type FrameReferencePaths = {
   next?: string;
 };
 
-export type AppendAnimationRequest = {
-  name: string;
+export type AppendAnimationRequest = SpriteSheetShape & AnimationSetInput & {
   baseFrameId: string;
   targetLayerId: string;
-  direction: AnimationDirection;
   prompt: string;
-  frameCount: number;
-  columns: number;
-  cellWidth: number;
-  cellHeight: number;
   parentId?: string;
   referencePath?: string;
 };
@@ -65,24 +56,29 @@ function validateSheetShape(request: Pick<SpriteSheetRequest, "prompt" | "frameC
 
 function validate(request: SpriteSheetRequest): void {
   validateSheetShape(request);
+  validateAnimationSetInput(request.animationSet);
   if (!Number.isFinite(request.durationMs) || request.durationMs < 1) {
     throw new Error("프레임 시간은 1ms 이상이어야 합니다.");
+  }
+}
+
+function validateAnimationSetInput(input: AnimationSetInput): void {
+  if (!input || typeof input.name !== "string") throw new Error("애니메이션 세트 이름이 필요합니다.");
+  const name = input.name.trim();
+  if (!name) throw new Error("애니메이션 세트 이름이 필요합니다.");
+  if (name === UNCLASSIFIED_NAME) throw new Error("미분류는 예약 이름입니다.");
+  if (!(["forward", "reverse", "pingPong"] as const).includes(input.direction)) {
+    throw new Error("재생 방향이 올바르지 않습니다.");
   }
 }
 
 export function assertAppendAnimationRequest(project: SpriteProject, request: AppendAnimationRequest): void {
   validateDocument(project.document);
   validateSheetShape(request);
+  validateAnimationSetInput(request);
   const name = request.name.trim();
-  if (!name) throw new Error("애니메이션 태그 이름이 필요합니다.");
-  if (!(["forward", "reverse", "pingPong"] as const).includes(request.direction)) {
-    throw new Error("재생 방향이 올바르지 않습니다.");
-  }
-  if (project.document.tags.length === 0) {
-    throw new Error("먼저 타임라인에서 현재 전체 구간의 애니메이션 태그를 추가하세요.");
-  }
   if (project.document.tags.some((tag) => tag.name === name)) {
-    throw new Error("애니메이션 태그 이름은 비어 있지 않고 고유해야 합니다.");
+    throw new Error("애니메이션 세트 이름은 비어 있지 않고 고유해야 합니다.");
   }
   assertUniqueUnityAnimationClipFileNames([...project.document.tags, { name }]);
   if (!project.document.frames.some((frame) => frame.id === request.baseFrameId)) {
@@ -128,10 +124,7 @@ export function buildAppendAnimationPrompt(
   outputPath: string,
 ): string {
   validateSheetShape(request);
-  if (!request.name.trim()) throw new Error("애니메이션 태그 이름이 필요합니다.");
-  if (!(["forward", "reverse", "pingPong"] as const).includes(request.direction)) {
-    throw new Error("재생 방향이 올바르지 않습니다.");
-  }
+  validateAnimationSetInput(request);
   if (!baseReferencePath.trim()) throw new Error("기준 프레임 참조 경로가 필요합니다.");
   if (!outputPath.trim()) throw new Error("출력 파일 경로가 필요합니다.");
   const rows = Math.ceil(request.frameCount / request.columns);
@@ -162,29 +155,23 @@ export function buildFrameRegenerationPrompt(
   if (!outputPath.trim()) throw new Error("출력 파일 경로가 필요합니다.");
   if (!references.first.trim()) throw new Error("첫 프레임 참조 경로가 필요합니다.");
 
-  const { frames, tags } = project.document;
-  const frameIndex = frames.findIndex((frame) => frame.id === request.frameId);
-  if (frameIndex < 0) throw new Error("선택한 프레임을 찾을 수 없습니다.");
-
-  const tag = tags.find((candidate) => candidate.frameIds.includes(request.frameId));
-  const rangeFrameIds = tag?.frameIds ?? frames.map((frame) => frame.id);
-  const rangeIndex = rangeFrameIds.indexOf(request.frameId);
-  const progress = rangeFrameIds.length === 1 ? 100 : (rangeIndex / (rangeFrameIds.length - 1)) * 100;
+  const context = editingFrameContext(project.document, request.frameId);
+  const progress = context.total === 1 ? 100 : (context.index / (context.total - 1)) * 100;
   const anchorX = Math.floor(project.document.width / 2);
   const anchorY = project.document.height - Math.max(1, Math.round(project.document.height / 8));
 
   return [
     request.prompt.trim(),
     request.referencePath ? `캐릭터 외형과 팔레트는 다음 참조 이미지를 따르세요: ${request.referencePath}` : "",
-    `선택 프레임: ${frameIndex + 1}/${frames.length}`,
-    `애니메이션 태그: ${tag?.name ?? "전체 구간"}`,
-    `재생 방향: ${tag?.direction ?? "forward"}`,
+    `선택 프레임: ${context.position}/${context.total}`,
+    `애니메이션 세트: ${context.name}`,
+    `재생 방향: ${context.direction}`,
     `진행률: ${progress.toFixed(1)}%`,
     "원 프롬프트, 타임라인 위치와 역할별 참조를 함께 해석해 현재 동작 단계를 준비·타격·후속·복귀 중 하나로 먼저 판단하세요.",
     "첫 프레임 참조는 캐릭터 외형·팔레트·크기·카메라의 기준으로, 이전·다음 참조는 앞뒤 동작 연결의 기준으로 사용하고, 선택적 참조가 없는 경계에서는 존재하는 참조만 사용하세요.",
     `첫 프레임 참조: ${references.first}`,
-    references.previous?.trim() ? `이전 프레임 참조: ${references.previous}` : "",
-    references.next?.trim() ? `다음 프레임 참조: ${references.next}` : "",
+    context.previousFrameId && references.previous?.trim() ? `이전 프레임 참조: ${references.previous}` : "",
+    context.nextFrameId && references.next?.trim() ? `다음 프레임 참조: ${references.next}` : "",
     `정확한 캔버스 크기: ${project.document.width} × ${project.document.height} 픽셀. 투명 배경의 픽셀 아트 한 프레임만 만드세요.`,
     `지면 기준점과 하체 중심을 각 프레임의 x=${anchorX}, y=${anchorY} 픽셀에 고정하세요.`,
     `결과를 반드시 다음 경로에 저장하세요: ${outputPath}`,
@@ -311,6 +298,7 @@ export function importSpriteSheet(
   outputPath: string,
 ): SpriteProject {
   validate(request);
+  if (!outputPath.trim()) throw new Error("출력 파일 경로가 필요합니다.");
   const sheet = decodePng(png);
   const rows = Math.ceil(request.frameCount / request.columns);
   if (sheet.width !== request.columns * request.cellWidth || sheet.height !== rows * request.cellHeight) {
@@ -337,7 +325,7 @@ export function importSpriteSheet(
     cels[celKey(frame.id, layer.id)] = { id: crypto.randomUUID(), imageId, x: 0, y: 0, opacity: 1 };
   }
 
-  return {
+  const result: SpriteProject = {
     ...project,
     document: {
       width: request.cellWidth,
@@ -348,7 +336,12 @@ export function importSpriteSheet(
       cels,
       images,
       palette: project.document.palette,
-      tags: [],
+      tags: [{
+        id: crypto.randomUUID(),
+        name: request.animationSet.name.trim(),
+        direction: request.animationSet.direction,
+        frameIds: frames.map((frame) => frame.id),
+      }],
     },
     generationHistory: [...project.generationHistory, {
       id: crypto.randomUUID(),
@@ -359,6 +352,8 @@ export function importSpriteSheet(
     }],
     exportSettings: { ...project.exportSettings, columns: request.columns },
   };
+  validateDocument(result.document);
+  return result;
 }
 
 export function appendAnimationSheet(
@@ -409,7 +404,7 @@ export function appendAnimationSheet(
     frameIds: [baseCloneId, ...document.frames.slice(-request.frameCount).map((frame) => frame.id)],
     direction: request.direction,
   });
-  return {
+  const result: SpriteProject = {
     ...project,
     document,
     generationHistory: [...project.generationHistory, {
@@ -420,6 +415,8 @@ export function appendAnimationSheet(
       parentId: request.parentId,
     }],
   };
+  validateDocument(result.document);
+  return result;
 }
 
 export function importRegeneratedFrame(

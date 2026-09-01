@@ -24,6 +24,7 @@ const request: SpriteSheetRequest = {
   cellWidth: 1,
   cellHeight: 1,
   durationMs: 80,
+  animationSet: { name: "walk", direction: "forward" },
 };
 
 function setPixel(pixels: Uint8ClampedArray, width: number, x: number, y: number): void {
@@ -187,9 +188,10 @@ test("추가 애니메이션 사전 검증은 Codex 전에 잘못된 프로젝�
   delete missingCel.document.cels[celKey(valid.baseFrameId, valid.targetLayerId)];
   assert.throws(() => assertAppendAnimationRequest(missingCel, valid), /대상 레이어 셀/);
 
-  const noTag = structuredClone(project);
-  noTag.document.tags = [];
-  assert.throws(() => assertAppendAnimationRequest(noTag, valid), /먼저 타임라인/);
+  const withoutSet = structuredClone(project);
+  withoutSet.document.tags = [];
+  assert.doesNotThrow(() => assertAppendAnimationRequest(withoutSet, valid));
+  assert.throws(() => assertAppendAnimationRequest(project, { ...valid, name: "미분류" }), /예약 이름/);
 
   for (const patch of [
     { visible: false },
@@ -339,7 +341,7 @@ test("선택 프레임 프롬프트는 태그 진행률과 역할별 참조를 �
   }, "C:/project/generated/job/frame.png");
 
   assert.match(prompt, /선택 프레임: 3\/4/);
-  assert.match(prompt, /애니메이션 태그: attack/);
+  assert.match(prompt, /애니메이션 세트: attack/);
   assert.match(prompt, /재생 방향: reverse/);
   assert.match(prompt, /진행률: 66\.7%/);
   assert.match(prompt, /준비·타격·후속·복귀/);
@@ -449,10 +451,20 @@ test("잘못된 생성 요청을 거부한다", () => {
     () => buildSpriteSheetPrompt({ ...request, prompt: " " }, "sheet.png"),
     /프롬프트/,
   );
+  assert.throws(
+    () => buildSpriteSheetPrompt({ ...request, animationSet: { ...request.animationSet, name: "미분류" } }, "sheet.png"),
+    /예약 이름/,
+  );
 });
 
 test("스프라이트 시트를 프레임과 생성 이력으로 가져온다", () => {
   const project = createProject("기사", createDocument({ width: 4, height: 4 }));
+  project.document.tags.push({
+    id: "old",
+    name: "old",
+    direction: "reverse",
+    frameIds: [project.document.frames[0].id],
+  });
   const pixels = new Uint8ClampedArray([
     255, 0, 0, 255,
     0, 255, 0, 255,
@@ -465,6 +477,15 @@ test("스프라이트 시트를 프레임과 생성 이력으로 가져온다", 
   assert.equal(imported.document.width, 1);
   assert.equal(imported.document.height, 1);
   assert.equal(imported.document.frames.length, 3);
+  assert.deepEqual(imported.document.tags.map((tag) => ({
+    name: tag.name,
+    direction: tag.direction,
+    frameIds: tag.frameIds,
+  })), [{
+    name: "walk",
+    direction: "forward",
+    frameIds: imported.document.frames.map((frame) => frame.id),
+  }]);
   assert.deepEqual(imported.document.frames.map((frame) => frame.durationMs), [80, 80, 80]);
   assert.deepEqual(
     imported.document.frames.map((frame) => {
@@ -532,10 +553,36 @@ test("기준점 정렬은 경계 픽셀과 빈 프레임을 보존한다", () =>
 
 test("시트 크기가 격자와 다르면 가져오기를 거부한다", () => {
   const project = createProject("기사", createDocument({ width: 1, height: 1 }));
+  const before = structuredClone(project);
   assert.throws(
     () => importSpriteSheet(project, encodePng(1, 1, new Uint8ClampedArray(4)), request, "sheet.png"),
     /시트 크기/,
   );
+  assert.deepEqual(project, before);
+});
+
+test("재생성 프롬프트는 교차 저장 순서에서도 같은 세트의 편집 순서만 사용한다", () => {
+  let document = createDocument({ width: 1, height: 1 });
+  for (let index = 0; index < 3; index += 1) document = addFrame(document);
+  const [idle0, walk0, idle1, walk1] = document.frames.map((frame) => frame.id);
+  document.tags = [
+    { id: "idle", name: "idle", direction: "forward", frameIds: [idle0, idle1] },
+    { id: "walk", name: "walk", direction: "reverse", frameIds: [walk0, walk1] },
+  ];
+  const project = createProject("기사", document);
+  const prompt = buildFrameRegenerationPrompt(project, {
+    prompt: "걷기",
+    frameId: walk0,
+  }, {
+    first: "walk-first.png",
+    previous: "physical-idle.png",
+    next: "walk-next.png",
+  }, "frame.png");
+
+  assert.match(prompt, /선택 프레임: 1\/2/);
+  assert.match(prompt, /애니메이션 세트: walk/);
+  assert.match(prompt, /다음 프레임 참조.*walk-next\.png/);
+  assert.doesNotMatch(prompt, /이전 프레임 참조/);
 });
 
 test("재생성은 선택 프레임 픽셀만 교체하고 나머지 프로젝트 상태를 보존한다", () => {
