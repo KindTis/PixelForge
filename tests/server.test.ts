@@ -126,8 +126,7 @@ function threeFrameProject() {
   document.tags.push({
     id: crypto.randomUUID(),
     name: "공격",
-    fromFrameId: document.frames[0].id,
-    toFrameId: document.frames[2].id,
+    frameIds: document.frames.map((frame) => frame.id),
     direction: "forward",
   });
   const project = makeProject("기사", document);

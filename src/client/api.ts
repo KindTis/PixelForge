@@ -219,13 +219,11 @@ export function completedGenerationSelection(
     if (!project) throw new Error("완료된 생성 결과가 없습니다.");
     const tag = project.document.tags.find((candidate) => candidate.name === target.appendAnimation.name.trim());
     if (!tag) throw new Error("완료 결과에서 추가된 애니메이션 태그를 찾을 수 없습니다.");
-    const firstId = frameSequence(tag, project.document.frames)[0];
-    const from = project.document.frames.findIndex((frame) => frame.id === tag.fromFrameId);
-    const to = project.document.frames.findIndex((frame) => frame.id === tag.toFrameId);
+    const firstId = frameSequence(tag)[0];
     return {
       frameIndex: project.document.frames.findIndex((frame) => frame.id === firstId),
       tag,
-      frameCount: to - from + 1,
+      frameCount: tag.frameIds.length,
     };
   }
   const requestedFrameId = target?.frameId;

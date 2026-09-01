@@ -157,8 +157,7 @@ test("태그 선택은 aria-pressed와 재생 첫 프레임을 갱신하고 삭�
   document.tags.push({
     id: tagId,
     name: "attack",
-    fromFrameId: document.frames[0].id,
-    toFrameId: document.frames[1].id,
+    frameIds: document.frames.map((frame) => frame.id),
     direction: "reverse",
   });
   const project = createProject("기사", document);

@@ -50,18 +50,15 @@ export function buildCommon(document: SpriteDocument, options: SheetOptions): Co
   }
 
   const filenames = document.frames.map((frame, index) => {
-    const tag = document.tags.find((candidate) => {
-      const from = document.frames.findIndex((item) => item.id === candidate.fromFrameId);
-      const to = document.frames.findIndex((item) => item.id === candidate.toFrameId);
-      return index >= from && index <= to;
-    });
+    const tag = document.tags.find((candidate) => candidate.frameIds.includes(frame.id));
     return `${safeName(tag?.name ?? "default")}_${String(index).padStart(3, "0")}`;
   });
   const animations: CommonMetadata["animations"] = {};
   if (document.tags.length) for (const tag of document.tags) {
-    const from = document.frames.findIndex((frame) => frame.id === tag.fromFrameId);
-    const to = document.frames.findIndex((frame) => frame.id === tag.toFrameId);
-    animations[tag.name] = { frames: filenames.slice(from, to + 1), direction: tag.direction };
+    animations[tag.name] = {
+      frames: tag.frameIds.map((frameId) => filenames[document.frames.findIndex((frame) => frame.id === frameId)]),
+      direction: tag.direction,
+    };
   } else animations.default = { frames: filenames, direction: "forward" };
 
   const metadata: CommonMetadata = {

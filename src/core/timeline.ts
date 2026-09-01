@@ -56,11 +56,7 @@ export function deleteFrame(document: SpriteDocument, id: string): SpriteDocumen
   const index = frameIndex(next, id);
   next.frames.splice(index, 1);
   for (const layer of next.layers) delete next.cels[celKey(id, layer.id)];
-  const replacement = next.frames[Math.min(index, next.frames.length - 1)].id;
-  for (const tag of next.tags) {
-    if (tag.fromFrameId === id) tag.fromFrameId = replacement;
-    if (tag.toFrameId === id) tag.toFrameId = replacement;
-  }
+  for (const tag of next.tags) tag.frameIds = tag.frameIds.filter((frameId) => frameId !== id);
   cleanImages(next);
   validateDocument(next);
   return next;
@@ -145,14 +141,6 @@ export function unlinkCel(document: SpriteDocument, frameId: string, layerId: st
   const source = next.images[cel.imageId];
   next.images[imageId] = { ...source, data: new Uint8ClampedArray(source.data) };
   next.cels[key].imageId = imageId;
-  return next;
-}
-
-export function addTag(document: SpriteDocument, input: Omit<AnimationTag, "id">): SpriteDocument {
-  if (!input.name.trim() || document.tags.some((tag) => tag.name === input.name.trim())) throw new Error("태그 이름은 비어 있지 않고 고유해야 합니다.");
-  const next = copy(document);
-  next.tags.push({ ...input, id: crypto.randomUUID(), name: input.name.trim() });
-  validateDocument(next);
   return next;
 }
 

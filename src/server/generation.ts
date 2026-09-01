@@ -1,5 +1,5 @@
-import { assertUniqueUnityAnimationClipFileNames } from "../core/animation.ts";
-import { addTag, duplicateFrame, moveFrame } from "../core/timeline.ts";
+import { addAnimationTag, assertUniqueUnityAnimationClipFileNames } from "../core/animation.ts";
+import { duplicateFrame, moveFrame } from "../core/timeline.ts";
 import type { AnimationDirection, Cel, Frame, Layer, PixelBuffer, RGBA, SpriteProject } from "../core/types.ts";
 import { celKey } from "../core/types.ts";
 import { validateDocument } from "../core/document.ts";
@@ -166,19 +166,10 @@ export function buildFrameRegenerationPrompt(
   const frameIndex = frames.findIndex((frame) => frame.id === request.frameId);
   if (frameIndex < 0) throw new Error("선택한 프레임을 찾을 수 없습니다.");
 
-  const containingTags = tags.filter((tag) => {
-    const from = frames.findIndex((frame) => frame.id === tag.fromFrameId);
-    const to = frames.findIndex((frame) => frame.id === tag.toFrameId);
-    return from >= 0 && to >= from && frameIndex >= from && frameIndex <= to;
-  });
-  const tag = containingTags.sort((left, right) => {
-    const leftSpan = frames.findIndex((frame) => frame.id === left.toFrameId) - frames.findIndex((frame) => frame.id === left.fromFrameId);
-    const rightSpan = frames.findIndex((frame) => frame.id === right.toFrameId) - frames.findIndex((frame) => frame.id === right.fromFrameId);
-    return leftSpan - rightSpan;
-  })[0];
-  const rangeStart = tag ? frames.findIndex((frame) => frame.id === tag.fromFrameId) : 0;
-  const rangeEnd = tag ? frames.findIndex((frame) => frame.id === tag.toFrameId) : frames.length - 1;
-  const progress = rangeStart === rangeEnd ? 100 : ((frameIndex - rangeStart) / (rangeEnd - rangeStart)) * 100;
+  const tag = tags.find((candidate) => candidate.frameIds.includes(request.frameId));
+  const rangeFrameIds = tag?.frameIds ?? frames.map((frame) => frame.id);
+  const rangeIndex = rangeFrameIds.indexOf(request.frameId);
+  const progress = rangeFrameIds.length === 1 ? 100 : (rangeIndex / (rangeFrameIds.length - 1)) * 100;
   const anchorX = Math.floor(project.document.width / 2);
   const anchorY = project.document.height - Math.max(1, Math.round(project.document.height / 8));
 
@@ -413,10 +404,9 @@ export function appendAnimationSheet(
     }
   }
 
-  document = addTag(document, {
+  document = addAnimationTag(document, {
     name: request.name,
-    fromFrameId: baseCloneId,
-    toFrameId: document.frames.at(-1)!.id,
+    frameIds: [baseCloneId, ...document.frames.slice(-request.frameCount).map((frame) => frame.id)],
     direction: request.direction,
   });
   return {

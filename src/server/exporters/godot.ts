@@ -12,8 +12,7 @@ export async function exportGodot(document: SpriteDocument, options: SheetOption
   const tags: AnimationTag[] = document.tags.length ? document.tags : [{
     id: "default",
     name: "default",
-    fromFrameId: document.frames[0].id,
-    toFrameId: document.frames.at(-1)!.id,
+    frameIds: document.frames.map((frame) => frame.id),
     direction: "forward",
   }];
 
@@ -24,7 +23,7 @@ export async function exportGodot(document: SpriteDocument, options: SheetOption
     `margin = Rect2(${frame.spriteSourceSize.x}, ${frame.spriteSourceSize.y}, ${frame.sourceSize.w - frame.spriteSourceSize.w}, ${frame.sourceSize.h - frame.spriteSourceSize.h})`,
   ].join("\n")).join("\n\n");
   const animations = tags.map((tag) => {
-    const frames = frameSequence(tag, document.frames).map((frameId) => {
+    const frames = frameSequence(tag).map((frameId) => {
       const frame = document.frames.find((candidate) => candidate.id === frameId)!;
       return `{
 "duration": ${frame.durationMs / 1000},

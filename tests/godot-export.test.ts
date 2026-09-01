@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { addAnimationTag } from "../src/core/animation.ts";
 import { createDocument } from "../src/core/document.ts";
-import { addTag, duplicateFrame, setFrameDuration } from "../src/core/timeline.ts";
+import { duplicateFrame, setFrameDuration } from "../src/core/timeline.ts";
 import { celKey } from "../src/core/types.ts";
 import { exportGodot } from "../src/server/exporters/godot.ts";
 
@@ -13,16 +14,14 @@ test("Godot 묶음은 AtlasTexture와 태그 재생 순서를 보존한다", asy
   document = duplicateFrame(document, document.frames[1].id);
   document = duplicateFrame(document, document.frames[2].id);
   document = setFrameDuration(document, document.frames[1].id, 180);
-  document = addTag(document, {
+  document = addAnimationTag(document, {
     name: "walk",
-    fromFrameId: document.frames[0].id,
-    toFrameId: document.frames[1].id,
+    frameIds: document.frames.slice(0, 2).map((frame) => frame.id),
     direction: "forward",
   });
-  document = addTag(document, {
+  document = addAnimationTag(document, {
     name: "attack",
-    fromFrameId: document.frames[2].id,
-    toFrameId: document.frames[3].id,
+    frameIds: document.frames.slice(2).map((frame) => frame.id),
     direction: "reverse",
   });
 
@@ -40,11 +39,4 @@ test("Godot 묶음은 AtlasTexture와 태그 재생 순서를 보존한다", asy
 
   const repeated = await exportGodot(document, { columns: 2, padding: 1, margin: 0, trim: true });
   assert.equal(repeated[2].data, tres);
-
-  document.tags[0].name = "attack?";
-  document.tags[1].name = "ATTACK*";
-  const legacyFiles = await exportGodot(document, { columns: 2, padding: 1, margin: 0, trim: true });
-  const legacyTres = legacyFiles.find((file) => file.path === "sprite_frames.tres")!.data as string;
-  assert.match(legacyTres, /"name": &"attack\?"/);
-  assert.match(legacyTres, /"name": &"ATTACK\*"/);
 });

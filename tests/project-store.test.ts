@@ -75,7 +75,7 @@ test("선택 프레임 재생성 결과를 저장 왕복해 전체 프로젝트�
     document = addFrame(addFrame(document));
     document = addLayer(document, "효과");
     for (const [index, cel] of Object.values(document.cels).entries()) document.images[cel.imageId].data.fill(index + 1);
-    document.tags.push({ id: crypto.randomUUID(), name: "공격", fromFrameId: document.frames[0].id, toFrameId: document.frames[2].id, direction: "pingPong" });
+    document.tags.push({ id: crypto.randomUUID(), name: "공격", frameIds: document.frames.map((frame) => frame.id), direction: "pingPong" });
     const project = makeProject("기사", document);
     project.generationHistory.push({ id: crypto.randomUUID(), prompt: "기존 생성", createdAt: "2026-08-09T00:00:00.000Z", outputPath: "old.png" });
     const selectedFrame = project.document.frames[1];

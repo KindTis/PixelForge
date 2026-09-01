@@ -62,8 +62,7 @@ function appendedProject(direction: AnimationDirection) {
   document.tags.push({
     id: crypto.randomUUID(),
     name: "attack",
-    fromFrameId: document.frames[0].id,
-    toFrameId: document.frames[3].id,
+    frameIds: document.frames.map((frame) => frame.id),
     direction,
   });
   return createProject("기사", document);
@@ -82,7 +81,7 @@ test("추가 완료 선택은 방향별 첫 재생 프레임과 물리 프레임
     };
     const selection = completedGenerationSelection(project, target);
     const tag = project.document.tags.find((candidate) => candidate.name === "attack")!;
-    const firstFrameId = direction === "reverse" ? tag.toFrameId : tag.fromFrameId;
+    const firstFrameId = direction === "reverse" ? tag.frameIds.at(-1)! : tag.frameIds[0];
     assert.deepEqual(selection, {
       frameIndex: project.document.frames.findIndex((frame) => frame.id === firstFrameId),
       tag,
@@ -98,8 +97,7 @@ test("추가 애니메이션 사전 안내는 태그와 활성 레이어 문제�
   project.document.tags.push({
     id: "walk",
     name: "walk",
-    fromFrameId: project.document.frames[0].id,
-    toFrameId: project.document.frames[0].id,
+    frameIds: [project.document.frames[0].id],
     direction: "forward",
   });
   assert.match(appendAnimationIssue(project, "검 공격", "walk", layer, true) ?? "", /고유/);

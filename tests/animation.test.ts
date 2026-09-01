@@ -6,27 +6,16 @@ import {
   frameSequence,
   unityAnimationClipFileName,
 } from "../src/core/animation.ts";
-import type { AnimationTag, Frame } from "../src/core/types.ts";
-
-const frames: Frame[] = ["a", "b", "c"].map((id) => ({ id, durationMs: 100 }));
+import type { AnimationTag } from "../src/core/types.ts";
 
 function tag(direction: AnimationTag["direction"]): AnimationTag {
-  return { id: "tag", name: "공격", fromFrameId: "a", toFrameId: "c", direction };
+  return { id: "tag", name: "공격", frameIds: ["a", "c", "b"], direction };
 }
 
-test("핑퐁 태그는 양 끝 프레임을 중복하지 않는다", () => {
-  assert.deepEqual(frameSequence(tag("pingPong"), frames), ["a", "b", "c", "b"]);
-});
-
-test("역방향 태그는 끝에서 시작까지 재생한다", () => {
-  assert.deepEqual(frameSequence(tag("reverse"), frames), ["c", "b", "a"]);
-});
-
-test("존재하지 않는 태그 구간은 거부한다", () => {
-  assert.throws(
-    () => frameSequence({ ...tag("forward"), toFrameId: "missing" }, frames),
-    /태그 프레임/,
-  );
+test("프레임 시퀀스는 저장된 명시 순서를 사용한다", () => {
+  assert.deepEqual(frameSequence(tag("forward")), ["a", "c", "b"]);
+  assert.deepEqual(frameSequence(tag("reverse")), ["b", "c", "a"]);
+  assert.deepEqual(frameSequence(tag("pingPong")), ["a", "c", "b", "c"]);
 });
 
 test("Unity AnimationClip 파일명은 importer 규칙으로 정규화하고 대소문자 없이 충돌한다", () => {

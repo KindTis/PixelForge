@@ -35,8 +35,7 @@ export type AnimationDirection = "forward" | "reverse" | "pingPong";
 export type AnimationTag = {
   id: string;
   name: string;
-  fromFrameId: string;
-  toFrameId: string;
+  frameIds: string[];
   direction: AnimationDirection;
 };
 

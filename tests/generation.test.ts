@@ -72,8 +72,7 @@ function projectWithThreeFramesAndTwoLayers() {
   document.tags.push({
     id: crypto.randomUUID(),
     name: "공격",
-    fromFrameId: document.frames[0].id,
-    toFrameId: document.frames[2].id,
+    frameIds: document.frames.map((frame) => frame.id),
     direction: "forward",
   });
   const project = createProject("기사", document);
@@ -87,8 +86,7 @@ function taggedProject() {
   document.tags.push({
     id: crypto.randomUUID(),
     name: "walk",
-    fromFrameId: document.frames[0].id,
-    toFrameId: document.frames[1].id,
+    frameIds: document.frames.map((frame) => frame.id),
     direction: "forward",
   });
   return createProject("기사", document);
@@ -119,8 +117,7 @@ function fiveFrameWalkProject() {
   document.tags.push({
     id: crypto.randomUUID(),
     name: "walk",
-    fromFrameId: document.frames[0].id,
-    toFrameId: document.frames[4].id,
+    frameIds: document.frames.map((frame) => frame.id),
     direction: "forward",
   });
   const project = createProject("기사", document);
@@ -268,13 +265,11 @@ test("추가 시트는 기존 상태를 보존하고 기준 연결 복제본과 
   const attack = after.document.tags.at(-1)!;
   assert.deepEqual({
     name: attack.name,
-    from: attack.fromFrameId,
-    to: attack.toFrameId,
+    frameIds: attack.frameIds,
     direction: attack.direction,
   }, {
     name: "attack",
-    from: clone.id,
-    to: after.document.frames[8].id,
+    frameIds: [clone.id, ...after.document.frames.slice(6).map((frame) => frame.id)],
     direction: "forward",
   });
   assert.equal(after.generationHistory.at(-1)?.outputPath, "generated/animation.png");
@@ -330,8 +325,7 @@ test("선택 프레임 프롬프트는 태그 진행률과 역할별 참조를 �
   document.tags.push({
     id: crypto.randomUUID(),
     name: "attack",
-    fromFrameId: document.frames[0].id,
-    toFrameId: document.frames[3].id,
+    frameIds: document.frames.slice(0, 4).map((frame) => frame.id),
     direction: "reverse",
   });
   const project = createProject("기사", document);
@@ -367,8 +361,7 @@ test("선택 프레임 진행률은 부분 태그 구간 안에서 계산한다"
   document.tags.push({
     id: crypto.randomUUID(),
     name: "attack",
-    fromFrameId: document.frames[1].id,
-    toFrameId: document.frames[3].id,
+    frameIds: document.frames.slice(1, 4).map((frame) => frame.id),
     direction: "forward",
   });
   const project = createProject("기사", document);
@@ -381,8 +374,7 @@ test("선택 프레임 진행률은 부분 태그 구간 안에서 계산한다"
 
   assert.match(promptFor(document.frames[1].id), /진행률: 0\.0%/);
   assert.match(promptFor(document.frames[3].id), /진행률: 100\.0%/);
-  document.tags[0].fromFrameId = document.frames[2].id;
-  document.tags[0].toFrameId = document.frames[2].id;
+  document.tags[0].frameIds = [document.frames[2].id];
   assert.match(promptFor(document.frames[2].id), /진행률: 100\.0%/);
 });
 

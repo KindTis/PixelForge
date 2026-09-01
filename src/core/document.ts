@@ -4,6 +4,7 @@ import {
   type SpriteDocument,
   type SpriteProject,
 } from "./types.ts";
+import { validateAnimationTags } from "./animation.ts";
 
 function id(): string {
   return crypto.randomUUID();
@@ -101,12 +102,5 @@ export function validateDocument(document: SpriteDocument): void {
     }
   }
 
-  for (const tag of document.tags) {
-    if (!frameIds.has(tag.fromFrameId) || !frameIds.has(tag.toFrameId)) {
-      throw new Error("태그 프레임이 존재하지 않습니다.");
-    }
-    if (document.frames.findIndex((frame) => frame.id === tag.fromFrameId) > document.frames.findIndex((frame) => frame.id === tag.toFrameId)) {
-      throw new Error("태그 프레임 구간이 역전되었습니다.");
-    }
-  }
+  validateAnimationTags(document);
 }

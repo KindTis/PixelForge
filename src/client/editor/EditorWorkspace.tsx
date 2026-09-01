@@ -1,6 +1,6 @@
 import { forwardRef, useEffect, useImperativeHandle, useRef, useState, type PointerEvent as ReactPointerEvent, type ReactNode, type WheelEvent } from "react";
 import type { AiEditReadyResult, AiEditRequest, AiEditTarget } from "../../core/ai-edit.ts";
-import { frameSequence } from "../../core/animation.ts";
+import { addAnimationTag, frameSequence } from "../../core/animation.ts";
 import { applyCommand, History, type EditCommand, type PixelChange } from "../../core/commands.ts";
 import { compositeFrame } from "../../core/render.ts";
 import { convertDocumentToIndexed, indexedToRgba, nearestPaletteColor, quantizeToPalette, replaceColor, sameColor } from "../../core/palette.ts";
@@ -9,7 +9,6 @@ import { extractSelection, flipSelection, moveSelection, pasteSelection, rectang
 import {
   addFrame,
   addLayer,
-  addTag,
   deleteFrame,
   deleteLayer,
   deleteTag,
@@ -150,7 +149,7 @@ export const EditorWorkspace = forwardRef<EditorWorkspaceHandle, {
   const image = cel ? project.document.images[cel.imageId] : undefined;
   const selectedTag = project.document.tags.find((tag) => tag.id === selectedAnimationTagId);
   const playbackFrames = selectedTag
-    ? frameSequence(selectedTag, project.document.frames)
+    ? frameSequence(selectedTag)
     : project.document.frames.map((item) => item.id);
   const activeCelLinked = Boolean(cel && Object.values(project.document.cels).some((candidate) =>
     candidate.id !== cel.id && candidate.imageId === cel.imageId));
@@ -366,7 +365,7 @@ export const EditorWorkspace = forwardRef<EditorWorkspaceHandle, {
     setPlaying(false);
     onSelectedAnimationTagId(tagId);
     const tag = project.document.tags.find((candidate) => candidate.id === tagId);
-    const firstId = tag ? frameSequence(tag, project.document.frames)[0] : project.document.frames[0].id;
+    const firstId = tag ? frameSequence(tag)[0] : project.document.frames[0].id;
     playbackCursor.current = 0;
     onFrameIndex(project.document.frames.findIndex((candidate) => candidate.id === firstId));
   };
@@ -559,9 +558,13 @@ export const EditorWorkspace = forwardRef<EditorWorkspaceHandle, {
     return next;
   });
 
-  const addAnimationTag = () => {
+  const createAnimationTag = () => {
     if (readOnly || !tagName.trim()) return;
-    replace((document) => addTag(document, { name: tagName, fromFrameId: document.frames[0].id, toFrameId: document.frames.at(-1)!.id, direction: tagDirection }));
+    replace((document) => addAnimationTag(document, {
+      name: tagName,
+      frameIds: document.frames.map((frame) => frame.id),
+      direction: tagDirection,
+    }));
     setTagName("");
   };
 
@@ -694,7 +697,7 @@ export const EditorWorkspace = forwardRef<EditorWorkspaceHandle, {
         <button className="frame-label" type="button" disabled={readOnly} onClick={() => { setPlaying(false); onFrameIndex(index); }}>F{String(index + 1).padStart(2, "0")}</button><input aria-label={`${index + 1}번 프레임 시간`} disabled={readOnly} type="number" min="1" max="60000" value={item.durationMs} onChange={(event) => replace((document) => setFrameDuration(document, item.id, Number(event.target.value)))} />
         <i><button type="button" disabled={readOnly} aria-label="프레임 왼쪽 이동" onClick={() => reorderFrame(item.id, index - 1)}>←</button><button type="button" disabled={readOnly} aria-label="프레임 오른쪽 이동" onClick={() => reorderFrame(item.id, index + 1)}>→</button></i>
       </div>)}</div>
-      <div className="tag-editor"><span>태그</span><input aria-label="태그 이름" disabled={readOnly} placeholder="예: attack" value={tagName} onChange={(event) => setTagName(event.target.value)} /><select aria-label="태그 재생 방향" disabled={readOnly} value={tagDirection} onChange={(event) => setTagDirection(event.target.value as typeof tagDirection)}><option value="forward">정방향</option><option value="reverse">역방향</option><option value="pingPong">핑퐁</option></select><button type="button" disabled={readOnly} onClick={addAnimationTag}>전체 구간 추가</button><button type="button" aria-pressed={selectedAnimationTagId === undefined} disabled={readOnly} onClick={() => selectPlaybackRange(undefined)}>전체</button>{project.document.tags.map((tag) => <span className="tag-chip" key={tag.id}><button type="button" aria-pressed={selectedAnimationTagId === tag.id} disabled={readOnly} onClick={() => selectPlaybackRange(tag.id)}>{tag.name}</button><button type="button" disabled={readOnly} aria-label={`${tag.name} 애니메이션 태그 삭제`} onClick={() => removeAnimationTag(tag.id)}>×</button></span>)}</div>
+      <div className="tag-editor"><span>태그</span><input aria-label="태그 이름" disabled={readOnly} placeholder="예: attack" value={tagName} onChange={(event) => setTagName(event.target.value)} /><select aria-label="태그 재생 방향" disabled={readOnly} value={tagDirection} onChange={(event) => setTagDirection(event.target.value as typeof tagDirection)}><option value="forward">정방향</option><option value="reverse">역방향</option><option value="pingPong">핑퐁</option></select><button type="button" disabled={readOnly} onClick={createAnimationTag}>전체 구간 추가</button><button type="button" aria-pressed={selectedAnimationTagId === undefined} disabled={readOnly} onClick={() => selectPlaybackRange(undefined)}>전체</button>{project.document.tags.map((tag) => <span className="tag-chip" key={tag.id}><button type="button" aria-pressed={selectedAnimationTagId === tag.id} disabled={readOnly} onClick={() => selectPlaybackRange(tag.id)}>{tag.name}</button><button type="button" disabled={readOnly} aria-label={`${tag.name} 애니메이션 태그 삭제`} onClick={() => removeAnimationTag(tag.id)}>×</button></span>)}</div>
     </section>
     {resizeOpen && <ResizeDialog initialWidth={project.document.width} initialHeight={project.document.height} onClose={() => setResizeOpen(false)} onApply={applyResize} />}
   </>;

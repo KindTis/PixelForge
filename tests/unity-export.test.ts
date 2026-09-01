@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { addAnimationTag } from "../src/core/animation.ts";
 import { createDocument } from "../src/core/document.ts";
-import { addTag, duplicateFrame } from "../src/core/timeline.ts";
+import { duplicateFrame } from "../src/core/timeline.ts";
 import { celKey } from "../src/core/types.ts";
 import { exportUnity } from "../src/server/exporters/unity.ts";
 
@@ -13,16 +14,14 @@ test("Unity 묶음은 스프라이트 분할과 AnimationClip 생성 정보를 �
   document.frames[1].durationMs = 140;
   document = duplicateFrame(document, document.frames[1].id);
   document = duplicateFrame(document, document.frames[2].id);
-  document = addTag(document, {
+  document = addAnimationTag(document, {
     name: "walk",
-    fromFrameId: document.frames[0].id,
-    toFrameId: document.frames[1].id,
+    frameIds: document.frames.slice(0, 2).map((frame) => frame.id),
     direction: "forward",
   });
-  document = addTag(document, {
+  document = addAnimationTag(document, {
     name: "attack",
-    fromFrameId: document.frames[2].id,
-    toFrameId: document.frames[3].id,
+    frameIds: document.frames.slice(2).map((frame) => frame.id),
     direction: "reverse",
   });
 
@@ -75,18 +74,10 @@ test("Unity 묶음은 스프라이트 분할과 AnimationClip 생성 정보를 �
 test("Unity 내보내기는 충돌한 AnimationClip 파일명을 파일 생성 전에 거부한다", async () => {
   let document = createDocument({ width: 1, height: 1 });
   document = duplicateFrame(document, document.frames[0].id);
-  document = addTag(document, {
-    name: "attack?",
-    fromFrameId: document.frames[0].id,
-    toFrameId: document.frames[0].id,
-    direction: "forward",
-  });
-  document = addTag(document, {
-    name: "ATTACK*",
-    fromFrameId: document.frames[1].id,
-    toFrameId: document.frames[1].id,
-    direction: "forward",
-  });
+  document.tags = [
+    { id: "attack-a", name: "attack?", frameIds: [document.frames[0].id], direction: "forward" },
+    { id: "attack-b", name: "ATTACK*", frameIds: [document.frames[1].id], direction: "forward" },
+  ];
 
   await assert.rejects(
     exportUnity(document, {
