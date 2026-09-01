@@ -2,6 +2,69 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { CanvasRenderer } from "../src/client/editor/CanvasRenderer.ts";
 import { createDocument } from "../src/core/document.ts";
+import { addFrame } from "../src/core/timeline.ts";
+import { celKey } from "../src/core/types.ts";
+
+test("어니언 스킨은 전역 이웃 대신 지정한 같은 그룹 이웃만 그린다", () => {
+  let sprite = createDocument({ width: 1, height: 1 });
+  for (let index = 0; index < 3; index += 1) sprite = addFrame(sprite);
+  const [sameGroupPreviousId, otherPreviousId, currentId, otherNextId] = sprite.frames.map((frame) => frame.id);
+  const layerId = sprite.layers[0].id;
+  const colors = new Map([
+    [sameGroupPreviousId, [1, 0, 0, 255]],
+    [otherPreviousId, [2, 0, 0, 255]],
+    [currentId, [3, 0, 0, 255]],
+    [otherNextId, [4, 0, 0, 255]],
+  ]);
+  for (const [frameId, color] of colors) {
+    const imageId = sprite.cels[celKey(frameId, layerId)].imageId;
+    sprite.images[imageId].data.set(color);
+  }
+  sprite.tags = [{ id: "active", name: "active", direction: "forward", frameIds: [sameGroupPreviousId, currentId] }];
+
+  const drawn: number[][] = [];
+  const context = {
+    setTransform() {}, clearRect() {}, fillRect() {}, putImageData() {}, strokeRect() {}, setLineDash() {},
+    drawImage(source: { pixel?: number[] }) { drawn.push(source.pixel ?? []); },
+  } as unknown as CanvasRenderingContext2D;
+  const canvas = { width: 20, height: 20, clientWidth: 20, clientHeight: 20, getContext: () => context } as unknown as HTMLCanvasElement;
+  const previousWindow = globalThis.window;
+  const previousDocument = globalThis.document;
+  const previousImageData = globalThis.ImageData;
+  Object.assign(globalThis, {
+    window: { devicePixelRatio: 1 },
+    document: { createElement: () => {
+      const source: { width: number; height: number; pixel?: number[]; getContext(): unknown } = {
+        width: 0,
+        height: 0,
+        getContext: () => ({
+          putImageData: (image: { data: Uint8ClampedArray }) => { source.pixel = Array.from(image.data); },
+          fillRect() {},
+        }),
+      };
+      return source;
+    } },
+    ImageData: class { constructor(readonly data: Uint8ClampedArray) {} },
+  });
+
+  try {
+    new CanvasRenderer(canvas).render(sprite, {
+      frameId: currentId,
+      onionPreviousFrameId: sameGroupPreviousId,
+      onionNextFrameId: undefined,
+      zoom: 1,
+      panX: 0,
+      panY: 0,
+      showGrid: false,
+      onionSkin: true,
+      tilePreview: false,
+    });
+
+    assert.deepEqual(drawn, [[1, 0, 0, 255], [3, 0, 0, 255]]);
+  } finally {
+    Object.assign(globalThis, { window: previousWindow, document: previousDocument, ImageData: previousImageData });
+  }
+});
 
 test("문서 밖은 작업 영역 배경으로 가리고 문서 경계를 그린다", () => {
   const fillRects: number[][] = [];

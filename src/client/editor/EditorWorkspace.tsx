@@ -1,6 +1,6 @@
 import { forwardRef, useEffect, useImperativeHandle, useRef, useState, type PointerEvent as ReactPointerEvent, type ReactNode, type WheelEvent } from "react";
 import type { AiEditReadyResult, AiEditRequest, AiEditTarget } from "../../core/ai-edit.ts";
-import { frameSequence, reconcileAnimationSelection, type AnimationSelection } from "../../core/animation.ts";
+import { editingFrameContext, frameSequence, reconcileAnimationSelection, type AnimationSelection } from "../../core/animation.ts";
 import { applyCommand, type EditCommand, type History, type PixelChange } from "../../core/commands.ts";
 import { convertDocumentToIndexed, indexedToRgba, nearestPaletteColor, quantizeToPalette, replaceColor, sameColor } from "../../core/palette.ts";
 import { resizeCanvas, resizeImage } from "../../core/resize.ts";
@@ -125,6 +125,7 @@ export const EditorWorkspace = forwardRef<EditorWorkspaceHandle, {
   const frame = animationSelection.frameId
     ? project.document.frames.find((candidate) => candidate.id === animationSelection.frameId)
     : undefined;
+  const editing = frame ? editingFrameContext(project.document, frame.id) : undefined;
   const frameIndex = frame ? project.document.frames.indexOf(frame) : -1;
   const activeLayer = project.document.layers.find((layer) => layer.id === activeLayerId);
   const cel = frame ? project.document.cels[celKey(frame.id, activeLayerId)] : undefined;
@@ -272,6 +273,8 @@ export const EditorWorkspace = forwardRef<EditorWorkspaceHandle, {
     const height = element?.clientHeight ?? 0;
     return {
       frameId: frame.id,
+      onionPreviousFrameId: editing?.previousFrameId,
+      onionNextFrameId: editing?.nextFrameId,
       zoom,
       panX: Math.round((width - project.document.width * zoom) / 2) + panOffset.x,
       panY: Math.round((height - project.document.height * zoom) / 2) + panOffset.y,
@@ -642,13 +645,13 @@ export const EditorWorkspace = forwardRef<EditorWorkspaceHandle, {
       <aside className="right-dock">
         {generationPanel({
           activeFrameId: frame?.id,
-          activeFrameNumber: frame ? frameIndex + 1 : undefined,
+          activeFrameNumber: editing?.position,
           activeLayer,
           hasActiveCel: Boolean(cel && image),
         })}
         <section className="layers-panel">
           <div className="panel-title"><span>레이어</span><b>{project.document.layers.length}</b></div>
-          <div className="layer-actions"><button type="button" disabled={readOnly} onClick={() => replace((document) => addLayer(document))}>＋</button><button type="button" disabled={readOnly} onClick={() => replace((document) => duplicateLayer(document, activeLayerId))}>복제</button><button type="button" disabled={readOnly} onClick={() => replace((document) => deleteLayer(document, activeLayerId))}>삭제</button><button type="button" disabled={readOnly} onClick={() => replace((document) => moveLayer(document, activeLayerId, Math.max(0, document.layers.findIndex((layer) => layer.id === activeLayerId) - 1)))}>↑</button><button type="button" disabled={readOnly} onClick={() => replace((document) => moveLayer(document, activeLayerId, Math.min(document.layers.length - 1, document.layers.findIndex((layer) => layer.id === activeLayerId) + 1)))}>↓</button><button type="button" disabled={readOnly || !frame || frameIndex === 0} onClick={() => frame && replace((document) => linkCel(document, document.frames[frameIndex - 1].id, activeLayerId, frame.id, activeLayerId))}>이전 셀 연결</button><button type="button" disabled={readOnly || !frame} onClick={() => frame && replace((document) => unlinkCel(document, frame.id, activeLayerId))}>셀 분리</button></div>
+          <div className="layer-actions"><button type="button" disabled={readOnly} onClick={() => replace((document) => addLayer(document))}>＋</button><button type="button" disabled={readOnly} onClick={() => replace((document) => duplicateLayer(document, activeLayerId))}>복제</button><button type="button" disabled={readOnly} onClick={() => replace((document) => deleteLayer(document, activeLayerId))}>삭제</button><button type="button" disabled={readOnly} onClick={() => replace((document) => moveLayer(document, activeLayerId, Math.max(0, document.layers.findIndex((layer) => layer.id === activeLayerId) - 1)))}>↑</button><button type="button" disabled={readOnly} onClick={() => replace((document) => moveLayer(document, activeLayerId, Math.min(document.layers.length - 1, document.layers.findIndex((layer) => layer.id === activeLayerId) + 1)))}>↓</button><button type="button" disabled={readOnly || !frame || !editing?.previousFrameId} onClick={() => frame && editing?.previousFrameId && replace((document) => linkCel(document, editing.previousFrameId!, activeLayerId, frame.id, activeLayerId))}>이전 셀 연결</button><button type="button" disabled={readOnly || !frame} onClick={() => frame && replace((document) => unlinkCel(document, frame.id, activeLayerId))}>셀 분리</button></div>
           {activeCelLinked && <p className="linked-cel-status">연결된 셀 · 편집하면 현재 레이어의 셀만 자동 분리됩니다. 필요하면 먼저 셀 분리를 실행하세요.</p>}
           <div className="layer-list">{project.document.layers.map((layer) => <div className={activeLayerId === layer.id ? "selected" : ""} key={layer.id} aria-disabled={readOnly} onClick={() => { if (!readOnly) setActiveLayerId(layer.id); }}>
             <button type="button" disabled={readOnly} aria-label={layer.visible ? "레이어 숨기기" : "레이어 보이기"} onClick={(event) => { event.stopPropagation(); updateLayer(layer.id, { visible: !layer.visible }); }}>{layer.visible ? "◉" : "○"}</button>

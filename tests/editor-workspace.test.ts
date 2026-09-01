@@ -242,3 +242,20 @@ test("빈 세트와 미분류는 재생 불가 이유와 다음 행동을 표시
   }).element;
   assert.match(renderedText(unclassifiedRendered), /프레임을 선택해 새 세트로 등록하거나 CODEX FORGE·PNG 가져오기/);
 });
+
+test("이전 셀 연결은 물리 프레임이 아니라 활성 세트의 이전 프레임만 사용한다", () => {
+  let document = createDocument({ width: 1, height: 1 });
+  document = addFrame(addFrame(document));
+  const ids = document.frames.map((frame) => frame.id);
+  document.tags = [
+    { id: "other", name: "other", direction: "forward", frameIds: [ids[0]] },
+    { id: "active", name: "active", direction: "forward", frameIds: ids.slice(1) },
+  ];
+  const project = createProject("기사", document);
+  const linkButton = (frameId: string) => elements(workspaceCanvas(project, [], {
+    selection: { tagId: "active", frameId },
+  }).element).find((node) => node.type === "button" && renderedText(node) === "이전 셀 연결");
+
+  assert.equal(linkButton(ids[1])?.props?.disabled, true);
+  assert.equal(linkButton(ids[2])?.props?.disabled, false);
+});
