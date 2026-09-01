@@ -1,7 +1,7 @@
 import { forwardRef, useEffect, useImperativeHandle, useRef, useState, type PointerEvent as ReactPointerEvent, type ReactNode, type WheelEvent } from "react";
 import type { AiEditReadyResult, AiEditRequest, AiEditTarget } from "../../core/ai-edit.ts";
-import { addAnimationTag, deleteAnimationFrame, deleteAnimationSet, frameSequence } from "../../core/animation.ts";
-import { applyCommand, History, type EditCommand, type PixelChange } from "../../core/commands.ts";
+import { addAnimationTag, animationGroupFrameIds, deleteAnimationFrame, deleteAnimationSet, frameSequence, reconcileAnimationSelection, type AnimationSelection } from "../../core/animation.ts";
+import { applyCommand, type EditCommand, type History, type PixelChange } from "../../core/commands.ts";
 import { compositeFrame } from "../../core/render.ts";
 import { convertDocumentToIndexed, indexedToRgba, nearestPaletteColor, quantizeToPalette, replaceColor, sameColor } from "../../core/palette.ts";
 import { resizeCanvas, resizeImage } from "../../core/resize.ts";
@@ -90,19 +90,16 @@ export type GenerationPanelContext = {
 
 export const EditorWorkspace = forwardRef<EditorWorkspaceHandle, {
   project: SpriteProject;
-  frameIndex: number;
+  history: History;
+  selection: AnimationSelection;
   readOnly: boolean;
-  onFrameIndex(index: number): void;
-  selectedAnimationTagId?: string;
-  onSelectedAnimationTagId(id?: string): void;
+  onSelection(selection: AnimationSelection): void;
   onChange(project: SpriteProject): void;
   onSave(): void;
   generationPanel(context: GenerationPanelContext): ReactNode;
   saveState: string;
   onError(message: string): void;
-}>(function EditorWorkspace({ project, frameIndex, readOnly, onFrameIndex, selectedAnimationTagId, onSelectedAnimationTagId, onChange, onSave, generationPanel, saveState, onError }, ref) {
-  const history = useRef(new History(project.document));
-  const emitted = useRef<SpriteDocument>(project.document);
+}>(function EditorWorkspace({ project, history, selection: animationSelection, readOnly, onSelection, onChange, onSave, generationPanel, saveState, onError }, ref) {
   const canvas = useRef<HTMLCanvasElement>(null);
   const controller = useRef<ToolController | undefined>(undefined);
   const clipboard = useRef<SelectionContent | undefined>(undefined);
@@ -133,31 +130,36 @@ export const EditorWorkspace = forwardRef<EditorWorkspaceHandle, {
   const [resizeOpen, setResizeOpen] = useState(false);
 
   useEffect(() => {
-    if (project.document !== emitted.current) {
-      history.current = new History(project.document);
-      emitted.current = project.document;
-      setSelection(undefined);
-    }
+    setSelection(undefined);
+    setPlaying(false);
+    playbackCursor.current = 0;
+  }, [history]);
+
+  useEffect(() => {
     if (!project.document.layers.some((layer) => layer.id === activeLayerId)) setActiveLayerId(project.document.layers[0].id);
   }, [project.document, activeLayerId]);
 
+  const selectedFrameIndex = project.document.frames.findIndex((candidate) => candidate.id === animationSelection.frameId);
+  const frameIndex = Math.max(0, selectedFrameIndex);
   const frame = project.document.frames[Math.min(frameIndex, project.document.frames.length - 1)];
   const activeLayer = project.document.layers.find((layer) => layer.id === activeLayerId);
   const cel = project.document.cels[celKey(frame.id, activeLayerId)];
   const image = cel ? project.document.images[cel.imageId] : undefined;
+  const selectedAnimationTagId = animationSelection.tagId ?? undefined;
   const selectedTag = project.document.tags.find((tag) => tag.id === selectedAnimationTagId);
   const playbackFrames = selectedTag
     ? frameSequence(selectedTag)
-    : project.document.frames.map((item) => item.id);
+    : animationGroupFrameIds(project.document, null);
   const activeCelLinked = Boolean(cel && Object.values(project.document.cels).some((candidate) =>
     candidate.id !== cel.id && candidate.imageId === cel.imageId));
 
   useEffect(() => {
-    if (!selectedAnimationTagId || selectedTag) return;
+    const reconciled = reconcileAnimationSelection(project.document, animationSelection);
+    if (reconciled.tagId === animationSelection.tagId && reconciled.frameId === animationSelection.frameId) return;
     setPlaying(false);
     playbackCursor.current = 0;
-    onSelectedAnimationTagId(undefined);
-  }, [selectedAnimationTagId, selectedTag, onSelectedAnimationTagId]);
+    onSelection(reconciled);
+  }, [project.document, animationSelection, onSelection]);
 
   const applySettings = (next: AiEditorSettings) => {
     setTool(next.tool);
@@ -199,19 +201,18 @@ export const EditorWorkspace = forwardRef<EditorWorkspaceHandle, {
       };
       const application = runAiEditAttempts({
         ...settingsSnapshot,
-        selection: selectionReplayMask(settingsSnapshot.selection, image!, cel!, history.current.document),
-        document: history.current.document,
+        selection: selectionReplayMask(settingsSnapshot.selection, image!, cel!, history.document),
+        document: history.document,
       }, target, result.attempts);
 
-      const historySnapshot = history.current.snapshot();
+      const historySnapshot = history.snapshot();
       const documentChanged = application.historySteps.length > 0;
-      const document = application.historySteps.length
-        ? history.current.commitSteps(application.historySteps)
-        : history.current.document;
+      const next = application.historySteps.length
+        ? history.commitSteps(application.historySteps)
+        : history.project;
       if (application.actionCount > 0) applySettings(application.settings);
       if (application.historySteps.length) {
-        emitted.current = document;
-        onChange({ ...project, document });
+        onChange(next);
       }
 
       let active = true;
@@ -222,21 +223,19 @@ export const EditorWorkspace = forwardRef<EditorWorkspaceHandle, {
         rollback() {
           if (!active) return;
           active = false;
-          const restored = history.current.restore(historySnapshot);
+          const restored = history.restore(historySnapshot);
           if (application.actionCount > 0) applySettings(settingsSnapshot);
           if (documentChanged) {
-            emitted.current = restored;
-            onChange({ ...project, document: restored });
+            onChange(restored);
           }
         },
       };
     },
   }));
 
-  const emit = (document: SpriteDocument) => {
+  const emit = (next: SpriteProject) => {
     if (readOnly) return;
-    emitted.current = document;
-    onChange({ ...project, document });
+    onChange(next);
   };
 
   const execute = (command: EditCommand): SpriteDocument | undefined => {
@@ -246,31 +245,41 @@ export const EditorWorkspace = forwardRef<EditorWorkspaceHandle, {
       const constrained = project.document.colorMode === "indexed"
         ? { ...command, pixels: command.pixels.map((pixel) => ({ ...pixel, rgba: nearestPaletteColor(pixel.rgba, palette) })) }
         : command;
-      const document = history.current.execute(constrained);
-      emit(document);
-      return document;
+      const next = history.execute(constrained);
+      emit(next);
+      return next.document;
     } catch (error) { onError(error instanceof Error ? error.message : String(error)); }
   };
 
   const replace = (transform: (document: SpriteDocument) => SpriteDocument) => {
     if (readOnly) return;
-    try { emit(history.current.replace(transform(project.document))); } catch (error) { onError(error instanceof Error ? error.message : String(error)); }
+    try {
+      const next = history.replaceDocument(transform(history.document));
+      emit(next);
+      return next;
+    } catch (error) { onError(error instanceof Error ? error.message : String(error)); }
   };
 
   const applyResize = (request: ResizeRequest) => {
     if (readOnly) return;
-    const current = history.current.document;
+    const current = history.document;
     const resized = request.mode === "canvas"
       ? resizeCanvas(current, request.width, request.height, request.horizontal, request.vertical)
       : resizeImage(current, request.width, request.height);
     if (resized === current) return;
-    emit(history.current.replace(resized));
+    emit(history.replaceDocument(resized));
     setSelection(undefined);
     setPanOffset({ x: 0, y: 0 });
   };
 
-  const undo = () => { if (!readOnly) emit(history.current.undo()); };
-  const redo = () => { if (!readOnly) emit(history.current.redo()); };
+  const restoreHistory = (next: SpriteProject) => {
+    setSelection(undefined);
+    setPlaying(false);
+    onSelection(reconcileAnimationSelection(next.document, animationSelection));
+    emit(next);
+  };
+  const undo = () => { if (!readOnly) restoreHistory(history.undo()); };
+  const redo = () => { if (!readOnly) restoreHistory(history.redo()); };
 
   const view = () => {
     const element = canvas.current;
@@ -345,8 +354,9 @@ export const EditorWorkspace = forwardRef<EditorWorkspaceHandle, {
     const timer = window.setTimeout(() => {
       playbackCursor.current = (playbackCursor.current + 1) % playbackFrames.length;
       const nextId = playbackFrames[playbackCursor.current];
-      const nextIndex = project.document.frames.findIndex((candidate) => candidate.id === nextId);
-      if (nextIndex >= 0) onFrameIndex(nextIndex);
+      if (project.document.frames.some((candidate) => candidate.id === nextId)) {
+        onSelection(reconcileAnimationSelection(project.document, { ...animationSelection, frameId: nextId }));
+      }
     }, currentFrame.durationMs);
     return () => window.clearTimeout(timer);
   }, [playing, frameIndex, selectedAnimationTagId, project.document.frames, project.document.tags]);
@@ -361,11 +371,10 @@ export const EditorWorkspace = forwardRef<EditorWorkspaceHandle, {
 
   const selectPlaybackRange = (tagId?: string) => {
     setPlaying(false);
-    onSelectedAnimationTagId(tagId);
     const tag = project.document.tags.find((candidate) => candidate.id === tagId);
-    const firstId = tag ? frameSequence(tag)[0] : project.document.frames[0].id;
+    const firstId = tag ? frameSequence(tag)[0] : animationGroupFrameIds(project.document, null)[0];
     playbackCursor.current = 0;
-    onFrameIndex(project.document.frames.findIndex((candidate) => candidate.id === firstId));
+    onSelection({ tagId: tag?.id ?? null, frameId: firstId ?? null });
   };
 
   const togglePlayback = () => {
@@ -373,7 +382,7 @@ export const EditorWorkspace = forwardRef<EditorWorkspaceHandle, {
     const current = playbackFrames.indexOf(frame.id);
     playbackCursor.current = current < 0 ? 0 : current;
     if (current < 0) {
-      onFrameIndex(project.document.frames.findIndex((candidate) => candidate.id === playbackFrames[0]));
+      onSelection(reconcileAnimationSelection(project.document, { ...animationSelection, frameId: playbackFrames[0] }));
     }
     if (playbackFrames.length < 2) return;
     setPlaying(true);
@@ -568,15 +577,15 @@ export const EditorWorkspace = forwardRef<EditorWorkspaceHandle, {
 
   const removeAnimationTag = (tagId: string) => {
     setPlaying(false);
-    if (selectedAnimationTagId === tagId) onSelectedAnimationTagId(undefined);
-    replace((document) => deleteAnimationSet(document, tagId));
+    const next = replace((document) => deleteAnimationSet(document, tagId));
+    if (next) onSelection(reconcileAnimationSelection(next.document, animationSelection));
   };
 
   const reorderFrame = (id: string, target: number) => {
     const selectedId = frame.id;
     const next = moveFrame(project.document, id, target);
     replace(() => next);
-    onFrameIndex(next.frames.findIndex((candidate) => candidate.id === selectedId));
+    onSelection(reconcileAnimationSelection(next, { ...animationSelection, frameId: selectedId }));
   };
 
   const changeColorMode = (mode: "rgba" | "indexed") => {
@@ -585,7 +594,7 @@ export const EditorWorkspace = forwardRef<EditorWorkspaceHandle, {
     try {
       const next = convertDocumentToIndexed(project.document);
       const palette = next.palette.map((entry) => entry.color);
-      emit(history.current.replace(next));
+      emit(history.replaceDocument(next));
       setColor(nearestPaletteColor(color, palette));
       setSecondaryColor(nearestPaletteColor(secondaryColor, palette));
     } catch (error) { onError(error instanceof Error ? error.message : String(error)); }
@@ -689,10 +698,10 @@ export const EditorWorkspace = forwardRef<EditorWorkspaceHandle, {
     </section>
 
     <section className="timeline editor-timeline" aria-label="애니메이션 타임라인">
-      <div className="timeline-head"><span>타임라인</span><b>{project.document.frames.length} 프레임</b><small>{saveState}</small><div><button type="button" disabled={readOnly} onClick={() => replace((document) => addFrame(document, frame.id))}>＋</button><button type="button" disabled={readOnly} onClick={() => { const next = duplicateFrame(project.document, frame.id); replace(() => next); onFrameIndex(frameIndex + 1); }}>복제</button><button type="button" disabled={readOnly} onClick={() => { if (project.document.frames.length < 2) return; const nextIndex = Math.min(frameIndex, project.document.frames.length - 2); replace((document) => deleteAnimationFrame(document, frame.id)); onFrameIndex(nextIndex); }}>삭제</button></div></div>
+      <div className="timeline-head"><span>타임라인</span><b>{project.document.frames.length} 프레임</b><small>{saveState}</small><div><button type="button" disabled={readOnly} onClick={() => replace((document) => addFrame(document, frame.id))}>＋</button><button type="button" disabled={readOnly} onClick={() => { const next = duplicateFrame(project.document, frame.id); replace(() => next); onSelection(reconcileAnimationSelection(next, { ...animationSelection, frameId: next.frames[frameIndex + 1].id })); }}>복제</button><button type="button" disabled={readOnly} onClick={() => { if (project.document.frames.length < 2) return; const nextIndex = Math.min(frameIndex, project.document.frames.length - 2); const next = deleteAnimationFrame(project.document, frame.id); replace(() => next); onSelection(reconcileAnimationSelection(next, { ...animationSelection, frameId: next.frames[nextIndex].id })); }}>삭제</button></div></div>
       <div className="frames">{project.document.frames.map((item, index) => <div className={`frame-card ${index === frameIndex ? "selected" : ""}`} key={item.id}>
-        <button className="frame-image" type="button" disabled={readOnly} aria-label={`${index + 1}번 프레임 선택`} onClick={() => { setPlaying(false); onFrameIndex(index); }}><FrameCanvas project={project} index={index} /></button>
-        <button className="frame-label" type="button" disabled={readOnly} onClick={() => { setPlaying(false); onFrameIndex(index); }}>F{String(index + 1).padStart(2, "0")}</button><input aria-label={`${index + 1}번 프레임 시간`} disabled={readOnly} type="number" min="1" max="60000" value={item.durationMs} onChange={(event) => replace((document) => setFrameDuration(document, item.id, Number(event.target.value)))} />
+        <button className="frame-image" type="button" disabled={readOnly} aria-label={`${index + 1}번 프레임 선택`} onClick={() => { setPlaying(false); onSelection(reconcileAnimationSelection(project.document, { ...animationSelection, frameId: item.id })); }}><FrameCanvas project={project} index={index} /></button>
+        <button className="frame-label" type="button" disabled={readOnly} onClick={() => { setPlaying(false); onSelection(reconcileAnimationSelection(project.document, { ...animationSelection, frameId: item.id })); }}>F{String(index + 1).padStart(2, "0")}</button><input aria-label={`${index + 1}번 프레임 시간`} disabled={readOnly} type="number" min="1" max="60000" value={item.durationMs} onChange={(event) => replace((document) => setFrameDuration(document, item.id, Number(event.target.value)))} />
         <i><button type="button" disabled={readOnly} aria-label="프레임 왼쪽 이동" onClick={() => reorderFrame(item.id, index - 1)}>←</button><button type="button" disabled={readOnly} aria-label="프레임 오른쪽 이동" onClick={() => reorderFrame(item.id, index + 1)}>→</button></i>
       </div>)}</div>
       <div className="tag-editor"><span>태그</span><input aria-label="태그 이름" disabled={readOnly} placeholder="예: attack" value={tagName} onChange={(event) => setTagName(event.target.value)} /><select aria-label="태그 재생 방향" disabled={readOnly} value={tagDirection} onChange={(event) => setTagDirection(event.target.value as typeof tagDirection)}><option value="forward">정방향</option><option value="reverse">역방향</option><option value="pingPong">핑퐁</option></select><button type="button" disabled={readOnly} onClick={createAnimationTag}>전체 구간 추가</button><button type="button" aria-pressed={selectedAnimationTagId === undefined} disabled={readOnly} onClick={() => selectPlaybackRange(undefined)}>전체</button>{project.document.tags.map((tag) => <span className="tag-chip" key={tag.id}><button type="button" aria-pressed={selectedAnimationTagId === tag.id} disabled={readOnly} onClick={() => selectPlaybackRange(tag.id)}>{tag.name}</button><button type="button" disabled={readOnly} aria-label={`${tag.name} 애니메이션 태그 삭제`} onClick={() => removeAnimationTag(tag.id)}>×</button></span>)}</div>

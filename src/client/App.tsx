@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import type { AnimationDirection, SpriteProject } from "../core/types.ts";
+import { defaultAnimationSelection, reconcileAnimationSelection, type AnimationSelection } from "../core/animation.ts";
+import { History } from "../core/commands.ts";
 import { renameProject } from "../core/document.ts";
 import { api, appendAnimationIssue, cellEditApplicationDisposition, cellEditApplicationRequestTimeout, cellEditCompletionNotice, cellEditPayload, codexJobStatusTitle, completedGenerationSelection, decodeProject, encodeProject, failedCodexJob, generationPayload, isInitialBlankProject, isRetryablePollingError, pollingErrorCodexJob, projectJobOwnershipMatches, projectLifetimeMatches, releaseProjectJobOwnership, type CellEditJob, type CodexJob, type GenerationJob, type GenerationTarget, type ProjectJobOwnership, type ProjectLifetime, type Session } from "./api.ts";
 import { EditorWorkspace, type EditorWorkspaceHandle } from "./editor/EditorWorkspace.tsx";
@@ -84,8 +86,8 @@ export function App() {
   const projectLifetime = useRef<ProjectLifetime | undefined>(undefined);
   const activeJobOwnership = useRef<ProjectJobOwnership | undefined>(undefined);
   const editor = useRef<EditorWorkspaceHandle>(null);
-  const [frameIndex, setFrameIndex] = useState(0);
-  const [selectedAnimationTagId, setSelectedAnimationTagId] = useState<string>();
+  const projectHistory = useRef<History | undefined>(undefined);
+  const [animationSelection, setAnimationSelection] = useState<AnimationSelection>({ tagId: null, frameId: null });
   const [dirty, setDirty] = useState(false);
   const [prompt, setPrompt] = useState("칼을 휘두르는 2D 기사 캐릭터, 선명한 실루엣, 제한된 판타지 팔레트");
   const [frameCount, setFrameCount] = useState(8);
@@ -121,13 +123,18 @@ export function App() {
     setProject(next);
   };
 
+  const syncProject = (next: SpriteProject) => {
+    if (projectHistory.current) projectHistory.current.project = next;
+    setCurrentProject(next);
+  };
+
   const commitProjectName = () => {
     if (!project || projectNameDraft === undefined) return;
     try {
       const renamed = renameProject(project, projectNameDraft);
       setProjectNameDraft(undefined);
       if (renamed.name === project.name) return;
-      setCurrentProject(renamed);
+      syncProject(renamed);
       setProjects((current) => current.map((item) => item.id === renamed.id ? { ...item, name: renamed.name } : item));
       setDirty(true);
     } catch (reason) {
@@ -307,11 +314,16 @@ export function App() {
             const selection = completedGenerationSelection(completedProject, target, next.frameId);
             setJob({ ...next, project: completedProject });
             beginProjectLifetime(completedProject.id);
-            setCurrentProject(completedProject);
+            const tracked = projectHistory.current
+              ? projectHistory.current.replaceProject(completedProject, ["document", "generationHistory", "exportSettings"])
+              : completedProject;
+            setCurrentProject(tracked);
             setDirty(false);
-            setFrameIndex(selection.frameIndex);
-            if (selection.tag) setSelectedAnimationTagId(selection.tag.id);
-            else if (!target) setSelectedAnimationTagId(undefined);
+            const selectedFrame = tracked.document.frames[selection.frameIndex];
+            setAnimationSelection(reconcileAnimationSelection(tracked.document, {
+              tagId: selection.tag?.id ?? null,
+              frameId: selectedFrame?.id ?? null,
+            }));
             setNotice(selection.tag
               ? `${selection.tag.name} 애니메이션 ${selection.frameCount}프레임을 추가했습니다.`
               : target && "frameId" in target
@@ -498,10 +510,12 @@ export function App() {
         }),
       }));
       if (!projectLifetimeMatches(projectLifetime.current, lifetime)) return;
-      setCurrentProject(imported);
+      const tracked = projectHistory.current
+        ? projectHistory.current.replaceProject(imported, ["document", "generationHistory", "exportSettings"])
+        : imported;
+      setCurrentProject(tracked);
       setDirty(false);
-      setFrameIndex(0);
-      setSelectedAnimationTagId(undefined);
+      setAnimationSelection(defaultAnimationSelection(tracked.document));
       setNotice("PNG 시트를 프레임으로 가져왔습니다.");
     } catch (reason) {
       if (projectLifetimeMatches(projectLifetime.current, lifetime)) setError(reason instanceof Error ? reason.message : String(reason));
@@ -517,14 +531,14 @@ export function App() {
     activeJobOwnership.current = undefined;
     cellEditApplicationPending.current = undefined;
     cellEditCancelRequested.current = false;
+    projectHistory.current = new History(next);
     setCurrentProject(next);
+    setAnimationSelection(defaultAnimationSelection(next.document));
     setProjectNameDraft(undefined);
     setStartingKind(undefined);
     setJob(undefined);
     setReference(undefined);
     setDirty(false);
-    setFrameIndex(0);
-    setSelectedAnimationTagId(undefined);
     const generatedFrames = next.generationHistory.length ? next.document.frames.length : 8;
     setFrameCount(generatedFrames);
     setColumns(Math.min(next.exportSettings.columns, generatedFrames));
@@ -564,7 +578,9 @@ export function App() {
     projectLifetime.current = undefined;
     activeJobOwnership.current = undefined;
     cellEditApplicationPending.current = undefined;
+    projectHistory.current = undefined;
     setCurrentProject(undefined);
+    setAnimationSelection({ tagId: null, frameId: null });
     setJob(undefined);
     setReference(undefined);
   };
@@ -589,7 +605,7 @@ export function App() {
     });
     if (response.status === "cancelled") return undefined;
     if (!current()) throw new Error("프로젝트가 변경되어 내보내기 결과를 반영하지 않았습니다.");
-    setCurrentProject({ ...project, exportSettings: settings });
+    syncProject({ ...project, exportSettings: settings });
     setDirty(false);
     return response;
   };
@@ -619,7 +635,7 @@ export function App() {
         </div>
       </header>
 
-      {!project ? <NewProject projects={projects} onOpen={openProject} onCreate={createNewProject} /> : <EditorWorkspace ref={editor} project={project} frameIndex={frameIndex} readOnly={codexBusy} onFrameIndex={setFrameIndex} selectedAnimationTagId={selectedAnimationTagId} onSelectedAnimationTagId={setSelectedAnimationTagId} onChange={(next) => {
+      {!project ? <NewProject projects={projects} onOpen={openProject} onCreate={createNewProject} /> : <EditorWorkspace ref={editor} project={project} history={projectHistory.current!} selection={animationSelection} readOnly={codexBusy} onSelection={setAnimationSelection} onChange={(next) => {
         setCurrentProject(next);
         const pending = cellEditApplicationPending.current;
         if (!pending || !projectJobOwnershipMatches(projectLifetime.current, activeJobOwnership.current, pending)) setDirty(true);
@@ -660,7 +676,7 @@ export function App() {
                 : <button className="forge-button" type="submit" disabled={!account || codexBusy}>
                     <span>{isInitialBlankProject(project) ? "스프라이트 생성" : "전체 시트 다시 생성"}</span><b>⌘ ↗</b>
                   </button>}
-              <button className="forge-button" type="button" disabled={!account || codexBusy || !project.document.frames[frameIndex]} onClick={() => void generate({ frameId: project.document.frames[frameIndex].id })}>
+              <button className="forge-button" type="button" disabled={!account || codexBusy || !animationSelection.frameId} onClick={() => animationSelection.frameId && void generate({ frameId: animationSelection.frameId })}>
                 <span>선택 프레임 재생성</span><b>⌘ ↗</b>
               </button>
               <button className="forge-button" type="button" disabled={account?.type !== "chatgpt" || !prompt.trim() || !hasActiveCel || activeLayer?.locked || codexBusy || Boolean(cellEditUnavailable)} onClick={() => void editCurrentCell()}>

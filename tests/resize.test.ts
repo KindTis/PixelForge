@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { History } from "../src/core/commands.ts";
-import { createDocument } from "../src/core/document.ts";
+import { createDocument, createProject } from "../src/core/document.ts";
 import { resizeCanvas, resizeImage } from "../src/core/resize.ts";
 import { addFrame, addLayer, duplicateFrame } from "../src/core/timeline.ts";
 
@@ -30,8 +30,8 @@ test("이미지 크기는 연결 셀을 유지하며 모든 픽셀과 위치를 
   document = addLayer(document);
   for (const cel of Object.values(document.cels)) { cel.x = 1; cel.y = 1; }
 
-  const history = new History(document);
-  const resized = history.replace(resizeImage(document, 4, 6));
+  const history = new History(createProject("테스트", document));
+  const resized = history.replaceDocument(resizeImage(document, 4, 6)).document;
   const linkedKeys = document.frames.map((frame) => `${frame.id}:${document.layers[1].id}`);
   const image = resized.images[linkedImageId];
   const pixel = (x: number, y: number) => Array.from(image.data.slice((y * image.width + x) * 4, (y * image.width + x + 1) * 4));
@@ -43,8 +43,8 @@ test("이미지 크기는 연결 셀을 유지하며 모든 픽셀과 위치를 
   assert.deepEqual([pixel(0, 0), pixel(1, 2), pixel(2, 2), pixel(0, 3)], [
     [255, 0, 0, 255], [255, 0, 0, 255], [0, 255, 0, 255], [0, 0, 255, 255],
   ]);
-  assert.equal(history.undo(), document);
-  assert.equal(history.redo(), resized);
+  assert.equal(history.undo().document, document);
+  assert.equal(history.redo().document, resized);
 });
 
 test("크기는 1~4096 정수만 허용하고 같은 크기는 원본을 재사용한다", () => {

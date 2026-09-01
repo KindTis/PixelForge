@@ -1,12 +1,19 @@
-import type { RGBA, SpriteDocument } from "./types.ts";
+import type { RGBA, SpriteDocument, SpriteProject } from "./types.ts";
 
 export type PixelChange = { x: number; y: number; rgba: RGBA };
 export type EditCommand = { type: "setPixels"; celId: string; pixels: PixelChange[] };
+export type UndoableProjectField = "document" | "generationHistory" | "exportSettings";
+type ProjectHistoryEntry = {
+  fields: readonly UndoableProjectField[];
+  before: SpriteProject;
+  after: SpriteProject;
+};
 export type HistorySnapshot = {
-  document: SpriteDocument;
-  undoStack: readonly SpriteDocument[];
-  redoStack: readonly SpriteDocument[];
-  transactionStart?: SpriteDocument;
+  project: SpriteProject;
+  undoStack: readonly ProjectHistoryEntry[];
+  redoStack: readonly ProjectHistoryEntry[];
+  transactionStart?: SpriteProject;
+  transactionFields: readonly UndoableProjectField[];
 };
 
 export function applyCommand(document: SpriteDocument, command: EditCommand): SpriteDocument {
@@ -39,89 +46,122 @@ export function applyCommand(document: SpriteDocument, command: EditCommand): Sp
   };
 }
 
-export class History {
-  private readonly undoStack: SpriteDocument[] = [];
-  private readonly redoStack: SpriteDocument[] = [];
-  private transactionStart?: SpriteDocument;
+function restoreFields(
+  current: SpriteProject,
+  snapshot: SpriteProject,
+  fields: readonly UndoableProjectField[],
+): SpriteProject {
+  let next = current;
+  for (const field of fields) {
+    if (field === "document") next = { ...next, document: snapshot.document };
+    else if (field === "generationHistory") next = { ...next, generationHistory: snapshot.generationHistory };
+    else next = { ...next, exportSettings: snapshot.exportSettings };
+  }
+  return next;
+}
 
-  constructor(public document: SpriteDocument) {}
+export class History {
+  private readonly undoStack: ProjectHistoryEntry[] = [];
+  private readonly redoStack: ProjectHistoryEntry[] = [];
+  private transactionStart?: SpriteProject;
+  private readonly transactionFields = new Set<UndoableProjectField>();
+
+  constructor(public project: SpriteProject) {}
+
+  get document(): SpriteDocument { return this.project.document; }
 
   snapshot(): HistorySnapshot {
     return {
-      document: this.document,
+      project: this.project,
       undoStack: this.undoStack.slice(),
       redoStack: this.redoStack.slice(),
       transactionStart: this.transactionStart,
+      transactionFields: [...this.transactionFields],
     };
   }
 
-  restore(snapshot: HistorySnapshot): SpriteDocument {
-    this.document = snapshot.document;
+  restore(snapshot: HistorySnapshot): SpriteProject {
+    this.project = snapshot.project;
     this.undoStack.splice(0, this.undoStack.length, ...snapshot.undoStack);
     this.redoStack.splice(0, this.redoStack.length, ...snapshot.redoStack);
     this.transactionStart = snapshot.transactionStart;
-    return this.document;
+    this.transactionFields.clear();
+    for (const field of snapshot.transactionFields) this.transactionFields.add(field);
+    return this.project;
   }
 
-  execute(command: EditCommand): SpriteDocument {
+  execute(command: EditCommand): SpriteProject {
     const before = this.document;
     const after = applyCommand(before, command);
-    if (after === before) return after;
-    if (!this.transactionStart) {
-      this.undoStack.push(before);
-      this.redoStack.length = 0;
-    }
-    this.document = after;
-    return after;
+    return after === before ? this.project : this.replaceDocument(after);
   }
 
-  replace(document: SpriteDocument): SpriteDocument {
-    if (document === this.document) return document;
-    if (!this.transactionStart) {
-      this.undoStack.push(this.document);
-      this.redoStack.length = 0;
-    }
-    this.document = document;
-    return document;
+  replaceDocument(document: SpriteDocument): SpriteProject {
+    return this.replaceProject({ ...this.project, document }, ["document"]);
   }
 
-  commitSteps(documents: readonly SpriteDocument[]): SpriteDocument {
+  replaceProject(project: SpriteProject, fields: readonly UndoableProjectField[]): SpriteProject {
+    const changedFields = [...new Set(fields)].filter((field) => project[field] !== this.project[field]);
+    if (changedFields.length === 0) return this.project;
+    if (this.transactionStart) {
+      for (const field of changedFields) this.transactionFields.add(field);
+    } else {
+      this.undoStack.push({ fields: changedFields, before: this.project, after: project });
+      this.redoStack.length = 0;
+    }
+    this.project = project;
+    return project;
+  }
+
+  commitSteps(documents: readonly SpriteDocument[]): SpriteProject {
     if (this.transactionStart) throw new Error("편집 트랜잭션 중에는 격리 결과를 반영할 수 없습니다.");
-    if (documents.length === 0) return this.document;
-    this.undoStack.push(this.document, ...documents.slice(0, -1));
+    const entries: ProjectHistoryEntry[] = [];
+    let current = this.project;
+    for (const document of documents) {
+      if (document === current.document) continue;
+      const next = { ...current, document };
+      entries.push({ fields: ["document"], before: current, after: next });
+      current = next;
+    }
+    if (entries.length === 0) return this.project;
+    this.undoStack.push(...entries);
     this.redoStack.length = 0;
-    this.document = documents.at(-1)!;
-    return this.document;
+    this.project = current;
+    return current;
   }
 
   beginTransaction(): void {
     if (this.transactionStart) throw new Error("편집 트랜잭션이 이미 시작되었습니다.");
-    this.transactionStart = this.document;
+    this.transactionStart = this.project;
+    this.transactionFields.clear();
   }
 
   commitTransaction(): void {
     if (!this.transactionStart) return;
-    if (this.document !== this.transactionStart) {
-      this.undoStack.push(this.transactionStart);
+    const before = this.transactionStart;
+    const fields = [...this.transactionFields].filter((field) => this.project[field] !== before[field]);
+    if (fields.length > 0) {
+      this.undoStack.push({ fields, before, after: this.project });
       this.redoStack.length = 0;
     }
     this.transactionStart = undefined;
+    this.transactionFields.clear();
   }
 
-  undo(): SpriteDocument {
+  undo(): SpriteProject {
     if (this.transactionStart) this.commitTransaction();
-    const previous = this.undoStack.pop();
-    if (!previous) return this.document;
-    this.redoStack.push(this.document);
-    this.document = previous;
-    return previous;
+    const entry = this.undoStack.pop();
+    if (!entry) return this.project;
+    this.redoStack.push(entry);
+    this.project = restoreFields(this.project, entry.before, entry.fields);
+    return this.project;
   }
 
-  redo(): SpriteDocument {
-    const next = this.redoStack.pop();
-    if (!next) return this.document;
-    this.undoStack.push(this.document);
-    this.document = next;
-    return next;
+  redo(): SpriteProject {
+    const entry = this.redoStack.pop();
+    if (!entry) return this.project;
+    this.undoStack.push(entry);
+    this.project = restoreFields(this.project, entry.after, entry.fields);
+    return this.project;
   }
 }

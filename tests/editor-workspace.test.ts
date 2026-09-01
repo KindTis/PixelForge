@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import * as React from "react";
+import { defaultAnimationSelection, type AnimationSelection } from "../src/core/animation.ts";
+import { History } from "../src/core/commands.ts";
 import { createDocument, createProject } from "../src/core/document.ts";
 import { duplicateFrame } from "../src/core/timeline.ts";
 import { celKey } from "../src/core/types.ts";
@@ -63,7 +65,7 @@ function workspaceCanvas(
   const previous = internals.H;
   let refIndex = 0;
   internals.H = {
-    useRef(initial: unknown) { return { current: refIndex++ === 2 ? canvas : initial }; },
+    useRef(initial: unknown) { return { current: refIndex++ === 0 ? canvas : initial }; },
     useState(initial: unknown) { return [initial, () => {}]; },
     useEffect() {},
     useImperativeHandle() {},
@@ -71,11 +73,10 @@ function workspaceCanvas(
   try {
     const element = (EditorWorkspace as unknown as { render: (props: Record<string, unknown>, ref: null) => { props: { children: unknown } } }).render({
       project,
-      frameIndex: 0,
+      history: overrides.history ?? new History(project),
+      selection: overrides.selection ?? defaultAnimationSelection(project.document),
       readOnly: false,
-      onFrameIndex() {},
-      selectedAnimationTagId: undefined,
-      onSelectedAnimationTagId() {},
+      onSelection() {},
       onChange() {},
       onSave() {},
       generationPanel: () => null,
@@ -161,31 +162,27 @@ test("태그 선택은 aria-pressed와 재생 첫 프레임을 갱신하고 삭�
     direction: "reverse",
   });
   const project = createProject("기사", document);
-  const selected: Array<string | undefined> = [];
-  const frameIndexes: number[] = [];
+  const selected: AnimationSelection[] = [];
   const rendered = workspaceCanvas(project, [], {
-    selectedAnimationTagId: undefined,
-    onSelectedAnimationTagId: (id: string | undefined) => selected.push(id),
-    onFrameIndex: (index: number) => frameIndexes.push(index),
+    selection: { tagId: null, frameId: document.frames[0].id },
+    onSelection: (selection: AnimationSelection) => selected.push(selection),
   }).element;
   const attack = elements(rendered).find((value) => value.type === "button" && value.props?.children === "attack");
   assert.ok(attack);
   assert.equal(attack.props?.["aria-pressed"], false);
   (attack.props?.onClick as () => void)();
-  assert.deepEqual(Array.from(selected), [tagId]);
-  assert.deepEqual(frameIndexes, [1]);
+  assert.deepEqual(selected.map((value) => ({ ...value })), [{ tagId, frameId: document.frames[1].id }]);
   assert.match(renderedText(rendered), /연결된 셀 · 편집하면 현재 레이어의 셀만 자동 분리됩니다/);
 
   const selectedRendered = workspaceCanvas(project, [], {
-    selectedAnimationTagId: tagId,
-    onSelectedAnimationTagId: (id: string | undefined) => selected.push(id),
-    onFrameIndex: (index: number) => frameIndexes.push(index),
+    selection: { tagId, frameId: document.frames[1].id },
+    onSelection: (selection: AnimationSelection) => selected.push(selection),
   }).element;
   const remove = elements(selectedRendered).find((value) => value.type === "button"
     && value.props?.["aria-label"] === "attack 애니메이션 태그 삭제");
   assert.ok(remove);
   (remove.props?.onClick as () => void)();
-  assert.equal(selected.at(-1), undefined);
+  assert.equal(selected.at(-1)?.tagId, null);
 
   let context: GenerationPanelContext | undefined;
   workspaceCanvas(project, [], {
