@@ -168,6 +168,8 @@ export class CodexBridge extends EventEmitter {
     });
     const turn = await this.request<{ turn: { id: string } }>("turn/start", {
       threadId: thread.thread.id,
+      model: "gpt-5.6-sol",
+      effort: "xhigh",
       input: [
         { type: "text", text: `$imagegen ${request.prompt}` },
         { type: "skill", name: skill.name, path: skill.path },

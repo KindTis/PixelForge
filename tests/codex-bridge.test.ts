@@ -156,7 +156,7 @@ test("API 키 계정에서는 생성하지 않는다", async () => {
   await assert.rejects(bridge.startGeneration({ cwd: "C:/project", prompt: "공격" }), /ChatGPT 로그인/);
 });
 
-test("imagegen 스킬로 스레드와 턴을 시작하고 중단한다", async () => {
+test("imagegen 스킬을 gpt-5.6-sol xhigh 턴으로 시작하고 중단한다", async () => {
   const process = new FakeProcess();
   const bridge = await startedBridge(process);
   const events: unknown[] = [];
@@ -185,6 +185,8 @@ test("imagegen 스킬로 스레드와 턴을 시작하고 중단한다", async (
   const turn = process.messages.find((message) => message.method === "turn/start")!;
   assert.deepEqual(turn.params, {
     threadId: "thread-1",
+    model: "gpt-5.6-sol",
+    effort: "xhigh",
     input: [
       { type: "text", text: "$imagegen 8프레임 검 공격" },
       { type: "skill", name: "imagegen", path: "C:/skills/imagegen/SKILL.md" },
